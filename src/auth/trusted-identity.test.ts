@@ -8,11 +8,14 @@ import {
   DelegationDeniedError,
   DelegationStoreUnavailableError,
   PrincipalUnavailableError,
+  SecurityOverrideRejectedError,
+  UntrustedRuntimeError,
 } from "../errors.js";
-import { authorizeTrustedExecution, type TrustedAuthorizationAssembly } from "./authorize.js";
+import { authorizeTrustedExecution } from "./authorize.js";
+import { createTrustedRuntime, type CreateTrustedRuntimeInput } from "./trusted-runtime.js";
 import { createMemoryDelegationAuthorizationStore, revalidateDelegationRecord, type DelegationAuthorization } from "./delegation.js";
 import { createDenyByDefaultPrincipalProvider, isUsableTrustedPrincipal, type TrustedPrincipal } from "./principal.js";
-import { createDenyByDefaultBindingQuery } from "./canonical-scope.js";
+import { createAuthoritativeBindingQueryFromMetadataStore, createDenyByDefaultBindingQuery } from "./canonical-scope.js";
 
 const SCOPE: Scope = {
   workspaceId: "ws_1",
@@ -71,14 +74,15 @@ const TEST_TOKEN = "tok";
 
 function serviceTrusted(
   principal: TrustedPrincipal,
-  extras: Omit<Partial<TrustedAuthorizationAssembly>, "principalProvider"> = {},
+  extras: Omit<Partial<CreateTrustedRuntimeInput>, "environment" | "principalProvider"> = {},
 ) {
   return {
-    authorization: { environment: "service" as const, bearerToken: TEST_TOKEN },
-    trustedServices: {
+    runtime: createTrustedRuntime({
+      environment: "service",
       principalProvider: createDenyByDefaultPrincipalProvider([{ token: TEST_TOKEN, principal }]),
       ...extras,
-    },
+    }),
+    authorization: { bearerToken: TEST_TOKEN },
   };
 }
 
@@ -301,7 +305,8 @@ describe("CW-09-02 trusted identity and delegation (unit)", () => {
           declaredCaller: CALLER,
           now: NOW,
         },
-        authorization: { environment: "service" },
+        runtime: createTrustedRuntime({ environment: "service" }),
+        authorization: { bearerToken: TEST_TOKEN },
       }),
     ).rejects.toBeInstanceOf(PrincipalUnavailableError);
 
@@ -321,8 +326,11 @@ describe("CW-09-02 trusted identity and delegation (unit)", () => {
           declaredCaller: CALLER,
           now: NOW,
         },
-        authorization: { environment: "cloud", bearerToken: "tok" },
-        trustedServices: { principalProvider: throwingProvider },
+        runtime: createTrustedRuntime({
+          environment: "cloud",
+          principalProvider: throwingProvider,
+        }),
+        authorization: { bearerToken: "tok" },
       }),
     ).rejects.toBeInstanceOf(PrincipalUnavailableError);
 
@@ -374,9 +382,10 @@ describe("CW-09-02 trusted identity and delegation (unit)", () => {
           declaredCaller: CALLER,
           now: NOW,
         },
-        authorization: { environment: "service", requireAuth: false },
+        runtime: createTrustedRuntime({ environment: "service" }),
+        authorization: { bearerToken: TEST_TOKEN, requireAuth: false } as never,
       }),
-    ).rejects.toBeInstanceOf(PrincipalUnavailableError);
+    ).rejects.toBeInstanceOf(SecurityOverrideRejectedError);
   });
 
   it("deny-by-default principal provider only allows registered tokens", async () => {
@@ -402,7 +411,7 @@ describe("CW-09-02 trusted identity and delegation (unit)", () => {
           declaredCaller: CALLER,
           now: NOW,
         },
-        authorization: { environment: "local", requireAuth: false },
+        runtime: createTrustedRuntime({ environment: "local", requireAuth: false }),
       }),
     ).rejects.toBeInstanceOf(BindingStoreUnavailableError);
 
@@ -417,11 +426,11 @@ describe("CW-09-02 trusted identity and delegation (unit)", () => {
           declaredCaller: CALLER,
           now: NOW,
         },
-        authorization: {
+        runtime: createTrustedRuntime({
           environment: "local",
           requireAuth: false,
-        },
-        bindingQuery: createDenyByDefaultBindingQuery([liveBinding()]),
+          bindingQuery: createDenyByDefaultBindingQuery([liveBinding()]),
+        }),
       }),
     ).rejects.toBeInstanceOf(DelegationStoreUnavailableError);
   });
@@ -440,7 +449,7 @@ describe("CW-09-02 trusted identity and delegation (unit)", () => {
         declaredCaller: CALLER,
         now: NOW,
       },
-      ...serviceTrusted(principalSelf, { metadataStore }),
+      ...serviceTrusted(principalSelf, { bindingQuery: createAuthoritativeBindingQueryFromMetadataStore(metadataStore) }),
     });
     expect(result.bindingId).toBe(binding.id);
     expect(result.decision.decision).toBe("allow");
@@ -460,16 +469,16 @@ describe("CW-09-02-R1 production identity injection (unit)", () => {
           declaredCaller: CALLER,
           now: NOW,
         },
+        runtime: createTrustedRuntime({ environment: "service" }),
         authorization: {
-          environment: "service",
           principal: principalSelf,
           bindingQuery: createDenyByDefaultBindingQuery([liveBinding()]),
-        },
+        } as never,
       }),
     ).rejects.toSatisfy((err: unknown) => {
-      expect(err).toBeInstanceOf(PrincipalUnavailableError);
-      const denied = err as PrincipalUnavailableError<import("./authorize.js").ExecutionAuthorizationDecision>;
-      expect(denied.decision.reason).toBe("untrusted_principal_injection");
+      expect(err).toBeInstanceOf(SecurityOverrideRejectedError);
+      const denied = err as SecurityOverrideRejectedError<import("./authorize.js").ExecutionAuthorizationDecision>;
+      expect(denied.decision.reason).toBe("security_override_rejected");
       return true;
     });
   });
@@ -487,21 +496,21 @@ describe("CW-09-02-R1 production identity injection (unit)", () => {
           declaredCaller: CALLER,
           now: NOW,
         },
-        authorization: {
+        runtime: createTrustedRuntime({
           environment: "service",
-          bearerToken: TEST_TOKEN,
-          bindingQuery: forged,
-        },
-        trustedServices: {
           principalProvider: createDenyByDefaultPrincipalProvider([
             { token: TEST_TOKEN, principal: principalSelf },
           ]),
-        },
+        }),
+        authorization: {
+          bearerToken: TEST_TOKEN,
+          bindingQuery: forged,
+        } as never,
       }),
     ).rejects.toSatisfy((err: unknown) => {
-      expect(err).toBeInstanceOf(BindingStoreUnavailableError);
-      const denied = err as BindingStoreUnavailableError<import("./authorize.js").ExecutionAuthorizationDecision>;
-      expect(denied.decision.reason).toBe("untrusted_binding_query");
+      expect(err).toBeInstanceOf(SecurityOverrideRejectedError);
+      const denied = err as SecurityOverrideRejectedError<import("./authorize.js").ExecutionAuthorizationDecision>;
+      expect(denied.decision.reason).toBe("security_override_rejected");
       return true;
     });
   });
@@ -517,12 +526,13 @@ describe("CW-09-02-R1 production identity injection (unit)", () => {
         declaredCaller: CALLER,
         now: NOW,
       },
-      authorization: {
+      runtime: createTrustedRuntime({
         environment: "local",
-        allowInjectedPrincipal: true,
-        principal: principalSelf,
+        requireAuth: true,
+        allowLocalInjection: true,
+        injectedPrincipal: principalSelf,
         bindingQuery: createDenyByDefaultBindingQuery([liveBinding()]),
-      },
+      }),
     });
     expect(result.allowed).toBe(true);
     expect(result.actorUserId).toBe("agent_main");
@@ -558,13 +568,14 @@ describe("CW-09-02-R2 principal tenant consistency at resolution (unit)", () => 
           declaredCaller: { ...CALLER, tenantId: "t_a" },
           now: NOW,
         },
-        authorization: { environment: "service", bearerToken: TEST_TOKEN },
-        trustedServices: {
+        runtime: createTrustedRuntime({
+          environment: "service",
           principalProvider: createDenyByDefaultPrincipalProvider([
             { token: TEST_TOKEN, principal: mismatched },
           ]),
           bindingQuery: createDenyByDefaultBindingQuery([liveBinding()]),
-        },
+        }),
+        authorization: { bearerToken: TEST_TOKEN },
       }),
     ).rejects.toBeInstanceOf(PrincipalUnavailableError);
   });

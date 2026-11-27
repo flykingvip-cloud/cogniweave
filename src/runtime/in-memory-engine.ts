@@ -6,6 +6,7 @@ import type {
   CogniWeaveEngine,
   CompactJournalsOptions,
   CompactJournalsResult,
+  EngineCallOptions,
   IngestInput,
   IngestResult,
   QueryAtomsHybridOptions,
@@ -16,6 +17,7 @@ import type {
   ResolveEvidenceOptions,
   SearchEvidenceOptions,
   TraceOptions,
+  UpsertAtomsOptions,
 } from "../contracts.js";
 import { withAtomV2Defaults } from "../domain/atom-v2.js";
 import {
@@ -24,11 +26,24 @@ import {
   isRebuildObjectType,
   journalObjectIdsForType,
   resolveCanonicalResourceScope as resolveCanonicalResourceScopeFromLookup,
+  type CanonicalAuthorizationMode,
   type CanonicalResourceKind,
   type CanonicalResourceLookup,
   type CanonicalResourceScope,
+  type CanonicalResourceScopeResolver,
 } from "../auth/canonical-scope.js";
-import { IdempotencyConflictError, ScopeViolationError, StoreUnavailableError, ValidationError } from "../errors.js";
+import {
+  authorizeEngineDirectInvocation,
+  type EngineDirectAuthorizationResult,
+} from "../auth/engine-invocation.js";
+import { sameMemorySubject } from "../auth/delegation.js";
+import {
+  createImplicitLocalRuntime,
+  createTrustedRuntime,
+  resolveTrustedRuntimeAssembly,
+  type TrustedRuntime,
+} from "../auth/trusted-runtime.js";
+import { IdempotencyConflictError, ScopeViolationError, StoreUnavailableError, UntrustedRuntimeError, ValidationError } from "../errors.js";
 import {
   repairDerivedIndexes as repairJournalDerivedIndexes,
   rebuildFromTruth as rebuildDerivedFromTruth,
@@ -691,6 +706,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   private readonly sourceObjectLinks = new Map<string, SourceObjectLink>();
   private readonly sourceLifecycleReceipts = new Map<string, SourceLifecycleReceipt>();
   private sourceLifecycleHydratePromise: Promise<void> | null = null;
+  readonly trustedRuntime: TrustedRuntime;
 
   constructor(
     config: EngineConfig,
@@ -701,9 +717,11 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       taskFramingStrategy?: TaskFramingStrategy;
       distillationStrategy?: DistillationStrategy;
       templateRegistry?: TemplateRegistry;
+      runtime?: TrustedRuntime;
     },
   ) {
     this.config = config;
+    this.trustedRuntime = this.initializeTrustedRuntime(stores?.runtime);
     const defaults = createAdapterBundle(config);
     const llmTaskFramingProvider = createHttpTaskFramingProvider(config);
     const llmDistillationProvider = createHttpDistillationProvider(config);
@@ -723,6 +741,54 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     this.templateRegistry = stores?.templateRegistry ?? DEFAULT_TEMPLATE_REGISTRY;
     // Kick hydrate early so first search/lifecycle sees durable bindings.
     void this.ensureSourceLifecycleHydrated();
+  }
+
+  private initializeTrustedRuntime(runtime?: TrustedRuntime): TrustedRuntime {
+    if (runtime !== undefined) {
+      const assembly = resolveTrustedRuntimeAssembly(runtime);
+      if (assembly.environment !== this.config.environment) {
+        throw new UntrustedRuntimeError(
+          "Trusted runtime environment must match EngineConfig.environment",
+          { decision: "deny", reason: "untrusted_runtime" },
+        );
+      }
+      return runtime;
+    }
+    if (this.config.environment === "local") {
+      return createImplicitLocalRuntime();
+    }
+    return createTrustedRuntime({ environment: this.config.environment });
+  }
+
+  resolveCanonicalResourceScopeForAuthorization(
+    kind: CanonicalResourceKind,
+    id: string,
+  ): Promise<CanonicalResourceScope> {
+    return resolveCanonicalResourceScopeFromLookup(kind, id, this.canonicalLookup());
+  }
+
+  private canonicalResolver(): CanonicalResourceScopeResolver {
+    return {
+      resolve: (kind, id) => this.resolveCanonicalResourceScopeForAuthorization(kind, id),
+    };
+  }
+
+  private async assertEngineAuthorized(input: {
+    method: string;
+    mode: CanonicalAuthorizationMode;
+    authorization?: { bearerToken?: string };
+    declaredScope?: Scope | null;
+    resource?: { kind: CanonicalResourceKind; id: string };
+  }): Promise<EngineDirectAuthorizationResult> {
+    return authorizeEngineDirectInvocation({
+      runtime: this.trustedRuntime,
+      method: input.method,
+      mode: input.mode,
+      authorization: input.authorization,
+      declaredScope: input.declaredScope,
+      resource: input.resource,
+      resolver: input.resource ? this.canonicalResolver() : undefined,
+    });
   }
 
   private ensureSourceLifecycleHydrated(): Promise<void> {
@@ -1400,10 +1466,16 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
 
   async frameTask(
     rawInput: string | Record<string, unknown>,
-    options?: { scope?: ScopeInput; hints?: Record<string, string | string[]>; forceLlm?: boolean },
+    options?: { scope?: ScopeInput; hints?: Record<string, string | string[]>; forceLlm?: boolean; authorization?: { bearerToken?: string } },
   ): Promise<TaskFrame> {
-    await this.ensureSourceLifecycleHydrated();
     const scope = resolveScope(options?.scope, this.config);
+    await this.assertEngineAuthorized({
+      method: "frameTask",
+      mode: "manage",
+      authorization: options?.authorization,
+      declaredScope: scope,
+    });
+    await this.ensureSourceLifecycleHydrated();
     const cacheKey = buildTaskFrameCacheKey(rawInput, scope, options?.hints);
     const forceLlm = options?.forceLlm === true;
     if (!forceLlm) {
@@ -1454,15 +1526,21 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   async reason(taskFrame: TaskFrame, options?: ReasonOptions): Promise<CognitivePackage> {
-    const [pkg] = await this.reasonWithDebug(taskFrame, { maxPaths: options?.maxPaths });
+    const [pkg] = await this.reasonWithDebug(taskFrame, options);
     return pkg;
   }
 
   async reasonWithDebug(
     taskFrame: TaskFrame,
-    options?: Pick<ReasonOptions, "maxPaths">,
+    options?: Pick<ReasonOptions, "maxPaths" | "authorization">,
   ): Promise<[CognitivePackage, ReasonDebugPayload]> {
     const normalizedTaskFrame = normalizeTaskFrame(taskFrame);
+    await this.assertEngineAuthorized({
+      method: "reasonWithDebug",
+      mode: "read",
+      authorization: options?.authorization,
+      declaredScope: normalizedTaskFrame.scope,
+    });
     const sessionId = createId("rsn");
     const template = this.templateRegistry.select(normalizedTaskFrame.taskType);
     const selectedTemplate = template.id;
@@ -1627,6 +1705,12 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
 
   async ingest(input: IngestInput): Promise<IngestResult> {
     const resolvedScope = resolveScope(input.scope, this.config);
+    await this.assertEngineAuthorized({
+      method: "ingest",
+      mode: "manage",
+      authorization: input.authorization,
+      declaredScope: resolvedScope,
+    });
     const ingestionId = createId("ing");
     const result: IngestResult = {
       ingestionId,
@@ -1638,6 +1722,12 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   async distill(input: IngestInput & { forceRebuild?: boolean }): Promise<DistillationResult> {
+    await this.assertEngineAuthorized({
+      method: "distill",
+      mode: "manage",
+      authorization: input.authorization,
+      declaredScope: resolveScope(input.scope, this.config),
+    });
     return this.distillationStrategy.distill({
       rawInput: input.rawInput,
       config: this.config,
@@ -1653,6 +1743,12 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   async writeBack(
     input: IngestInput & { package?: CognitivePackage | null },
   ): Promise<WriteBackResult> {
+    await this.assertEngineAuthorized({
+      method: "writeBack",
+      mode: "manage",
+      authorization: input.authorization,
+      declaredScope: resolveScope(input.scope, this.config),
+    });
     const writeOperationKey = await this.resolveWriteOperationKey(input);
     if (writeOperationKey && typeof this.metadataStore.getWriteOperation === "function") {
       const existing = await this.metadataStore.getWriteOperation(writeOperationKey);
@@ -1696,7 +1792,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         const withCanonicalEvent = canonicalizeDistillation(distillation, {
           eventId: existingEvent?.id ?? distillation.event.id,
         });
-        const atomDecisions = await this.upsertAtoms(withCanonicalEvent.atoms);
+        const atomDecisions = await this.upsertAtoms(withCanonicalEvent.atoms, { authorization: input.authorization });
         const atomIdMap = new Map(
           atomDecisions.map((decision) => [
             decision.atomId,
@@ -1705,7 +1801,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         );
         const canonicalDistillation = canonicalizeDistillation(withCanonicalEvent, { atomIdMap });
         assertCanonicalScopeHierarchy(canonicalDistillation);
-        const upsertedEvent = await this.upsertEvent(canonicalDistillation.event);
+        const upsertedEvent = await this.upsertEvent(canonicalDistillation.event, { authorization: input.authorization });
 
         for (const entity of canonicalDistillation.entities) {
           await this.metadataStore.saveEntity(entity);
@@ -1852,7 +1948,13 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return computeIngestionChecksum(rawInput, metadata);
   }
 
-  async upsertEvent(event: EventSkeleton): Promise<EventSkeleton> {
+  async upsertEvent(event: EventSkeleton, options?: EngineCallOptions): Promise<EventSkeleton> {
+    await this.assertEngineAuthorized({
+      method: "upsertEvent",
+      mode: "manage",
+      authorization: options?.authorization,
+      declaredScope: event.scope,
+    });
     const eventKey =
       event.eventKey ??
       computeEventKey({
@@ -1870,7 +1972,14 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return this.metadataStore.upsertEvent({ ...event, eventKey });
   }
 
-  async upsertAtoms(atoms: MemoryAtom[]): Promise<AtomUpsertDecision[]> {
+  async upsertAtoms(atoms: MemoryAtom[], options?: UpsertAtomsOptions): Promise<AtomUpsertDecision[]> {
+    const firstScope = atoms[0]?.scope;
+    await this.assertEngineAuthorized({
+      method: "upsertAtoms",
+      mode: "manage",
+      authorization: options?.authorization,
+      declaredScope: firstScope,
+    });
     const decisions: AtomUpsertDecision[] = [];
 
     for (const incomingAtom of atoms.map((atom) => attachDedupKey(withAtomV2Defaults(atom)))) {
@@ -1907,6 +2016,12 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   async trace(atomId: string, options?: TraceOptions): Promise<MemoryTrace> {
+    await this.assertEngineAuthorized({
+      method: "trace",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
     const requestedScope = resolveReadScopeOrThrow(options?.scope, this.config, "trace");
     const atom = await this.metadataStore.getAtom(atomId);
     if (!atom) {
@@ -1936,6 +2051,12 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   async tracePackage(packageId: string, _options?: TraceOptions): Promise<TracePackageResult> {
+    await this.assertEngineAuthorized({
+      method: "tracePackage",
+      mode: "read",
+      authorization: _options?.authorization,
+      resource: { kind: "package", id: packageId },
+    });
     const requestedScope = resolveReadScopeOrThrow(_options?.scope, this.config, "tracePackage");
     const trace = this.packageTraces.get(packageId);
     if (!trace) {
@@ -1949,6 +2070,12 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     sessionId: string,
     options?: TraceOptions,
   ): Promise<TraceReasoningSessionResult> {
+    await this.assertEngineAuthorized({
+      method: "traceReasoningSession",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "session", id: sessionId },
+    });
     const requestedScope = resolveReadScopeOrThrow(
       options?.scope,
       this.config,
@@ -1962,16 +2089,34 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return trace;
   }
 
-  async getProvenance(atomId: string) {
+  async getProvenance(atomId: string, options?: EngineCallOptions) {
+    await this.assertEngineAuthorized({
+      method: "getProvenance",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
     const atom = await this.metadataStore.getAtom(atomId);
     return atom?.provenance ?? { sourceEventIds: [], evidenceRefs: [] };
   }
 
-  async getConflicts(atomId: string): Promise<string[]> {
+  async getConflicts(atomId: string, options?: EngineCallOptions): Promise<string[]> {
+    await this.assertEngineAuthorized({
+      method: "getConflicts",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
     return (await this.metadataStore.getAtom(atomId))?.state.conflictsWith ?? [];
   }
 
-  async getVersionHistory(atomId: string): Promise<MemoryAtom[]> {
+  async getVersionHistory(atomId: string, options?: EngineCallOptions): Promise<MemoryAtom[]> {
+    await this.assertEngineAuthorized({
+      method: "getVersionHistory",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
     const atom = await this.metadataStore.getAtom(atomId);
     if (!atom) {
       return [];
@@ -1986,6 +2131,28 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
 
   async resolveEvidence(options: ResolveEvidenceOptions) {
     const requestedScope = resolveReadScopeOrThrow(options.scope, this.config, "resolveEvidence");
+    if (options.evidenceId) {
+      await this.assertEngineAuthorized({
+        method: "resolveEvidence",
+        mode: "read",
+        authorization: options.authorization,
+        resource: { kind: "evidence", id: options.evidenceId },
+      });
+    } else if (options.atomId) {
+      await this.assertEngineAuthorized({
+        method: "resolveEvidence",
+        mode: "read",
+        authorization: options.authorization,
+        resource: { kind: "atom", id: options.atomId },
+      });
+    } else {
+      await this.assertEngineAuthorized({
+        method: "resolveEvidence",
+        mode: "read",
+        authorization: options.authorization,
+        declaredScope: requestedScope,
+      });
+    }
     if (options.evidenceId) {
       const item = await this.metadataStore.getEvidence(options.evidenceId);
       if (!item) {
@@ -2015,7 +2182,13 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return [];
   }
 
-  async getEvidenceRefs(atomId: string, scope?: ScopeInput): Promise<string[]> {
+  async getEvidenceRefs(atomId: string, scope?: ScopeInput, options?: EngineCallOptions): Promise<string[]> {
+    await this.assertEngineAuthorized({
+      method: "getEvidenceRefs",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
     const requestedScope = resolveReadScopeOrThrow(scope, this.config, "getEvidenceRefs");
     const atom = await this.metadataStore.getAtom(atomId);
     if (!atom) {
@@ -2031,6 +2204,12 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   ): Promise<EvidenceSearchResult[]> {
     await this.ensureSourceLifecycleHydrated();
     const requestedScope = resolveReadScopeOrThrow(options?.scope, this.config, "searchEvidence");
+    await this.assertEngineAuthorized({
+      method: "searchEvidence",
+      mode: "read",
+      authorization: options?.authorization,
+      declaredScope: requestedScope,
+    });
     if (options?.caller) {
       const auth = await this.authorizeQueryAccess(requestedScope, options.caller);
       if (!auth.allowed) {
@@ -2066,7 +2245,21 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   async queryAtoms(options: QueryAtomsOptions): Promise<AtomQueryHit[]> {
     await this.ensureSourceLifecycleHydrated();
     const requestedScope = resolveReadScopeOrThrow(options.scope, this.config, "queryAtoms");
-    const auth = await this.authorizeQueryAccess(requestedScope, options.caller);
+    const direct = await this.assertEngineAuthorized({
+      method: "queryAtoms",
+      mode: "read",
+      authorization: options.authorization,
+      declaredScope: requestedScope,
+    });
+    if (!direct.unauthenticatedLocal) {
+      if (!sameMemorySubject(options.caller, direct.principal.subject) && options.caller.ownerId !== direct.principal.userId) {
+        throw new ScopeViolationError("queryAtoms caller does not match trusted principal subject");
+      }
+    }
+    const auth = await this.authorizeQueryAccess(
+      requestedScope,
+      direct.unauthenticatedLocal ? options.caller : direct.principal.subject,
+    );
     if (!auth.allowed) {
       return [];
     }
@@ -2202,7 +2395,15 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     scope: ScopeInput;
     caller: MemorySubject;
     scopeType?: "personal" | "agent" | "seat";
+    authorization?: { bearerToken?: string };
   }): Promise<{ bindingId: string; created: boolean }> {
+    const scope = resolveReadScopeOrThrow(input.scope, this.config, "ensureMemorySubjectBinding");
+    const direct = await this.assertEngineAuthorized({
+      method: "ensureMemorySubjectBinding",
+      mode: "manage",
+      authorization: input.authorization,
+      declaredScope: scope,
+    });
     if (
       !this.metadataStore.ensureDataPlaneId ||
       !this.metadataStore.saveMemorySubjectBinding ||
@@ -2210,7 +2411,6 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     ) {
       throw new Error("metadataStore MemorySubjectBinding APIs required");
     }
-    const scope = resolveReadScopeOrThrow(input.scope, this.config, "ensureMemorySubjectBinding");
     const dataPlaneId = await this.metadataStore.ensureDataPlaneId();
     const partition = createMemoryPartitionKeyV1(dataPlaneId, scope);
     const existing = await this.metadataStore.listMemorySubjectBindings({
@@ -2250,7 +2450,14 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   async detectConflicts(params: {
     atomIds?: string[];
     scope?: Scope;
+    authorization?: { bearerToken?: string };
   }): Promise<Record<string, unknown>> {
+    await this.assertEngineAuthorized({
+      method: "detectConflicts",
+      mode: "read",
+      authorization: params.authorization,
+      declaredScope: params.scope,
+    });
     const targetIds =
       params.atomIds ?? (await this.metadataStore.listAtoms()).map((atom) => atom.id);
     const conflicts = (
@@ -2265,7 +2472,14 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   async recomputeConfidence(
     atomId: string,
     signal?: Record<string, string | number | boolean>,
+    options?: EngineCallOptions,
   ): Promise<number> {
+    await this.assertEngineAuthorized({
+      method: "recomputeConfidence",
+      mode: "manage",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
     const atom = await this.metadataStore.getAtom(atomId);
     if (!atom) {
       return 0;
@@ -2276,7 +2490,13 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return atom.metrics.confidence;
   }
 
-  async deprecateAtom(atomId: string, _reason: string): Promise<void> {
+  async deprecateAtom(atomId: string, _reason: string, options?: EngineCallOptions): Promise<void> {
+    await this.assertEngineAuthorized({
+      method: "deprecateAtom",
+      mode: "manage",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
     const atom = await this.metadataStore.getAtom(atomId);
     if (!atom) {
       return;
@@ -2285,7 +2505,19 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     await this.metadataStore.saveAtom(atom);
   }
 
-  async supersedeAtom(oldAtomId: string, newAtomId: string): Promise<void> {
+  async supersedeAtom(oldAtomId: string, newAtomId: string, options?: EngineCallOptions): Promise<void> {
+    await this.assertEngineAuthorized({
+      method: "supersedeAtom",
+      mode: "manage",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: oldAtomId },
+    });
+    await this.assertEngineAuthorized({
+      method: "supersedeAtom",
+      mode: "manage",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: newAtomId },
+    });
     const oldAtom = await this.metadataStore.getAtom(oldAtomId);
     const newAtom = await this.metadataStore.getAtom(newAtomId);
     if (!oldAtom || !newAtom) {
@@ -2297,7 +2529,16 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     await this.metadataStore.saveAtom(newAtom);
   }
 
-  async mergeAtoms(atomIds: string[], targetAtomId?: string): Promise<string> {
+  async mergeAtoms(atomIds: string[], targetAtomId?: string, options?: EngineCallOptions): Promise<string> {
+    const mergeIds = [targetAtomId ?? atomIds[0], ...atomIds].filter((id): id is string => Boolean(id));
+    for (const atomId of [...new Set(mergeIds)]) {
+      await this.assertEngineAuthorized({
+        method: "mergeAtoms",
+        mode: "manage",
+        authorization: options?.authorization,
+        resource: { kind: "atom", id: atomId },
+      });
+    }
     const target = await this.metadataStore.getAtom(targetAtomId ?? atomIds[0]);
     if (!target) {
       throw new Error("merge target not found");
@@ -2336,8 +2577,19 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   async resolveCanonicalResourceScope(
     kind: CanonicalResourceKind,
     id: string,
+    options?: EngineCallOptions,
   ): Promise<CanonicalResourceScope> {
-    return resolveCanonicalResourceScopeFromLookup(kind, id, this.canonicalLookup());
+    const direct = await this.assertEngineAuthorized({
+      method: "resolveCanonicalResourceScope",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind, id },
+    });
+    if (direct.unauthenticatedLocal) {
+      return this.resolveCanonicalResourceScopeForAuthorization(kind, id);
+    }
+    const resolved = await this.resolveCanonicalResourceScopeForAuthorization(kind, id);
+    return resolved;
   }
 
   private async resolveJournalCanonicalScope(journal: WriteJournal): Promise<Scope | undefined> {
@@ -2365,12 +2617,28 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   async repairIndexes(options?: {
     journalId?: string;
     scope?: Scope;
+    authorization?: { bearerToken?: string };
   }): Promise<Record<string, unknown>> {
     const requestedScope = options?.scope
       ? resolveScope(options.scope, this.config)
       : undefined;
     if (!requestedScope && this.config.environment !== "local") {
       throw new ScopeViolationError("repairIndexes requires explicit scope");
+    }
+    if (options?.journalId) {
+      await this.assertEngineAuthorized({
+        method: "repairIndexes",
+        mode: "manage",
+        authorization: options?.authorization,
+        resource: { kind: "journal", id: options.journalId },
+      });
+    } else {
+      await this.assertEngineAuthorized({
+        method: "repairIndexes",
+        mode: "manage",
+        authorization: options?.authorization,
+        declaredScope: requestedScope,
+      });
     }
 
     let journals = options?.journalId
@@ -2401,13 +2669,20 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     objectType: string;
     objectId: string;
     scope?: ScopeInput;
+    authorization?: { bearerToken?: string };
   }): Promise<Record<string, unknown>> {
     const requestedScope = resolveReadScopeOrThrow(_options.scope, this.config, "rebuildFromTruth");
     const objectType = _options.objectType;
     if (!isRebuildObjectType(objectType)) {
       throw new ValidationError(`rebuildFromTruth received unsupported objectType: ${objectType}`);
     }
-    const resolved = await this.resolveCanonicalResourceScope(objectType, _options.objectId);
+    await this.assertEngineAuthorized({
+      method: "rebuildFromTruth",
+      mode: "manage",
+      authorization: _options.authorization,
+      resource: { kind: objectType, id: _options.objectId },
+    });
+    const resolved = await this.resolveCanonicalResourceScopeForAuthorization(objectType, _options.objectId);
     if (resolved.unresolvedReason === "store_unavailable") {
       throw new StoreUnavailableError("rebuildFromTruth canonical store unavailable");
     }
@@ -2443,6 +2718,12 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   async recoverFromCanonical(
     options?: RecoverFromCanonicalOptions,
   ): Promise<RecoverFromCanonicalResult> {
+    await this.assertEngineAuthorized({
+      method: "recoverFromCanonical",
+      mode: "manage",
+      authorization: options?.authorization,
+      declaredScope: options?.scope,
+    });
     await this.ensureSourceLifecycleHydrated();
 
     let journals = (await this.metadataStore.listJournals()).filter((journal) =>
@@ -2492,6 +2773,12 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   async compactJournals(options?: CompactJournalsOptions): Promise<CompactJournalsResult> {
+    await this.assertEngineAuthorized({
+      method: "compactJournals",
+      mode: "manage",
+      authorization: options?.authorization,
+      declaredScope: options?.scope,
+    });
     const keepCompleted = Math.max(0, options?.keepCompleted ?? 20);
     const dryRun = options?.dryRun === true;
     const journals = await this.metadataStore.listJournals();
@@ -2544,7 +2831,13 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     };
   }
 
-  async getWriteJournal(journalId: string, scope?: ScopeInput): Promise<WriteJournal> {
+  async getWriteJournal(journalId: string, scope?: ScopeInput, options?: EngineCallOptions): Promise<WriteJournal> {
+    await this.assertEngineAuthorized({
+      method: "getWriteJournal",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "journal", id: journalId },
+    });
     const requestedScope = resolveReadScopeOrThrow(scope, this.config, "getWriteJournal");
     const journal = await this.metadataStore.getJournal(journalId);
     if (!journal) {
@@ -2579,7 +2872,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
    * Includes bindings linked directly to the atom and bindings linked to its
    * current evidenceRefs. Does not invent locators or scan claim text.
    */
-  async listLiveSourcesForAtom(atomId: string): Promise<
+  async listLiveSourcesForAtom(atomId: string, options?: EngineCallOptions): Promise<
     Array<{
       sourceBindingId: string;
       sourceIdentityId: string;
@@ -2587,6 +2880,12 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       status: SourceLifecycleMode;
     }>
   > {
+    await this.assertEngineAuthorized({
+      method: "listLiveSourcesForAtom",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
     await this.ensureSourceLifecycleHydrated();
     const id = atomId.trim();
     if (!id) {
@@ -2757,6 +3056,12 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     target: SourceLifecycleMode,
     opts?: { from?: SourceLifecycleMode[] },
   ): Promise<SourceLifecycleReceipt> {
+    await this.assertEngineAuthorized({
+      method: "applySourceLifecycle",
+      mode: "manage",
+      authorization: input.authorization,
+      declaredScope: input.subject.scope,
+    });
     await this.ensureSourceLifecycleHydrated();
     const existingReceipt = await this.loadSourceLifecycleReceipt(input.operationId);
     if (existingReceipt) {

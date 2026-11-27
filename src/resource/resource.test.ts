@@ -121,7 +121,7 @@ describe("CogniWeaveMemoryResourceAdapter (CW-06A/B)", () => {
       await adapter.revokeAccess("res_team_1", {
         userId: "u_admin",
         tenantId: "t_1",
-        roles: ["tenant_admin"],
+        subject: { tenantId: "t_1", ownerType: "team", ownerId: "team_eng" },
       });
       // CW-08-06: Outbox consumer runs after persistence; failed consumer keeps event in outbox
       const failOnce = await adapter.dispatchOutboxEvents(async () => {

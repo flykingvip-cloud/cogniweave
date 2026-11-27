@@ -355,18 +355,35 @@ export class CogniWeaveMemoryResourceAdapter {
 
   authorizeResourceManagement(
     resource: MemoryResourceDescriptor,
-    actor: { userId: string; tenantId: string; roles?: string[] },
+    actor: {
+      userId: string;
+      tenantId: string;
+      roles?: string[];
+      subject?: { tenantId: string; ownerType: MemorySubject["ownerType"]; ownerId: string };
+    },
   ): boolean {
+    // Tenant/Workspace admin roles alone cannot bypass Canonical Ownership.
     if (actor.tenantId !== resource.tenantId) return false;
-    const roles = actor.roles ?? [];
-    if (roles.includes("tenant_admin") || roles.includes("governance_reviewer")) return true;
     if (resource.ownerType === "user" && resource.ownerId === actor.userId) return true;
+    if (
+      actor.subject &&
+      actor.subject.tenantId === resource.tenantId &&
+      actor.subject.ownerType === resource.ownerType &&
+      actor.subject.ownerId === resource.ownerId
+    ) {
+      return true;
+    }
     return false;
   }
 
   async revokeAccess(
     resourceId: string,
-    actor: { userId: string; tenantId: string; roles?: string[] },
+    actor: {
+      userId: string;
+      tenantId: string;
+      roles?: string[];
+      subject?: { tenantId: string; ownerType: MemorySubject["ownerType"]; ownerId: string };
+    },
     ctx?: { correlationId?: string; traceId?: string; policyVersion?: string },
   ): Promise<MemoryResourceDescriptor> {
     await this.ensureLoaded();

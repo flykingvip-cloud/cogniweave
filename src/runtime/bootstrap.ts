@@ -1,4 +1,5 @@
 import { createAdapterBundle } from "../adapters/factory.js";
+import type { TrustedRuntime } from "../auth/trusted-runtime.js";
 import type { EngineConfig } from "../models.js";
 import {
   createCogniWeaveHttpServer,
@@ -15,6 +16,8 @@ export interface CogniWeaveRuntime {
 }
 
 export interface CreateCogniWeaveRuntimeOptions {
+  /** Sealed runtime from createTrustedRuntime(). Required for service/cloud auth. */
+  runtime?: TrustedRuntime;
   http?: CogniWeaveHttpServerOptions;
 }
 
@@ -27,9 +30,13 @@ export function createCogniWeaveRuntime(
     metadataStore: bundle.metadataStore,
     graphStore: bundle.graphStore,
     vectorStore: bundle.vectorStore,
+    runtime: options?.runtime,
   });
   const service = new CogniWeaveRestService(engine);
-  const server = createCogniWeaveHttpServer(service, options?.http);
+  const server = createCogniWeaveHttpServer(service, {
+    ...options?.http,
+    runtime: options?.runtime ?? options?.http?.runtime ?? engine.trustedRuntime,
+  });
 
   return {
     config,

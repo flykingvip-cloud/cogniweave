@@ -26,7 +26,9 @@ export type ExecutionAuthorizationErrorCode =
   | "delegation_denied"
   | "delegation_store_unavailable"
   | "binding_store_unavailable"
-  | "unauthorized";
+  | "unauthorized"
+  | "untrusted_runtime"
+  | "security_override_rejected";
 
 /**
  * Fail-closed authorization failure. `decision` carries the CW-09-02 audit trace.
@@ -64,5 +66,17 @@ export class DelegationStoreUnavailableError<TDecision = unknown> extends Execut
 export class BindingStoreUnavailableError<TDecision = unknown> extends ExecutionAuthorizationError<TDecision> {
   constructor(message: string, decision: TDecision) {
     super("binding_store_unavailable", message, decision);
+  }
+}
+
+export class UntrustedRuntimeError<TDecision = unknown> extends ExecutionAuthorizationError<TDecision> {
+  constructor(message: string, decision: TDecision) {
+    super("untrusted_runtime", message, decision);
+  }
+}
+
+export class SecurityOverrideRejectedError<TDecision = unknown> extends ExecutionAuthorizationError<TDecision> {
+  constructor(message: string, decision: TDecision) {
+    super("security_override_rejected", message, decision);
   }
 }

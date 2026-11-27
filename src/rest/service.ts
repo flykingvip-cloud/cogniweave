@@ -35,6 +35,18 @@ function normalizeHeaders(headers?: Record<string, string | undefined>): Record<
   );
 }
 
+
+function bearerAuthorization(context?: RestContext): { authorization?: { bearerToken: string } } {
+  const token = normalizeHeaders(context?.headers).authorization;
+  if (token?.toLowerCase().startsWith("bearer ")) {
+    const bearerToken = token.slice("Bearer ".length).trim();
+    if (bearerToken) {
+      return { authorization: { bearerToken } };
+    }
+  }
+  return {};
+}
+
 function buildMetadata(
   requestMetadata: Record<string, string> | undefined,
   context?: RestContext,
@@ -196,35 +208,65 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     request: FrameTaskRequest,
     context?: RestContext,
   ): Promise<RestResponse<TaskFrame>> {
-    return response(200, await this.frameTask(request), normalizeHeaders(context?.headers));
+    return response(
+      200,
+      await this.engine.frameTask(request.rawInput, {
+        scope: request.scope,
+        hints: request.hints,
+        forceLlm: request.forceLlm,
+        ...bearerAuthorization(context),
+      }),
+      normalizeHeaders(context?.headers),
+    );
   }
 
   async handleReason(
     request: ReasonRequest,
     context?: RestContext,
   ): Promise<RestResponse<CognitivePackage>> {
-    return response(200, await this.reason(request), normalizeHeaders(context?.headers));
+    return response(
+      200,
+      await this.engine.reason(request.taskFrame, {
+        maxPaths: request.maxPaths,
+        includeExplainability: request.includeExplainability,
+        includeOptionalEvidenceRefs: request.includeOptionalEvidenceRefs,
+        ...bearerAuthorization(context),
+      }),
+      normalizeHeaders(context?.headers),
+    );
   }
 
   async handleReasonDebug(
     request: ReasonRequest,
     context?: RestContext,
   ): Promise<RestResponse<ReasonDebugResponse>> {
-    return response(200, await this.reasonDebug(request), normalizeHeaders(context?.headers));
+    const [pkg, debug] = await this.engine.reasonWithDebug(request.taskFrame, {
+      maxPaths: request.maxPaths,
+      ...bearerAuthorization(context),
+    });
+    return response(200, { package: pkg, debug }, normalizeHeaders(context?.headers));
   }
 
   async handleIngest(
     request: DistillRequest,
     context?: RestContext,
   ): Promise<RestResponse<IngestResult>> {
-    return response(202, await this.ingest(request, context), normalizeHeaders(context?.headers));
+    return response(
+      202,
+      await this.engine.ingest({ ...toIngestInput(request, context), ...bearerAuthorization(context) }),
+      normalizeHeaders(context?.headers),
+    );
   }
 
   async handleDistill(
     request: DistillRequest,
     context?: RestContext,
   ): Promise<RestResponse<DistillationResult>> {
-    const result = await this.distill(request, context);
+    const result = await this.engine.distill({
+      ...toIngestInput(request, context),
+      forceRebuild: request.forceRebuild,
+      ...bearerAuthorization(context),
+    });
     return response(200, result, {
       ...normalizeHeaders(context?.headers),
       "x-cogniweave-event-key": result.keys.eventKey,
@@ -235,7 +277,11 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     request: WriteBackRequest,
     context?: RestContext,
   ): Promise<RestResponse<WriteBackResult>> {
-    const result = await this.writeBack(request, context);
+    const result = await this.engine.writeBack({
+      ...toIngestInput(request, context),
+      package: request.package,
+      ...bearerAuthorization(context),
+    });
     return response(mapWriteBackStatus(result), result, {
       ...normalizeHeaders(context?.headers),
       "x-cogniweave-journal-id": result.journalId,
@@ -249,7 +295,7 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     const scope = resolveAuthorizedOrDeclaredScope(undefined, context) ?? parseScopeFromHeaders(context?.headers);
     return response(
       200,
-      await this.engine.tracePackage(packageId, { scope }),
+      await this.engine.tracePackage(packageId, { scope, ...bearerAuthorization(context) }),
       normalizeHeaders(context?.headers),
     );
   }
@@ -258,7 +304,7 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     const scope = resolveAuthorizedOrDeclaredScope(undefined, context) ?? parseScopeFromHeaders(context?.headers);
     return response(
       200,
-      await this.engine.trace(atomId, { scope }),
+      await this.engine.trace(atomId, { scope, ...bearerAuthorization(context) }),
       normalizeHeaders(context?.headers),
     );
   }
@@ -270,7 +316,7 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     const scope = resolveAuthorizedOrDeclaredScope(undefined, context) ?? parseScopeFromHeaders(context?.headers);
     return response(
       200,
-      await this.engine.traceReasoningSession(sessionId, { scope }),
+      await this.engine.traceReasoningSession(sessionId, { scope, ...bearerAuthorization(context) }),
       normalizeHeaders(context?.headers),
     );
   }
@@ -282,7 +328,7 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     const scope = resolveAuthorizedOrDeclaredScope(undefined, context) ?? parseScopeFromHeaders(context?.headers);
     return response(
       200,
-      await this.engine.getEvidenceRefs(atomId, scope),
+      await this.engine.getEvidenceRefs(atomId, scope, bearerAuthorization(context)),
       normalizeHeaders(context?.headers),
     );
   }
@@ -294,7 +340,7 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     const scope = resolveAuthorizedOrDeclaredScope(request.scope, context);
     return response(
       200,
-      await this.engine.resolveEvidence({ ...request, scope }),
+      await this.engine.resolveEvidence({ ...request, scope, ...bearerAuthorization(context) }),
       normalizeHeaders(context?.headers),
     );
   }
@@ -303,7 +349,11 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     request: RepairIndexesRequest,
     context?: RestContext,
   ): Promise<RestResponse<Record<string, unknown>>> {
-    return response(200, await this.repairIndexes(request), normalizeHeaders(context?.headers));
+    return response(
+      200,
+      await this.engine.repairIndexes({ ...request, ...bearerAuthorization(context) }),
+      normalizeHeaders(context?.headers),
+    );
   }
 
   async handleRebuildFromTruth(
@@ -313,7 +363,7 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     const scope = resolveAuthorizedOrDeclaredScope(request.scope, context);
     return response(
       200,
-      await this.rebuildFromTruth({ ...request, scope }),
+      await this.engine.rebuildFromTruth({ ...request, scope, ...bearerAuthorization(context) }),
       normalizeHeaders(context?.headers),
     );
   }
@@ -325,7 +375,7 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     const scope = resolveAuthorizedOrDeclaredScope(undefined, context) ?? parseScopeFromHeaders(context?.headers);
     return response(
       200,
-      await this.engine.getWriteJournal(journalId, scope),
+      await this.engine.getWriteJournal(journalId, scope, bearerAuthorization(context)),
       normalizeHeaders(context?.headers),
     );
   }

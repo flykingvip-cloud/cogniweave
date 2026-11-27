@@ -3,9 +3,15 @@ import {
   authorizeAtomBindings,
   authorizeTrustedExecution,
   type ExecutionAuthorizationDecision,
-  type TrustedAuthorizationAssembly,
-  type TrustedExecutionAuthorizationOptions,
+  type TrustedExecutionRequestAuthorization,
+  type TrustedRuntime,
 } from "../auth/authorize.js";
+import {
+  assertNoProductionSecurityOverrides,
+  findCallerSecurityOverrides,
+  resolveTrustedRuntimeAssembly,
+} from "../auth/trusted-runtime.js";
+import { SecurityOverrideRejectedError, UntrustedRuntimeError } from "../errors.js";
 import type { DurableJobStore } from "../jobs/durable-job-store.js";
 import { computeScopeFingerprint } from "../keys.js";
 import type { MemoryAtom, MemorySubject, MemorySubjectBinding, Scope } from "../models.js";
@@ -147,17 +153,18 @@ export async function runOptimizationJob(params: {
   optimizationType: OptimizationType;
   atoms: ReadonlyArray<MemoryAtom>;
   executionContext: OptimizationExecutionContext;
-  /** Request-level authorization options (bearer token, environment). Not a credential bag. */
-  authorization?: TrustedExecutionAuthorizationOptions;
+  /** Request data only: bearer token. Security configuration is not accepted here. */
+  authorization?: TrustedExecutionRequestAuthorization;
   /**
-   * Trusted runtime assembly of Principal Provider, Binding Query, and
-   * Delegation Store. Required in service/cloud. Not a business-request field.
+   * Sealed runtime created by `createTrustedRuntime()`. Required.
+   * Not a business-request field and not substitutable by a same-shaped object.
    */
-  trustedServices?: TrustedAuthorizationAssembly;
+  runtime: TrustedRuntime;
   policyVersion?: string;
   pipelineVersion?: string;
   nowMs?: number;
   jobStore?: DurableJobStore;
+  /** Data-plane persistence only. Never auto-promoted to a Binding Query. */
   metadataStore?: MetadataStore;
   graphStore?: GraphStore;
   vectorStore?: VectorStore;
@@ -175,7 +182,50 @@ export async function runOptimizationJob(params: {
   }
 
   const now = new Date(params.nowMs ?? Date.now()).toISOString();
-  const productionLike = (params.authorization?.environment ?? "service") !== "local";
+  let assembly;
+  try {
+    assembly = resolveTrustedRuntimeAssembly(params.runtime);
+  } catch (error) {
+    throw new UntrustedRuntimeError(
+      error instanceof Error
+        ? error.message
+        : "runOptimizationJob requires a verifiable TrustedRuntime from createTrustedRuntime()",
+      {
+        actor: { userId: ctx.actorUserId },
+        caller: ctx.caller,
+        subject: ctx.caller,
+        tenantId: params.tenantId,
+        scope: params.scope,
+        decision: "deny",
+        reason: "untrusted_runtime",
+        traceId: "opt_runtime",
+        at: now,
+      },
+    );
+  }
+
+  const overrideBags: unknown[] = [params, params.authorization, params.executionContext];
+  assertNoProductionSecurityOverrides({ environment: assembly.environment, bags: overrideBags });
+  // Even on local, public job parameters cannot install authorization infrastructure.
+  // Public job parameters cannot install authorization infrastructure in any environment.
+  const alwaysRejected = findCallerSecurityOverrides(params);
+  if (alwaysRejected.length > 0) {
+    throw new SecurityOverrideRejectedError(
+      `runOptimizationJob public parameters cannot carry authorization infrastructure: ${[...new Set(alwaysRejected)].join(", ")}`,
+      {
+        actor: { userId: ctx.actorUserId },
+        caller: ctx.caller,
+        subject: ctx.caller,
+        tenantId: params.tenantId,
+        scope: params.scope,
+        decision: "deny",
+        reason: "security_override_rejected",
+        traceId: "opt_override",
+        at: now,
+      },
+    );
+  }
+
   const authz = await authorizeTrustedExecution({
     request: {
       tenantId: params.tenantId,
@@ -186,11 +236,8 @@ export async function runOptimizationJob(params: {
       declaredCaller: ctx.caller,
       now,
     },
+    runtime: params.runtime,
     authorization: params.authorization,
-    trustedServices: params.trustedServices ?? params.authorization?.trustedServices,
-    // Production must not treat the job's data-plane metadataStore as a
-    // caller-substitutable Binding Query. Local/test may still use it.
-    ...(productionLike ? {} : { metadataStore: params.metadataStore }),
   });
   const authorizedCaller = authz.caller;
 

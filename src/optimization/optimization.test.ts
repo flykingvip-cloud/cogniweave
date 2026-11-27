@@ -2,14 +2,20 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import type { TrustedAuthorizationAssembly } from "../auth/authorize.js";
+import { createAuthoritativeBindingQueryFromMetadataStore } from "../auth/authorize.js";
 import { createMemoryDelegationAuthorizationStore } from "../auth/delegation.js";
 import { createDenyByDefaultPrincipalProvider, type TrustedPrincipal } from "../auth/principal.js";
+import { createTrustedRuntime } from "../auth/trusted-runtime.js";
+import type { AuthoritativeBindingQuery } from "../auth/canonical-scope.js";
+import type { DelegationAuthorizationStore } from "../auth/delegation.js";
+import type { MetadataStore } from "../storage/types.js";
 import {
   BindingStoreUnavailableError,
   DelegationDeniedError,
   DelegationStoreUnavailableError,
   PrincipalUnavailableError,
+  SecurityOverrideRejectedError,
+  UntrustedRuntimeError,
 } from "../errors.js";
 import { FileDurableJobStore } from "../jobs/durable-job-store.js";
 import { createMemoryPartitionKeyV1 } from "../keys.js";
@@ -57,14 +63,26 @@ const TEST_TOKEN = "tok";
 
 function serviceJobAuth(
   principal: TrustedPrincipal,
-  extras: Omit<Partial<TrustedAuthorizationAssembly>, "principalProvider"> = {},
+  extras: {
+    bindingQuery?: AuthoritativeBindingQuery;
+    delegationStore?: DelegationAuthorizationStore;
+    metadataStore?: MetadataStore;
+  } = {},
 ) {
+  const bindingQuery =
+    extras.bindingQuery ??
+    (extras.metadataStore
+      ? createAuthoritativeBindingQueryFromMetadataStore(extras.metadataStore)
+      : undefined);
   return {
-    authorization: { environment: "service" as const, bearerToken: TEST_TOKEN },
-    trustedServices: {
+    runtime: createTrustedRuntime({
+      environment: "service",
       principalProvider: createDenyByDefaultPrincipalProvider([{ token: TEST_TOKEN, principal }]),
-      ...extras,
-    },
+      ...(bindingQuery ? { bindingQuery } : {}),
+      ...(extras.delegationStore ? { delegationStore: extras.delegationStore } : {}),
+    }),
+    authorization: { bearerToken: TEST_TOKEN },
+    ...(extras.metadataStore ? { metadataStore: extras.metadataStore } : {}),
   };
 }
 
@@ -524,7 +542,8 @@ describe("CW-09-02 runOptimizationJob trusted identity (unit)", () => {
           caller: CALLER,
           dataPlaneId: "dp_1",
         },
-        authorization: { environment: "cloud" },
+        runtime: createTrustedRuntime({ environment: "cloud" }),
+        authorization: { bearerToken: TEST_TOKEN },
       }),
     ).rejects.toBeInstanceOf(PrincipalUnavailableError);
 
@@ -574,12 +593,12 @@ describe("CW-09-02-R1 runOptimizationJob production injection (unit)", () => {
           caller: CALLER,
           dataPlaneId: "dp_1",
         },
+        runtime: createTrustedRuntime({ environment: "service" }),
         authorization: {
-          environment: "service",
           principal: SELF_PRINCIPAL,
-        },
+        } as never,
       }),
-    ).rejects.toBeInstanceOf(PrincipalUnavailableError);
+    ).rejects.toBeInstanceOf(SecurityOverrideRejectedError);
 
     const forgedStore = new InMemoryMetadataStore();
     await forgedStore.saveMemorySubjectBinding(
@@ -603,22 +622,22 @@ describe("CW-09-02-R1 runOptimizationJob production injection (unit)", () => {
           caller: CALLER,
           dataPlaneId: "dp_1",
         },
-        authorization: {
+        runtime: createTrustedRuntime({
           environment: "cloud",
+          principalProvider: createDenyByDefaultPrincipalProvider([
+            { token: TEST_TOKEN, principal: SELF_PRINCIPAL },
+          ]),
+        }),
+        authorization: {
           bearerToken: TEST_TOKEN,
           bindingQuery: {
             async listLiveBindings() {
               return forgedStore.listMemorySubjectBindings!({ liveOnly: true });
             },
           },
-        },
-        trustedServices: {
-          principalProvider: createDenyByDefaultPrincipalProvider([
-            { token: TEST_TOKEN, principal: SELF_PRINCIPAL },
-          ]),
-        },
+        } as never,
         metadataStore: forgedStore,
       }),
-    ).rejects.toBeInstanceOf(BindingStoreUnavailableError);
+    ).rejects.toBeInstanceOf(SecurityOverrideRejectedError);
   });
 });

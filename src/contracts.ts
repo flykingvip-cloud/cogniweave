@@ -29,6 +29,15 @@ import type {
   CanonicalResourceScope,
 } from "./auth/canonical-scope.js";
 
+export type EngineCallAuthorization = {
+  /** Request data only. Environment, providers, and stores are not accepted here. */
+  bearerToken?: string;
+};
+
+export type EngineCallOptions = {
+  authorization?: EngineCallAuthorization;
+};
+
 export interface IngestInput {
   rawInput: string | Record<string, unknown>;
   scope: Scope;
@@ -36,6 +45,7 @@ export interface IngestInput {
   sourceSessionId?: string;
   sourceTurnRange?: [number, number];
   metadata?: Record<string, string>;
+  authorization?: EngineCallAuthorization;
 }
 
 export interface IngestResult {
@@ -48,21 +58,25 @@ export interface FrameTaskOptions {
   scope?: ScopeInput;
   hints?: Record<string, string | string[]>;
   forceLlm?: boolean;
+  authorization?: EngineCallAuthorization;
 }
 
 export interface ReasonOptions {
   maxPaths?: number;
   includeExplainability?: boolean;
   includeOptionalEvidenceRefs?: boolean;
+  authorization?: EngineCallAuthorization;
 }
 
 export interface UpsertAtomsOptions {
   mergeStrategy?: "default";
+  authorization?: EngineCallAuthorization;
 }
 
 export interface TraceOptions {
   includeOptionalEvidenceRefs?: boolean;
   scope?: ScopeInput;
+  authorization?: EngineCallAuthorization;
 }
 
 export interface ResolveEvidenceOptions {
@@ -70,6 +84,7 @@ export interface ResolveEvidenceOptions {
   evidenceId?: string;
   includeContent?: boolean;
   scope?: ScopeInput;
+  authorization?: EngineCallAuthorization;
 }
 
 export interface SearchEvidenceOptions {
@@ -78,6 +93,7 @@ export interface SearchEvidenceOptions {
   minScore?: number;
   /** When set, ACL authorize runs before candidates are returned (CW2-P4-01). */
   caller?: MemorySubject;
+  authorization?: EngineCallAuthorization;
 }
 
 export type QueryAtomsOptions = {
@@ -89,6 +105,7 @@ export type QueryAtomsOptions = {
     includeConflicted?: boolean;
     limit?: number;
   };
+  authorization?: EngineCallAuthorization;
 };
 
 export type AtomQueryHit = {
@@ -122,6 +139,7 @@ export type AtomHybridHit = AtomQueryHit & {
 export interface RepairIndexesOptions {
   journalId?: string;
   scope?: Scope;
+  authorization?: EngineCallAuthorization;
 }
 
 export interface RebuildFromTruthOptions {
@@ -129,10 +147,12 @@ export interface RebuildFromTruthOptions {
   objectId: string;
   /** CW-09-01: required for authorization; compared against canonical ownership. */
   scope?: Scope;
+  authorization?: EngineCallAuthorization;
 }
 
 export interface RecoverFromCanonicalOptions {
   scope?: Scope;
+  authorization?: EngineCallAuthorization;
 }
 
 export interface RecoverFromCanonicalResult {
@@ -147,6 +167,9 @@ export interface CompactJournalsOptions {
   /** Retain this many newest COMPLETED journals (default 20). */
   keepCompleted?: number;
   dryRun?: boolean;
+  /** Required in service/cloud; management is fail-closed without an authorized scope. */
+  scope?: Scope;
+  authorization?: EngineCallAuthorization;
 }
 
 export interface CompactJournalsResult {
@@ -181,7 +204,7 @@ export interface CogniWeaveEngine {
     rawInput: string | Record<string, unknown>,
     metadata?: Record<string, string>,
   ): string;
-  upsertEvent(event: EventSkeleton): Promise<EventSkeleton>;
+  upsertEvent(event: EventSkeleton, options?: EngineCallOptions): Promise<EventSkeleton>;
   upsertAtoms(atoms: MemoryAtom[], options?: UpsertAtomsOptions): Promise<AtomUpsertDecision[]>;
 
   trace(atomId: string, options?: TraceOptions): Promise<MemoryTrace>;
@@ -190,12 +213,12 @@ export interface CogniWeaveEngine {
     sessionId: string,
     options?: TraceOptions,
   ): Promise<TraceReasoningSessionResult>;
-  getProvenance(atomId: string): Promise<MemoryProvenance>;
-  getConflicts(atomId: string): Promise<string[]>;
-  getVersionHistory(atomId: string): Promise<MemoryAtom[]>;
+  getProvenance(atomId: string, options?: EngineCallOptions): Promise<MemoryProvenance>;
+  getConflicts(atomId: string, options?: EngineCallOptions): Promise<string[]>;
+  getVersionHistory(atomId: string, options?: EngineCallOptions): Promise<MemoryAtom[]>;
 
   resolveEvidence(options: ResolveEvidenceOptions): Promise<EvidenceRecord | EvidenceRecord[]>;
-  getEvidenceRefs(atomId: string, scope?: ScopeInput): Promise<string[]>;
+  getEvidenceRefs(atomId: string, scope?: ScopeInput, options?: EngineCallOptions): Promise<string[]>;
   searchEvidence(query: string, options?: SearchEvidenceOptions): Promise<EvidenceSearchResult[]>;
   /** CW2-P4-01: ACL + lifecycle gated scope query (no listAtoms full scan). */
   queryAtoms(options: QueryAtomsOptions): Promise<AtomQueryHit[]>;
@@ -209,25 +232,37 @@ export interface CogniWeaveEngine {
     scope: ScopeInput;
     caller: MemorySubject;
     scopeType?: "personal" | "agent" | "seat";
+    authorization?: EngineCallAuthorization;
   }): Promise<{ bindingId: string; created: boolean }>;
 
   detectConflicts(params: { atomIds?: string[]; scope?: Scope }): Promise<Record<string, unknown>>;
   recomputeConfidence(
     atomId: string,
     signal?: Record<string, string | number | boolean>,
+    options?: EngineCallOptions,
   ): Promise<number>;
-  deprecateAtom(atomId: string, reason: string): Promise<void>;
-  supersedeAtom(oldAtomId: string, newAtomId: string): Promise<void>;
-  mergeAtoms(atomIds: string[], targetAtomId?: string): Promise<string>;
+  deprecateAtom(atomId: string, reason: string, options?: EngineCallOptions): Promise<void>;
+  supersedeAtom(oldAtomId: string, newAtomId: string, options?: EngineCallOptions): Promise<void>;
+  mergeAtoms(atomIds: string[], targetAtomId?: string, options?: EngineCallOptions): Promise<string>;
 
   repairIndexes(options?: RepairIndexesOptions): Promise<Record<string, unknown>>;
   rebuildFromTruth(options: RebuildFromTruthOptions): Promise<Record<string, unknown>>;
-  getWriteJournal(journalId: string, scope?: ScopeInput): Promise<WriteJournal>;
+  getWriteJournal(journalId: string, scope?: ScopeInput, options?: EngineCallOptions): Promise<WriteJournal>;
   /**
-   * CW-09-01: resolve Tenant/Workspace/Subject ownership from the Canonical Store.
-   * Does not authorize the caller; callers must still pass a matching scope into mutating APIs.
+   * CW-09-01 / CW-09-02-R5: resolve Canonical ownership, then authorize the caller
+   * in service/cloud. Use `resolveCanonicalResourceScopeForAuthorization` only from
+   * an authorization gate that will apply its own policy.
    */
   resolveCanonicalResourceScope(
+    kind: CanonicalResourceKind,
+    id: string,
+    options?: EngineCallOptions,
+  ): Promise<CanonicalResourceScope>;
+  /**
+   * Internal authorization lookup. Does not enforce caller authorization and must
+   * not be treated as a public data-access API.
+   */
+  resolveCanonicalResourceScopeForAuthorization?(
     kind: CanonicalResourceKind,
     id: string,
   ): Promise<CanonicalResourceScope>;
@@ -251,7 +286,7 @@ export interface CogniWeaveEngine {
    * Fact-level forget enumeration: live source bindings linked to an atom
    * via atom and/or evidence source_object_links (no text-scan deletes).
    */
-  listLiveSourcesForAtom(atomId: string): Promise<
+  listLiveSourcesForAtom(atomId: string, options?: EngineCallOptions): Promise<
     Array<{
       sourceBindingId: string;
       sourceIdentityId: string;

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { createAuthoritativeBindingQueryFromMetadataStore } from "../auth/canonical-scope.js";
+import { createDenyByDefaultPrincipalProvider } from "../auth/principal.js";
+import { createTrustedRuntime } from "../auth/trusted-runtime.js";
 import { ScopeViolationError, ValidationError } from "../errors.js";
+import { createMemoryPartitionKeyV1 } from "../keys.js";
 import { InMemoryMetadataStore } from "../storage/in-memory.js";
+import { createMemorySubjectBinding } from "../subject/binding.js";
 import { InMemoryCogniWeaveEngine } from "./in-memory-engine.js";
 
 const scope = {
@@ -15,9 +20,40 @@ const otherScope = {
   workspaceId: "ws_other",
 };
 
-function engine(environment: "local" | "service" = "local", metadataStore = new InMemoryMetadataStore()) {
+const serviceAuth = { bearerToken: "svc_tok" };
+const serviceSubject = { tenantId: "t_1", ownerType: "user" as const, ownerId: "u_1" };
+
+async function engine(environment: "local" | "service" = "local", metadataStore = new InMemoryMetadataStore()) {
+  let runtime = undefined;
+  if (environment === "service") {
+    const dataPlaneId = await metadataStore.ensureDataPlaneId();
+    await metadataStore.saveMemorySubjectBinding(
+      createMemorySubjectBinding({
+        partition: createMemoryPartitionKeyV1(dataPlaneId, scope),
+        scope,
+        subject: serviceSubject,
+      }),
+    );
+    runtime = createTrustedRuntime({
+      environment: "service",
+      principalProvider: createDenyByDefaultPrincipalProvider([
+        {
+          token: "svc_tok",
+          principal: {
+            tenantId: "t_1",
+            userId: "u_1",
+            subject: serviceSubject,
+            allowedWorkspaceIds: ["ws_1", "ws_other"],
+          },
+        },
+      ]),
+      bindingQuery: createAuthoritativeBindingQueryFromMetadataStore(metadataStore),
+      ensureDataPlaneId: () => metadataStore.ensureDataPlaneId(),
+    });
+  }
   return {
     metadataStore,
+    authorization: environment === "service" ? serviceAuth : undefined,
     engine: new InMemoryCogniWeaveEngine(
       {
         environment,
@@ -26,7 +62,7 @@ function engine(environment: "local" | "service" = "local", metadataStore = new 
         evidenceBackend: "memory",
         vectorBackend: "memory",
       },
-      { metadataStore },
+      { metadataStore, runtime },
     ),
   };
 }
@@ -36,7 +72,7 @@ const rawInput =
 
 describe("CW-09-01 engine canonical scope guards", () => {
   it("persists WriteJournal.scope on writeBack and uses it for getWriteJournal", async () => {
-    const { engine: cw } = engine();
+    const { engine: cw } = await engine();
     const write = await cw.writeBack({
       rawInput,
       scope,
@@ -48,7 +84,7 @@ describe("CW-09-01 engine canonical scope guards", () => {
   });
 
   it("refuses getWriteJournal when ownership cannot be derived", async () => {
-    const { engine: cw, metadataStore } = engine();
+    const { engine: cw, metadataStore } = await engine();
     await metadataStore.putJournal({
       id: "jnl_orphan",
       eventKey: "ek_orphan",
@@ -71,7 +107,7 @@ describe("CW-09-01 engine canonical scope guards", () => {
   });
 
   it("rebuildFromTruth requires caller scope and matching objectType", async () => {
-    const { engine: cw } = engine();
+    const { engine: cw } = await engine();
     const write = await cw.writeBack({
       rawInput,
       scope,
@@ -104,12 +140,13 @@ describe("CW-09-01 engine canonical scope guards", () => {
   });
 
   it("repairIndexes in service mode requires scope and excludes unresolvable journals", async () => {
-    const { engine: cw, metadataStore } = engine("service");
+    const { engine: cw, metadataStore, authorization } = await engine("service");
     const write = await cw.writeBack({
       rawInput,
       scope,
       sourceType: "chat",
       sourceSessionId: "sess_repair",
+      authorization,
     });
     await metadataStore.updateJournal(write.journalId, { status: "DERIVED_OUT_OF_SYNC" });
     await metadataStore.putJournal({
@@ -131,11 +168,11 @@ describe("CW-09-01 engine canonical scope guards", () => {
       updatedAt: new Date().toISOString(),
     });
 
-    await expect(cw.repairIndexes({ journalId: write.journalId })).rejects.toBeInstanceOf(
+    await expect(cw.repairIndexes({ journalId: write.journalId, authorization })).rejects.toBeInstanceOf(
       ScopeViolationError,
     );
 
-    const repaired = await cw.repairIndexes({ scope });
+    const repaired = await cw.repairIndexes({ scope, authorization });
     expect(repaired).toMatchObject({ status: "SYNCED", repairedCount: 1 });
   });
 });

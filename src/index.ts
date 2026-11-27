@@ -84,6 +84,8 @@ export type {
   CogniWeaveEngine,
   CompactJournalsOptions,
   CompactJournalsResult,
+  EngineCallAuthorization,
+  EngineCallOptions,
   FrameTaskOptions,
   IngestInput,
   IngestResult,
@@ -112,9 +114,11 @@ export {
   IdempotencyConflictError,
   PrincipalUnavailableError,
   ReasoningError,
+  SecurityOverrideRejectedError,
   ScopeViolationError,
   StorageConsistencyError,
   StoreUnavailableError,
+  UntrustedRuntimeError,
   ValidationError,
 } from "./errors.js";
 export type { ExecutionAuthorizationErrorCode } from "./errors.js";
@@ -452,6 +456,8 @@ export type {
   TrustedExecutionAuthorizationOptions,
   TrustedExecutionAuthorizationSuccess,
   TrustedExecutionRequest,
+  TrustedExecutionRequestAuthorization,
+  TrustedRuntime,
 } from "./auth/authorize.js";
 export {
   authorizeAtomBindings,
@@ -459,7 +465,24 @@ export {
   createAuthoritativeBindingQueryFromMetadataStore,
   isProductionLikeEnvironment,
   resolveRequireAuth,
+  resolveRequireAuthFromRuntime,
 } from "./auth/authorize.js";
+
+export type {
+  CreateTrustedRuntimeInput,
+  SealedTrustedRuntimeAssembly,
+} from "./auth/trusted-runtime.js";
+export {
+  REQUEST_SECURITY_OVERRIDE_KEYS,
+  createImplicitLocalRuntime,
+  createTrustedRuntime,
+  findCallerSecurityOverrides,
+  isVerifiableTrustedRuntime,
+  resolveTrustedRuntimeAssembly,
+} from "./auth/trusted-runtime.js";
+
+export { ENGINE_DIRECT_AUTH_ENTRYPOINTS } from "./auth/engine-invocation.js";
+export type { EngineDirectAuthMethod } from "./auth/engine-invocation.js";
 
 export type {
   DistillRequest,
