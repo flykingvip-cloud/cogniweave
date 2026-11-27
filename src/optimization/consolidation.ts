@@ -269,13 +269,16 @@ export async function applyConsolidation(params: {
 
   if (deprecatedSourceIds.length === 0) {
     derivedIndexesSynced = true;
-  } else if (!params.graphStore || !params.vectorStore) {
+  } else if (
+    typeof params.graphStore?.delete !== "function" ||
+    typeof params.vectorStore?.delete !== "function"
+  ) {
     derivedIndexesSynced = false;
-    derivedSyncError = "graphStore_or_vectorStore_not_configured";
+    derivedSyncError = "derived_store_delete_unsupported";
   } else {
     try {
-      await params.graphStore.delete?.(deprecatedSourceIds);
-      await params.vectorStore.delete?.(deprecatedSourceIds);
+      await params.graphStore.delete(deprecatedSourceIds);
+      await params.vectorStore.delete(deprecatedSourceIds);
       derivedIndexesSynced = true;
     } catch (err) {
       derivedIndexesSynced = false;

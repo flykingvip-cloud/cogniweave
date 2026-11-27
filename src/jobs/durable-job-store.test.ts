@@ -37,13 +37,27 @@ describe("FileDurableJobStore (CW-07B)", () => {
         }),
       ).rejects.toThrow("different payload");
 
-      // J-05: Worker lease claim
+      // J-05 & CW-07B-R1: Worker lease claim with fencingToken; stale worker rejected
       const claimed = await store1.claimJob(j1.jobId, "worker_1", 5000, 1000);
       expect(claimed?.claimedByWorkerId).toBe("worker_1");
+      expect(claimed?.fencingToken).toBe(1);
       expect(await store1.claimJob(j1.jobId, "worker_2", 5000, 2000)).toBeNull();
 
+      // Lease expires at 6000; release and re-claim by worker_2 (fencingToken = 2)
+      await store1.releaseExpiredLeases(7000);
+      const reclaimed = await store1.claimJob(j1.jobId, "worker_2", 5000, 7500);
+      expect(reclaimed?.fencingToken).toBe(2);
+
+      // Stale worker_1 with fencingToken=1 cannot checkpoint or complete
+      await expect(
+        store1.checkpoint(j1.jobId, "stale_cp", 50, { workerId: "worker_1", fencingToken: 1 }),
+      ).rejects.toThrow("Stale worker lease");
+
       // J-04: Exponential backoff on retry -> dead_letter on maxAttempts
-      const retrying = await store1.fail(j1.jobId, "transient_err", 10_000);
+      const retrying = await store1.fail(j1.jobId, "transient_err", 10_000, {
+        workerId: "worker_2",
+        fencingToken: 2,
+      });
       expect(retrying.status).toBe("retrying");
       expect(retrying.nextAttemptAt).toBe(new Date(11_000).toISOString());
 

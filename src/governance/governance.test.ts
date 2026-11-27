@@ -98,6 +98,7 @@ describe("MemoryGovernanceService (CW-05A/B/C)", () => {
         actor: SPACE_ADMIN,
         candidateId: candidate.candidateId,
         decision: "approved",
+        approvedAtomVersion: ATOM.versioning.version,
         reason: "verified",
       });
       expect(approved.status).toBe("approved");
@@ -110,6 +111,26 @@ describe("MemoryGovernanceService (CW-05A/B/C)", () => {
         },
       };
 
+      // Non-admin member cannot publish approved promotion (CW-05C-R1)
+      await expect(
+        gov1.publishPromotion({
+          actor: MEMBER,
+          candidateId: candidate.candidateId,
+          atom: ATOM,
+          publisher,
+        }),
+      ).rejects.toThrow("lacks publish authority");
+
+      // Version mismatch rejected at publish time (CW-05C-R1)
+      await expect(
+        gov1.publishPromotion({
+          actor: SPACE_ADMIN,
+          candidateId: candidate.candidateId,
+          atom: { ...ATOM, versioning: { version: 99 } },
+          publisher,
+        }),
+      ).rejects.toThrow("Atom version mismatch");
+
       const published = await gov1.publishPromotion({
         actor: SPACE_ADMIN,
         candidateId: candidate.candidateId,
@@ -118,6 +139,15 @@ describe("MemoryGovernanceService (CW-05A/B/C)", () => {
       });
       expect(published.status).toBe("published");
       expect(published.publishedAssetId).toBe("kb_asset_99");
+
+      // Member cannot withdraw published org/team asset (CW-05C-R1)
+      await expect(
+        gov1.withdrawPromotion({
+          actor: MEMBER,
+          candidateId: candidate.candidateId,
+          publisher,
+        }),
+      ).rejects.toThrow("not authorized to withdraw");
 
       // Reload in fresh instance
       const gov2 = new MemoryGovernanceService({ storagePath });

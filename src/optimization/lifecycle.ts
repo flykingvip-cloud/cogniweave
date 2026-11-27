@@ -1,4 +1,5 @@
-import type { MemoryAtom } from "../models.js";
+import { randomUUID } from "node:crypto";
+import type { MemoryAtom, WriteJournal } from "../models.js";
 import type { GraphStore, MetadataStore, VectorStore } from "../storage/types.js";
 
 export type LifecycleAction =
@@ -40,6 +41,8 @@ export interface LifecycleEvaluation {
 }
 
 export interface AppliedLifecycleResult {
+  journalId: string;
+  canonicalCommitted: boolean;
   archivedIds: string[];
   deprecatedIds: string[];
   tombstonedIds: string[];
@@ -47,6 +50,7 @@ export interface AppliedLifecycleResult {
   deprioritizedIds: string[];
   purgedIds: string[];
   derivedIndexesSynced: boolean;
+  derivedSyncError?: string;
 }
 
 export function evaluateLifecycle(
@@ -251,71 +255,135 @@ export async function applyLifecycleDecisions(params: {
   const purgedIds: string[] = [];
   const removeFromDerivedIds: string[] = [];
   const now = params.now ?? new Date().toISOString();
+  const journalId = `jrnl_life_${randomUUID().slice(0, 12)}`;
 
-  for (const ev of params.evaluations) {
-    const atom = await params.metadataStore.getAtom(ev.atomId);
-    if (!atom) continue;
-    if (atom.lifecycle?.retentionClass === "legal_hold") continue;
+  const journal: WriteJournal = {
+    id: journalId,
+    eventKey: journalId,
+    status: "RECEIVED",
+    phase: "RECEIVED",
+    retryCount: 0,
+    objectIds: {
+      eventIds: [],
+      atomIds: [],
+      entityIds: [],
+      scenarioIds: [],
+      problemIds: [],
+      evidenceIds: [],
+      relationIds: [],
+    },
+    derivedPlan: {
+      graphNodeIds: [],
+      graphEdgeIds: [],
+      vectorDocIds: [],
+    },
+    updatedAt: now,
+  };
+  await params.metadataStore.putJournal(journal);
 
-    if (ev.action === "purge") {
-      await params.metadataStore.deleteAtom(atom.id);
-      purgedIds.push(atom.id);
-      removeFromDerivedIds.push(atom.id);
-    } else if (ev.action === "tombstone") {
-      await params.metadataStore.saveAtom({
-        ...atom,
-        state: { ...atom.state, status: "deprecated" },
-        lifecycle: {
-          ...atom.lifecycle,
-          tombstonedAt: atom.lifecycle?.tombstonedAt ?? now,
-          deprecatedAt: atom.lifecycle?.deprecatedAt ?? now,
-        },
-        versioning: { ...atom.versioning, version: atom.versioning.version + 1 },
-      });
-      tombstonedIds.push(atom.id);
-      removeFromDerivedIds.push(atom.id);
-    } else if (ev.action === "deprecate" || ev.action === "archive") {
-      await params.metadataStore.saveAtom({
-        ...atom,
-        state: { ...atom.state, status: "deprecated" },
-        lifecycle: { ...atom.lifecycle, deprecatedAt: atom.lifecycle?.deprecatedAt ?? now },
-        versioning: { ...atom.versioning, version: atom.versioning.version + 1 },
-      });
-      if (ev.action === "archive") archivedIds.push(atom.id);
-      else deprecatedIds.push(atom.id);
-      removeFromDerivedIds.push(atom.id);
-    } else if (ev.action === "revalidate") {
-      await params.metadataStore.saveAtom({
-        ...atom,
-        state: { ...atom.state, status: "tentative" },
-        versioning: { ...atom.versioning, version: atom.versioning.version + 1 },
-      });
-      revalidatedIds.push(atom.id);
-    } else if (ev.action === "deprioritize") {
-      await params.metadataStore.saveAtom({
-        ...atom,
-        governance: {
-          ...atom.governance,
-          retrievalScore: ev.decayedValue,
-          lastScoredAt: now,
-          scoreVersion: 1,
-        },
-      });
-      deprioritizedIds.push(atom.id);
+  const runBatch = async () => {
+    for (const ev of params.evaluations) {
+      const atom = await params.metadataStore.getAtom(ev.atomId);
+      if (!atom) continue;
+      if (atom.lifecycle?.retentionClass === "legal_hold") continue;
+
+      if (ev.action === "purge") {
+        await params.metadataStore.deleteAtom(atom.id);
+        purgedIds.push(atom.id);
+        removeFromDerivedIds.push(atom.id);
+      } else if (ev.action === "tombstone") {
+        await params.metadataStore.saveAtom({
+          ...atom,
+          state: { ...atom.state, status: "deprecated" },
+          lifecycle: {
+            ...atom.lifecycle,
+            tombstonedAt: atom.lifecycle?.tombstonedAt ?? now,
+            deprecatedAt: atom.lifecycle?.deprecatedAt ?? now,
+          },
+          versioning: { ...atom.versioning, version: atom.versioning.version + 1 },
+        });
+        tombstonedIds.push(atom.id);
+        removeFromDerivedIds.push(atom.id);
+      } else if (ev.action === "deprecate" || ev.action === "archive") {
+        await params.metadataStore.saveAtom({
+          ...atom,
+          state: { ...atom.state, status: "deprecated" },
+          lifecycle: { ...atom.lifecycle, deprecatedAt: atom.lifecycle?.deprecatedAt ?? now },
+          versioning: { ...atom.versioning, version: atom.versioning.version + 1 },
+        });
+        if (ev.action === "archive") archivedIds.push(atom.id);
+        else deprecatedIds.push(atom.id);
+        removeFromDerivedIds.push(atom.id);
+      } else if (ev.action === "revalidate") {
+        await params.metadataStore.saveAtom({
+          ...atom,
+          state: { ...atom.state, status: "tentative" },
+          versioning: { ...atom.versioning, version: atom.versioning.version + 1 },
+        });
+        revalidatedIds.push(atom.id);
+      } else if (ev.action === "deprioritize") {
+        await params.metadataStore.saveAtom({
+          ...atom,
+          governance: {
+            ...atom.governance,
+            retrievalScore: ev.decayedValue,
+            lastScoredAt: now,
+            scoreVersion: 1,
+          },
+        });
+        deprioritizedIds.push(atom.id);
+      }
     }
+  };
+
+  if (params.metadataStore.withTransaction) {
+    await params.metadataStore.withTransaction(runBatch);
+  } else {
+    await runBatch();
   }
 
-  let derivedIndexesSynced = true;
-  if (removeFromDerivedIds.length > 0) {
-    if (!params.graphStore || !params.vectorStore) {
+  let derivedIndexesSynced = false;
+  let derivedSyncError: string | undefined;
+  if (removeFromDerivedIds.length === 0) {
+    derivedIndexesSynced = true;
+  } else if (
+    typeof params.graphStore?.delete !== "function" ||
+    typeof params.vectorStore?.delete !== "function"
+  ) {
+    derivedIndexesSynced = false;
+    derivedSyncError = "derived_store_delete_unsupported";
+  } else {
+    try {
+      await params.graphStore.delete(removeFromDerivedIds);
+      await params.vectorStore.delete(removeFromDerivedIds);
+      derivedIndexesSynced = true;
+    } catch (err) {
       derivedIndexesSynced = false;
-    } else {
-      await params.graphStore.delete?.(removeFromDerivedIds);
-      await params.vectorStore.delete?.(removeFromDerivedIds);
+      derivedSyncError = err instanceof Error ? err.message : String(err);
     }
   }
+
+  await params.metadataStore.updateJournal(journalId, {
+    status: derivedIndexesSynced ? "COMPLETED" : "DERIVED_OUT_OF_SYNC",
+    phase: derivedIndexesSynced ? "COMPLETED" : "METADATA_COMMITTED",
+    objectIds: {
+      ...journal.objectIds,
+      atomIds: [
+        ...archivedIds,
+        ...deprecatedIds,
+        ...tombstonedIds,
+        ...revalidatedIds,
+        ...deprioritizedIds,
+        ...purgedIds,
+      ],
+    },
+    lastError: derivedSyncError,
+    updatedAt: new Date().toISOString(),
+  });
 
   return {
+    journalId,
+    canonicalCommitted: true,
     archivedIds,
     deprecatedIds,
     tombstonedIds,
@@ -323,5 +391,6 @@ export async function applyLifecycleDecisions(params: {
     deprioritizedIds,
     purgedIds,
     derivedIndexesSynced,
+    ...(derivedSyncError ? { derivedSyncError } : {}),
   };
 }

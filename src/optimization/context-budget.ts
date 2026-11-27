@@ -18,6 +18,7 @@ export interface ConflictWarning {
 export interface ContextBudgetResult {
   budgetStatus: BudgetStatus;
   budgetedPackage: CognitivePackage;
+  atomContextNotes: string[];
   selectedMemoryIds: string[];
   omittedMemories: OmittedMemoryItem[];
   omittedFields: string[];
@@ -69,12 +70,12 @@ export function buildContextPackage(params: {
 
   const omittedFields: string[] = [];
 
-  // Build baseline skeleton without optional bulk fields if needed.
+  // CW-04J-04: Preserve original answer.summary and answer.recommendations; only trim optional fields if over budget.
   let basePkg: CognitivePackage = {
     ...params.pkg,
     answer: {
       summary: params.pkg.answer.summary,
-      recommendations: [],
+      recommendations: [...params.pkg.answer.recommendations],
       nextSteps: [...params.pkg.answer.nextSteps],
     },
     supportingAtoms: [],
@@ -107,6 +108,7 @@ export function buildContextPackage(params: {
     return {
       budgetStatus: "unsatisfied_budget",
       budgetedPackage: basePkg,
+      atomContextNotes: [],
       selectedMemoryIds: [],
       omittedMemories: params.pkg.supportingAtoms.map((atomId) => ({
         atomId,
@@ -173,11 +175,6 @@ export function buildContextPackage(params: {
 
     const candidatePkg: CognitivePackage = {
       ...currentPkg,
-      answer: {
-        ...currentPkg.answer,
-        summary: nextStatements.join(" | "),
-        recommendations: nextStatements,
-      },
       supportingAtoms: nextIds,
       conflicts: nextConflicts,
       evidenceRefs: [...nextEv],
@@ -212,6 +209,7 @@ export function buildContextPackage(params: {
   return {
     budgetStatus: finalTokens <= budgetTokens ? "within_budget" : "unsatisfied_budget",
     budgetedPackage: currentPkg,
+    atomContextNotes: selectedStatements,
     selectedMemoryIds,
     omittedMemories,
     omittedFields,

@@ -33,6 +33,7 @@ export interface DurableJobRecord<Payload = unknown, Result = unknown> {
   progress: number;
   checkpoint?: string;
   claimedByWorkerId?: string;
+  fencingToken: number;
   leaseExpiresAt?: string;
   nextAttemptAt?: string;
   payload: Payload;
@@ -56,9 +57,23 @@ export interface DurableJobStore {
   listPendingJobs(nowMs?: number): Promise<DurableJobRecord[]>;
   claimJob(jobId: string, workerId: string, leaseMs?: number, nowMs?: number): Promise<DurableJobRecord | null>;
   releaseExpiredLeases(nowMs?: number): Promise<number>;
-  checkpoint(jobId: string, checkpoint: string, progress: number): Promise<DurableJobRecord>;
-  complete<Result>(jobId: string, result: Result): Promise<DurableJobRecord<unknown, Result>>;
-  fail(jobId: string, error: string, nowMs?: number): Promise<DurableJobRecord>;
+  checkpoint(
+    jobId: string,
+    checkpoint: string,
+    progress: number,
+    lease?: { workerId: string; fencingToken: number },
+  ): Promise<DurableJobRecord>;
+  complete<Result>(
+    jobId: string,
+    result: Result,
+    lease?: { workerId: string; fencingToken: number },
+  ): Promise<DurableJobRecord<unknown, Result>>;
+  fail(
+    jobId: string,
+    error: string,
+    nowMs?: number,
+    lease?: { workerId: string; fencingToken: number },
+  ): Promise<DurableJobRecord>;
   cancel(jobId: string): Promise<DurableJobRecord>;
   listDeadLetters(tenantId?: string): Promise<DurableJobRecord[]>;
 }
@@ -166,6 +181,7 @@ export class FileDurableJobStore implements DurableJobStore {
       attempt: 0,
       maxAttempts: Math.max(1, input.maxAttempts ?? 3),
       progress: 0,
+      fencingToken: 0,
       payload: input.payload,
       createdAt: now,
       updatedAt: now,
@@ -214,6 +230,7 @@ export class FileDurableJobStore implements DurableJobStore {
       ...existing,
       status: "running",
       claimedByWorkerId: workerId,
+      fencingToken: (existing.fencingToken ?? 0) + 1,
       leaseExpiresAt: new Date(nowMs + leaseMs).toISOString(),
       updatedAt: new Date(nowMs).toISOString(),
     };
@@ -247,13 +264,34 @@ export class FileDurableJobStore implements DurableJobStore {
     return released;
   }
 
-  async checkpoint(jobId: string, checkpoint: string, progress: number): Promise<DurableJobRecord> {
+  private assertLease(
+    existing: DurableJobRecord,
+    lease?: { workerId: string; fencingToken: number },
+  ): void {
+    if (!lease) return;
+    if (
+      existing.claimedByWorkerId !== lease.workerId ||
+      existing.fencingToken !== lease.fencingToken
+    ) {
+      throw new Error(
+        `Stale worker lease for job ${existing.jobId}: expected (${existing.claimedByWorkerId}, ${existing.fencingToken}), got (${lease.workerId}, ${lease.fencingToken})`,
+      );
+    }
+  }
+
+  async checkpoint(
+    jobId: string,
+    checkpoint: string,
+    progress: number,
+    lease?: { workerId: string; fencingToken: number },
+  ): Promise<DurableJobRecord> {
     await this.ensureLoaded();
     const existing = this.jobs.get(jobId);
     if (!existing) throw new Error(`Durable job not found: ${jobId}`);
     if (TERMINAL_STATUSES.has(existing.status)) {
       throw new Error(`Cannot checkpoint terminal job ${jobId} (${existing.status})`);
     }
+    this.assertLease(existing, lease);
     const updated: DurableJobRecord = {
       ...existing,
       status: "running",
@@ -269,6 +307,7 @@ export class FileDurableJobStore implements DurableJobStore {
   async complete<Result>(
     jobId: string,
     result: Result,
+    lease?: { workerId: string; fencingToken: number },
   ): Promise<DurableJobRecord<unknown, Result>> {
     await this.ensureLoaded();
     const existing = this.jobs.get(jobId);
@@ -276,6 +315,7 @@ export class FileDurableJobStore implements DurableJobStore {
     if (TERMINAL_STATUSES.has(existing.status)) {
       throw new Error(`Cannot complete terminal job ${jobId} (${existing.status})`);
     }
+    this.assertLease(existing, lease);
     const now = new Date().toISOString();
     const updated: DurableJobRecord<unknown, Result> = {
       ...existing,
@@ -292,13 +332,19 @@ export class FileDurableJobStore implements DurableJobStore {
     return updated;
   }
 
-  async fail(jobId: string, error: string, nowMs = Date.now()): Promise<DurableJobRecord> {
+  async fail(
+    jobId: string,
+    error: string,
+    nowMs = Date.now(),
+    lease?: { workerId: string; fencingToken: number },
+  ): Promise<DurableJobRecord> {
     await this.ensureLoaded();
     const existing = this.jobs.get(jobId);
     if (!existing) throw new Error(`Durable job not found: ${jobId}`);
     if (TERMINAL_STATUSES.has(existing.status)) {
       throw new Error(`Cannot fail terminal job ${jobId} (${existing.status})`);
     }
+    this.assertLease(existing, lease);
     const nextAttempt = existing.attempt + 1;
     const isDlq = nextAttempt >= existing.maxAttempts;
     const status: DurableJobStatus = isDlq ? "dead_letter" : "retrying";

@@ -51,6 +51,8 @@ export interface PromotionCandidate {
   requestedByUserId: string;
   targetSpaceId: string;
   evidenceRefs: string[];
+  approvedAtomVersion?: number;
+  approvedEvidenceDigest?: string;
   status: PromotionCandidateStatus;
   reviewedByUserId?: string;
   publishedAssetId?: string;
@@ -340,6 +342,7 @@ export class MemoryGovernanceService {
     actor: GovernanceActorContext;
     candidateId: string;
     decision: "approved" | "rejected";
+    approvedAtomVersion?: number;
     reason?: string;
     now?: string;
   }): Promise<PromotionCandidate> {
@@ -374,6 +377,9 @@ export class MemoryGovernanceService {
       ...existing,
       status: params.decision,
       reviewedByUserId: params.actor.userId,
+      ...(params.decision === "approved" && params.approvedAtomVersion !== undefined
+        ? { approvedAtomVersion: params.approvedAtomVersion }
+        : {}),
       decisionReason: params.reason,
       updatedAt: now,
     };
@@ -402,8 +408,38 @@ export class MemoryGovernanceService {
     await this.ensureLoaded();
     const existing = this.promotions.get(params.candidateId);
     if (!existing) throw new Error(`Promotion candidate not found: ${params.candidateId}`);
+
+    const canPublish =
+      params.actor.tenantId === existing.tenantId &&
+      (params.actor.roles.includes("tenant_admin") ||
+        (params.actor.roles.includes("space_admin") &&
+          (params.actor.adminSpaceIds?.includes(existing.targetSpaceId) ?? false)));
+    if (!canPublish) {
+      this.recordAudit(
+        existing.tenantId,
+        params.actor,
+        "access.denied",
+        existing.candidateId,
+        existing.status,
+        existing.status,
+        "publisher_not_authorized_for_target_space",
+      );
+      await this.persist();
+      throw new Error(`Actor ${params.actor.userId} lacks publish authority for space ${existing.targetSpaceId}`);
+    }
     if (existing.status !== "approved") {
       throw new Error(`Candidate ${params.candidateId} must be approved before publishing (status=${existing.status})`);
+    }
+    if (params.atom.id !== existing.atomId) {
+      throw new Error(`Atom mismatch: expected ${existing.atomId}, got ${params.atom.id}`);
+    }
+    if (
+      existing.approvedAtomVersion !== undefined &&
+      params.atom.versioning.version !== existing.approvedAtomVersion
+    ) {
+      throw new Error(
+        `Atom version mismatch: approved version ${existing.approvedAtomVersion}, got ${params.atom.versioning.version}`,
+      );
     }
     if ((params.atom.provenance?.evidenceRefs?.length ?? 0) === 0) {
       throw new Error("Cannot publish candidate without valid evidence references");
@@ -445,8 +481,24 @@ export class MemoryGovernanceService {
     await this.ensureLoaded();
     const existing = this.promotions.get(params.candidateId);
     if (!existing) throw new Error(`Promotion candidate not found: ${params.candidateId}`);
-    if (params.actor.tenantId !== existing.tenantId) {
-      throw new Error("Cross-tenant withdrawal forbidden");
+    const canWithdraw =
+      params.actor.tenantId === existing.tenantId &&
+      (params.actor.roles.includes("tenant_admin") ||
+        (params.actor.roles.includes("space_admin") &&
+          (params.actor.adminSpaceIds?.includes(existing.targetSpaceId) ?? false)) ||
+        (existing.status !== "published" && existing.requestedByUserId === params.actor.userId));
+    if (!canWithdraw) {
+      this.recordAudit(
+        existing.tenantId,
+        params.actor,
+        "access.denied",
+        existing.candidateId,
+        existing.status,
+        existing.status,
+        "actor_not_authorized_to_withdraw",
+      );
+      await this.persist();
+      throw new Error(`Actor ${params.actor.userId} is not authorized to withdraw ${params.candidateId}`);
     }
     if (existing.publishedAssetId && params.publisher?.withdrawAsset) {
       await params.publisher.withdrawAsset(existing.publishedAssetId, params.reason);

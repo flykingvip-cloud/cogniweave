@@ -198,22 +198,30 @@ export class CogniWeaveMemoryResourceAdapter {
     return saved;
   }
 
-  listResources(tenantId?: string): MemoryResourceDescriptor[] {
+  async listResources(tenantId?: string): Promise<MemoryResourceDescriptor[]> {
+    await this.ensureLoaded();
     const all = [...this.resources.values()];
     return tenantId ? all.filter((r) => r.tenantId === tenantId) : all;
   }
 
-  describeResource(resourceId: string): MemoryResourceDescriptor | undefined {
+  async describeResource(resourceId: string): Promise<MemoryResourceDescriptor | undefined> {
+    await this.ensureLoaded();
     return this.resources.get(resourceId);
   }
 
-  discoverResources(ctx: ResourceAccessContext): MemoryResourceDescriptor[] {
-    return this.listResources(ctx.tenantId).filter(
-      (resource) => this.checkAccess(resource.resourceId, ctx).allowed,
-    );
+  async discoverResources(ctx: ResourceAccessContext): Promise<MemoryResourceDescriptor[]> {
+    const list = await this.listResources(ctx.tenantId);
+    const allowed: MemoryResourceDescriptor[] = [];
+    for (const resource of list) {
+      if ((await this.checkAccess(resource.resourceId, ctx)).allowed) {
+        allowed.push(resource);
+      }
+    }
+    return allowed;
   }
 
-  checkAccess(resourceId: string, ctx: ResourceAccessContext): ResourceAccessDecision {
+  async checkAccess(resourceId: string, ctx: ResourceAccessContext): Promise<ResourceAccessDecision> {
+    await this.ensureLoaded();
     const resource = this.resources.get(resourceId);
     if (!resource) {
       return { allowed: false, denyReason: "resource_not_found" };
@@ -271,7 +279,7 @@ export class CogniWeaveMemoryResourceAdapter {
     ctx: ResourceAccessContext,
   ): Promise<CognitivePackage> {
     await this.ensureLoaded();
-    const access = this.checkAccess(resourceId, ctx);
+    const access = await this.checkAccess(resourceId, ctx);
     if (!access.allowed) {
       throw new Error(`Memory resource access denied: ${access.denyReason}`);
     }
@@ -294,7 +302,7 @@ export class CogniWeaveMemoryResourceAdapter {
     atomTypes?: string[],
   ): Promise<MemoryAtom[]> {
     await this.ensureLoaded();
-    const access = this.checkAccess(resourceId, ctx);
+    const access = await this.checkAccess(resourceId, ctx);
     if (!access.allowed) {
       throw new Error(`Memory resource access denied: ${access.denyReason}`);
     }
@@ -320,7 +328,7 @@ export class CogniWeaveMemoryResourceAdapter {
     ctx: ResourceAccessContext,
   ): Promise<unknown> {
     await this.ensureLoaded();
-    const access = this.checkAccess(resourceId, ctx);
+    const access = await this.checkAccess(resourceId, ctx);
     if (!access.allowed) {
       throw new Error(`Memory resource access denied: ${access.denyReason}`);
     }
@@ -338,18 +346,40 @@ export class CogniWeaveMemoryResourceAdapter {
     });
   }
 
-  getResourceStatus(resourceId: string): MemoryResourceDescriptor["lifecycleStatus"] | "not_found" {
+  async getResourceStatus(
+    resourceId: string,
+  ): Promise<MemoryResourceDescriptor["lifecycleStatus"] | "not_found"> {
+    await this.ensureLoaded();
     return this.resources.get(resourceId)?.lifecycleStatus ?? "not_found";
+  }
+
+  authorizeResourceManagement(
+    resource: MemoryResourceDescriptor,
+    actor: { userId: string; tenantId: string; roles?: string[] },
+  ): boolean {
+    if (actor.tenantId !== resource.tenantId) return false;
+    const roles = actor.roles ?? [];
+    if (roles.includes("tenant_admin") || roles.includes("governance_reviewer")) return true;
+    if (resource.ownerType === "user" && resource.ownerId === actor.userId) return true;
+    return false;
   }
 
   async revokeAccess(
     resourceId: string,
+    actor: { userId: string; tenantId: string; roles?: string[] },
     ctx?: { correlationId?: string; traceId?: string; policyVersion?: string },
   ): Promise<MemoryResourceDescriptor> {
     await this.ensureLoaded();
     const existing = this.resources.get(resourceId);
     if (!existing) {
       throw new Error(`Memory resource not found: ${resourceId}`);
+    }
+    if (!this.authorizeResourceManagement(existing, actor)) {
+      throw new Error(`Actor ${actor.userId} is not authorized to revoke resource ${resourceId}`);
+    }
+    // Idempotent repeat revocation
+    if (existing.lifecycleStatus === "revoked") {
+      return existing;
     }
     const updated: MemoryResourceDescriptor = {
       ...existing,
@@ -382,15 +412,6 @@ export class CogniWeaveMemoryResourceAdapter {
       await this.persist();
     }
     return removed;
-  }
-
-  async drainDomainEvents(): Promise<MemoryResourceDomainEvent[]> {
-    await this.ensureLoaded();
-    const drained = this.outboxEvents.splice(0, this.outboxEvents.length);
-    if (drained.length > 0) {
-      await this.persist();
-    }
-    return drained;
   }
 
   private emitEvent(

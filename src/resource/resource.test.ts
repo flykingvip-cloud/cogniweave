@@ -99,7 +99,7 @@ describe("CogniWeaveMemoryResourceAdapter (CW-06A/B)", () => {
 
       // R-03: Missing or mismatched subjectBindingId fails closed
       expect(
-        adapter.checkAccess("res_team_1", { ...ctx, bindings: [] }),
+        await adapter.checkAccess("res_team_1", { ...ctx, bindings: [] }),
       ).toEqual({ allowed: false, denyReason: "resource_binding_missing_or_unbound" });
 
       // R-02: Even if caller passes a wider/different TaskFrame.scope, reasoning is locked to resource.scope
@@ -107,15 +107,24 @@ describe("CogniWeaveMemoryResourceAdapter (CW-06A/B)", () => {
       const pkg = await adapter.retrieveCognitivePackage("res_team_1", widerFrame, ctx);
       expect(pkg.taskFrameId).toBe(widerFrame.id);
 
-      // R-06: Outbox peek + explicit acknowledge
+      // R-06: Outbox peek + explicit acknowledge (destructive drain removed)
       const pending = await adapter.peekDomainEvents();
       expect(pending.map((e) => e.eventType)).toEqual(["memory.resource.registered"]);
       await adapter.acknowledgeDomainEvents(pending.map((e) => e.eventId));
       expect(await adapter.peekDomainEvents()).toEqual([]);
 
-      await adapter.revokeAccess("res_team_1");
+      // CW-06A-R1: Non-admin member cannot revoke team resource
+      await expect(
+        adapter.revokeAccess("res_team_1", { userId: "u_1", tenantId: "t_1", roles: ["member"] }),
+      ).rejects.toThrow("not authorized to revoke");
+
+      await adapter.revokeAccess("res_team_1", {
+        userId: "u_admin",
+        tenantId: "t_1",
+        roles: ["tenant_admin"],
+      });
       expect(revokedIds).toEqual(["res_team_1"]);
-      expect(adapter.checkAccess("res_team_1", ctx)).toEqual({
+      expect(await adapter.checkAccess("res_team_1", ctx)).toEqual({
         allowed: false,
         denyReason: "resource_revoked",
       });

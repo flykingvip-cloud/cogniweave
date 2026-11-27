@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import type { DurableJobStore } from "../jobs/durable-job-store.js";
-import { computeScopeFingerprint } from "../keys.js";
-import type { MemoryAtom, Scope } from "../models.js";
+import { computeScopeFingerprint, createMemoryPartitionKeyV1 } from "../keys.js";
+import type { MemoryAtom, MemorySubject, MemorySubjectBinding, Scope } from "../models.js";
 import type { GraphStore, MetadataStore, VectorStore } from "../storage/types.js";
+import { authorizeMemoryAccess } from "../subject/binding.js";
 import { abstractFromAtoms, type AbstractedMemory } from "./abstraction.js";
 import {
   applyConsolidation,
@@ -31,6 +32,9 @@ export interface OptimizationExecutionContext {
   actorUserId: string;
   tenantId: string;
   scope: Scope;
+  caller: MemorySubject;
+  bindings: ReadonlyArray<MemorySubjectBinding>;
+  dataPlaneId: string;
   allowLifecycleMutations?: boolean;
 }
 
@@ -47,9 +51,9 @@ export interface OptimizationReport {
   plannedTokensAfter: number;
   plannedTokenReduction: number;
   estimatedTokensOfPersistedRemovedAtoms: number;
-  canonicalTokensBefore?: number;
-  canonicalTokensAfter?: number;
-  verifiedCanonicalTokenDelta?: number;
+  estimatedCanonicalClaimTokensBefore?: number;
+  estimatedCanonicalClaimTokensAfter?: number;
+  estimatedCanonicalClaimTokenDelta?: number;
 }
 
 export interface MemoryOptimizationJob {
@@ -70,25 +74,15 @@ export interface MemoryOptimizationJob {
   completedAt?: string;
 }
 
-function estimateTotalTokens(atoms: ReadonlyArray<MemoryAtom>): number {
+function estimateClaimTokens(atoms: ReadonlyArray<MemoryAtom>): number {
   return atoms.reduce(
     (sum, atom) => sum + Math.max(1, Math.ceil(atom.claim.statement.length / 4)),
     0,
   );
 }
 
-/**
- * CW-04G-R1: Content-aware idempotency key incorporating atom versions and claim/evidence hashes.
- */
-export function computeOptimizationIdempotencyKey(params: {
-  tenantId: string;
-  scope: Scope;
-  optimizationType: OptimizationType;
-  atoms: ReadonlyArray<MemoryAtom>;
-  policyVersion: string;
-  pipelineVersion: string;
-}): string {
-  const atomDigests = [...params.atoms]
+function buildAtomDigests(atoms: ReadonlyArray<MemoryAtom>) {
+  return [...atoms]
     .toSorted((a, b) => a.id.localeCompare(b.id))
     .map((a) => ({
       id: a.id,
@@ -97,11 +91,21 @@ export function computeOptimizationIdempotencyKey(params: {
       claim: a.claim.statement,
       evidence: [...a.provenance.evidenceRefs].toSorted(),
     }));
+}
+
+export function computeOptimizationIdempotencyKey(params: {
+  tenantId: string;
+  scope: Scope;
+  optimizationType: OptimizationType;
+  atoms: ReadonlyArray<MemoryAtom>;
+  policyVersion: string;
+  pipelineVersion: string;
+}): string {
   const payload = JSON.stringify({
     tenantId: params.tenantId,
     scope: computeScopeFingerprint(params.scope),
     optimizationType: params.optimizationType,
-    atomDigests,
+    atomDigests: buildAtomDigests(params.atoms),
     policyVersion: params.policyVersion,
     pipelineVersion: params.pipelineVersion,
   });
@@ -109,10 +113,11 @@ export function computeOptimizationIdempotencyKey(params: {
 }
 
 /**
- * CW-04G-R1 / CW-04G-R2 / P0-02:
- * - Enforces OptimizationExecutionContext (rejects any atom outside target scope).
- * - Content-hashed idempotencyKey prevents stale job reuse when atoms change.
- * - Measures real Canonical Store active-atom tokens before & after persistence.
+ * CW-04J-01 / CW-04J-05:
+ * - Requires executionContext (no optional bypass) and verifies SubjectBinding authorization
+ *   for the target scope partition AND every input atom before job enqueue or Canonical Store read/write.
+ * - Includes atomDigests in DurableJobStore payload so even explicit idempotencyKeys reject changed inputs.
+ * - Uses honest Estimated Canonical Claim Token naming.
  */
 export async function runOptimizationJob(params: {
   idempotencyKey?: string;
@@ -121,7 +126,7 @@ export async function runOptimizationJob(params: {
   scope: Scope;
   optimizationType: OptimizationType;
   atoms: ReadonlyArray<MemoryAtom>;
-  executionContext?: OptimizationExecutionContext;
+  executionContext: OptimizationExecutionContext;
   policyVersion?: string;
   pipelineVersion?: string;
   nowMs?: number;
@@ -130,26 +135,47 @@ export async function runOptimizationJob(params: {
   graphStore?: GraphStore;
   vectorStore?: VectorStore;
 }): Promise<MemoryOptimizationJob> {
-  const expectedScopeFp = computeScopeFingerprint(params.scope);
-  if (params.executionContext) {
-    if (params.executionContext.tenantId !== params.tenantId) {
-      throw new Error("OptimizationExecutionContext tenant mismatch");
-    }
-    if (computeScopeFingerprint(params.executionContext.scope) !== expectedScopeFp) {
-      throw new Error("OptimizationExecutionContext scope mismatch");
-    }
+  const ctx = params.executionContext;
+  if (!ctx || !ctx.actorUserId.trim()) {
+    throw new Error("OptimizationExecutionContext with actorUserId is required");
   }
+  const expectedScopeFp = computeScopeFingerprint(params.scope);
+  if (ctx.tenantId !== params.tenantId || ctx.caller.tenantId !== params.tenantId) {
+    throw new Error("OptimizationExecutionContext tenant mismatch");
+  }
+  if (computeScopeFingerprint(ctx.scope) !== expectedScopeFp) {
+    throw new Error("OptimizationExecutionContext scope mismatch");
+  }
+
+  const targetPartition = createMemoryPartitionKeyV1(ctx.dataPlaneId, params.scope);
+  const scopeAcl = authorizeMemoryAccess(ctx.bindings, {
+    partition: targetPartition,
+    caller: ctx.caller,
+  });
+  if (!scopeAcl.allowed) {
+    throw new Error(`Optimization job unauthorized for target scope: ${scopeAcl.reason}`);
+  }
+
   for (const atom of params.atoms) {
     if (computeScopeFingerprint(atom.scope) !== expectedScopeFp) {
       throw new Error(
         `Atom ${atom.id} belongs to a different scope than target optimization job scope`,
       );
     }
+    const atomPartition = createMemoryPartitionKeyV1(ctx.dataPlaneId, atom.scope);
+    const atomAcl = authorizeMemoryAccess(ctx.bindings, {
+      partition: atomPartition,
+      caller: ctx.caller,
+    });
+    if (!atomAcl.allowed) {
+      throw new Error(`Optimization job unauthorized for atom ${atom.id}: ${atomAcl.reason}`);
+    }
   }
 
   const policyVersion = params.policyVersion ?? "1.0.0";
   const pipelineVersion = params.pipelineVersion ?? "1.0.0";
   const targetMemoryIds = params.atoms.map((a) => a.id);
+  const atomDigests = buildAtomDigests(params.atoms);
   const idempotencyKey =
     params.idempotencyKey ??
     computeOptimizationIdempotencyKey({
@@ -172,9 +198,10 @@ export async function runOptimizationJob(params: {
       pipelineVersion,
       payload: {
         subjectId: params.subjectId,
-        scope: params.scope,
+        scope: expectedScopeFp,
         optimizationType: params.optimizationType,
-        targetMemoryIds,
+        policyVersion,
+        atomDigests,
       },
     });
     jobId = record.jobId;
@@ -200,13 +227,13 @@ export async function runOptimizationJob(params: {
   }
 
   try {
-    let canonicalTokensBefore: number | undefined;
+    let estimatedCanonicalClaimTokensBefore: number | undefined;
     if (params.metadataStore) {
       const allBefore = await params.metadataStore.listAtoms();
       const activeBefore = allBefore.filter(
         (a) => computeScopeFingerprint(a.scope) === expectedScopeFp && a.state.status !== "deprecated",
       );
-      canonicalTokensBefore = estimateTotalTokens(activeBefore);
+      estimatedCanonicalClaimTokensBefore = estimateClaimTokens(activeBefore);
     }
 
     const consolidation =
@@ -247,10 +274,7 @@ export async function runOptimizationJob(params: {
           verifiedDeprecatedOrPurged.add(id);
         }
       }
-      if (
-        lifecycleEvaluations.length > 0 &&
-        params.executionContext?.allowLifecycleMutations !== false
-      ) {
+      if (lifecycleEvaluations.length > 0 && ctx.allowLifecycleMutations !== false) {
         appliedLifecycle = await applyLifecycleDecisions({
           evaluations: lifecycleEvaluations,
           metadataStore: params.metadataStore,
@@ -269,28 +293,31 @@ export async function runOptimizationJob(params: {
       }
     }
 
-    let canonicalTokensAfter: number | undefined;
-    let verifiedCanonicalTokenDelta: number | undefined;
-    if (params.metadataStore && canonicalTokensBefore !== undefined) {
+    let estimatedCanonicalClaimTokensAfter: number | undefined;
+    let estimatedCanonicalClaimTokenDelta: number | undefined;
+    if (params.metadataStore && estimatedCanonicalClaimTokensBefore !== undefined) {
       const allAfter = await params.metadataStore.listAtoms();
       const activeAfter = allAfter.filter(
         (a) => computeScopeFingerprint(a.scope) === expectedScopeFp && a.state.status !== "deprecated",
       );
-      canonicalTokensAfter = estimateTotalTokens(activeAfter);
-      verifiedCanonicalTokenDelta = Math.max(0, canonicalTokensBefore - canonicalTokensAfter);
+      estimatedCanonicalClaimTokensAfter = estimateClaimTokens(activeAfter);
+      estimatedCanonicalClaimTokenDelta = Math.max(
+        0,
+        estimatedCanonicalClaimTokensBefore - estimatedCanonicalClaimTokensAfter,
+      );
     }
 
-    const estimatedTokensBefore = estimateTotalTokens(params.atoms);
+    const estimatedTokensBefore = estimateClaimTokens(params.atoms);
     const duplicateReductionCount = consolidation?.mergedCount ?? 0;
     const retainedPlannedIds = new Set(
       consolidation ? consolidation.clusters.map((c) => c.canonicalAtomId) : targetMemoryIds,
     );
-    const plannedTokensAfter = estimateTotalTokens(
+    const plannedTokensAfter = estimateClaimTokens(
       params.atoms.filter((a) => retainedPlannedIds.has(a.id)),
     );
     const plannedTokenReduction = Math.max(0, estimatedTokensBefore - plannedTokensAfter);
     const estimatedTokensOfPersistedRemovedAtoms = params.metadataStore
-      ? estimateTotalTokens(params.atoms.filter((a) => verifiedDeprecatedOrPurged.has(a.id)))
+      ? estimateClaimTokens(params.atoms.filter((a) => verifiedDeprecatedOrPurged.has(a.id)))
       : 0;
 
     const report: OptimizationReport = {
@@ -306,9 +333,15 @@ export async function runOptimizationJob(params: {
       plannedTokensAfter,
       plannedTokenReduction,
       estimatedTokensOfPersistedRemovedAtoms,
-      ...(canonicalTokensBefore !== undefined ? { canonicalTokensBefore } : {}),
-      ...(canonicalTokensAfter !== undefined ? { canonicalTokensAfter } : {}),
-      ...(verifiedCanonicalTokenDelta !== undefined ? { verifiedCanonicalTokenDelta } : {}),
+      ...(estimatedCanonicalClaimTokensBefore !== undefined
+        ? { estimatedCanonicalClaimTokensBefore }
+        : {}),
+      ...(estimatedCanonicalClaimTokensAfter !== undefined
+        ? { estimatedCanonicalClaimTokensAfter }
+        : {}),
+      ...(estimatedCanonicalClaimTokenDelta !== undefined
+        ? { estimatedCanonicalClaimTokenDelta }
+        : {}),
     };
 
     const completedAt = new Date(params.nowMs ?? Date.now()).toISOString();

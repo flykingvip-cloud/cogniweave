@@ -147,44 +147,67 @@ async function routeEnvelope(
     });
   }
 
-  // Optional body.scope tenant validation when authorizeTenantScope is configured.
-  const checkBodyScope = async (body: { scope?: { workspaceId?: string } }) => {
-    if (principal && options?.authorizeTenantScope && body.scope?.workspaceId) {
-      const ok = await options.authorizeTenantScope(principal, body.scope.workspaceId);
+  // CW-07A-R1: Unified mandatory resource/tenant authorization across ALL business routes.
+  const authorizeRequestResource = async (workspaceId?: string): Promise<RestResponse<unknown> | null> => {
+    if (!requireAuth) return null;
+    if (!principal) {
+      return responseBody(401, { error: "unauthorized" });
+    }
+    if (options?.authorizeTenantScope) {
+      const targetWs = workspaceId ?? envelope.headers["x-cogniweave-workspace-id"] ?? "";
+      const ok = await options.authorizeTenantScope(principal, targetWs);
       if (!ok) {
+        metrics.unauthorizedTotal += 1;
         return responseBody(403, { error: "scope_tenant_forbidden" });
       }
+      return null;
+    }
+    // Fail-closed fallback when no custom authorizeTenantScope hook is provided:
+    // require tenant_admin role OR workspaceId === principal.tenantId (when workspaceId is specified).
+    if (
+      workspaceId &&
+      workspaceId !== principal.tenantId &&
+      !(principal.roles ?? []).includes("tenant_admin")
+    ) {
+      metrics.unauthorizedTotal += 1;
+      return responseBody(403, { error: "scope_tenant_forbidden" });
     }
     return null;
   };
 
   if (method === "POST" && pathname === "/v1/tasks/frame") {
     const body = parseBody<FrameTaskRequest>(envelope.body);
-    const denied = await checkBodyScope(body);
+    const denied = await authorizeRequestResource(body.scope?.workspaceId);
     if (denied) return denied;
     return service.handleFrameTask(body, context);
   }
   if (method === "POST" && pathname === "/v1/reason") {
-    return service.handleReason(parseBody<ReasonRequest>(envelope.body), context);
+    const body = parseBody<ReasonRequest>(envelope.body);
+    const denied = await authorizeRequestResource(body.taskFrame?.scope?.workspaceId);
+    if (denied) return denied;
+    return service.handleReason(body, context);
   }
   if (method === "POST" && pathname === "/v1/reason/debug") {
-    return service.handleReasonDebug(parseBody<ReasonRequest>(envelope.body), context);
+    const body = parseBody<ReasonRequest>(envelope.body);
+    const denied = await authorizeRequestResource(body.taskFrame?.scope?.workspaceId);
+    if (denied) return denied;
+    return service.handleReasonDebug(body, context);
   }
   if (method === "POST" && pathname === "/v1/ingest") {
     const body = parseBody<DistillRequest>(envelope.body);
-    const denied = await checkBodyScope(body);
+    const denied = await authorizeRequestResource(body.scope?.workspaceId);
     if (denied) return denied;
     return service.handleIngest(body, context);
   }
   if (method === "POST" && pathname === "/v1/distill") {
     const body = parseBody<DistillRequest>(envelope.body);
-    const denied = await checkBodyScope(body);
+    const denied = await authorizeRequestResource(body.scope?.workspaceId);
     if (denied) return denied;
     return service.handleDistill(body, context);
   }
   if (method === "POST" && pathname === "/v1/write-back") {
     const body = parseBody<WriteBackRequest>(envelope.body);
-    const denied = await checkBodyScope(body);
+    const denied = await authorizeRequestResource(body.scope?.workspaceId);
     if (denied) return denied;
     return service.handleWriteBack(body, context);
   }
@@ -192,11 +215,15 @@ async function routeEnvelope(
   // CW-06 Memory Resource HTTP routes
   if (options?.resourceAdapter) {
     if (method === "GET" && pathname === "/v1/memory-resources") {
-      return responseBody(200, options.resourceAdapter.listResources(principal?.tenantId));
+      const denied = await authorizeRequestResource();
+      if (denied) return denied;
+      return responseBody(200, await options.resourceAdapter.listResources(principal?.tenantId));
     }
     const resMatch = pathname.match(/^\/v1\/memory-resources\/([^/]+)$/);
     if (method === "GET" && resMatch) {
-      const desc = options.resourceAdapter.describeResource(resMatch[1]);
+      const denied = await authorizeRequestResource();
+      if (denied) return denied;
+      const desc = await options.resourceAdapter.describeResource(resMatch[1]);
       if (!desc || (principal && desc.tenantId !== principal.tenantId)) {
         return responseBody(404, { error: "resource_not_found" });
       }
@@ -204,41 +231,66 @@ async function routeEnvelope(
     }
     const revokeMatch = pathname.match(/^\/v1\/memory-resources\/([^/]+)\/revoke$/);
     if (method === "POST" && revokeMatch) {
-      const desc = options.resourceAdapter.describeResource(revokeMatch[1]);
+      const denied = await authorizeRequestResource();
+      if (denied) return denied;
+      const desc = await options.resourceAdapter.describeResource(revokeMatch[1]);
       if (!desc || (principal && desc.tenantId !== principal.tenantId)) {
         return responseBody(404, { error: "resource_not_found" });
       }
-      return responseBody(200, await options.resourceAdapter.revokeAccess(revokeMatch[1]));
+      if (!principal) {
+        return responseBody(401, { error: "unauthorized" });
+      }
+      if (!options.resourceAdapter.authorizeResourceManagement(desc, principal)) {
+        metrics.unauthorizedTotal += 1;
+        return responseBody(403, { error: "resource_management_forbidden" });
+      }
+      return responseBody(200, await options.resourceAdapter.revokeAccess(revokeMatch[1], principal));
     }
   }
 
   const traceAtomMatch = pathname.match(/^\/v1\/atoms\/([^/]+)\/trace$/);
   if (method === "GET" && traceAtomMatch) {
+    const denied = await authorizeRequestResource();
+    if (denied) return denied;
     return service.handleTraceAtom(traceAtomMatch[1], context);
   }
 
   const evidenceRefsMatch = pathname.match(/^\/v1\/atoms\/([^/]+)\/evidence-refs$/);
   if (method === "GET" && evidenceRefsMatch) {
+    const denied = await authorizeRequestResource();
+    if (denied) return denied;
     return service.handleGetEvidenceRefs(evidenceRefsMatch[1], context);
   }
 
   const packageTraceMatch = pathname.match(/^\/v1\/packages\/([^/]+)\/trace$/);
   if (method === "GET" && packageTraceMatch) {
+    const denied = await authorizeRequestResource();
+    if (denied) return denied;
     return service.handleTracePackage(packageTraceMatch[1], context);
   }
 
   const reasoningSessionTraceMatch = pathname.match(/^\/v1\/reasoning-sessions\/([^/]+)\/trace$/);
   if (method === "GET" && reasoningSessionTraceMatch) {
+    const denied = await authorizeRequestResource();
+    if (denied) return denied;
     return service.handleTraceReasoningSession(reasoningSessionTraceMatch[1], context);
   }
 
   if (method === "POST" && pathname === "/v1/evidence/resolve") {
-    return service.handleResolveEvidence(parseBody<ResolveEvidenceRequest>(envelope.body), context);
+    const body = parseBody<ResolveEvidenceRequest>(envelope.body);
+    const denied = await authorizeRequestResource(body.scope?.workspaceId);
+    if (denied) return denied;
+    return service.handleResolveEvidence(body, context);
   }
   if (method === "POST" && pathname === "/v1/repair/indexes") {
-    return service.handleRepairIndexes(parseBody<RepairIndexesRequest>(envelope.body), context);
+    const body = parseBody<RepairIndexesRequest>(envelope.body);
+    const denied = await authorizeRequestResource(body.scope?.workspaceId);
+    if (denied) return denied;
+    return service.handleRepairIndexes(body, context);
   }
   if (method === "POST" && pathname === "/v1/rebuild/from-truth") {
+    const denied = await authorizeRequestResource();
+    if (denied) return denied;
     return service.handleRebuildFromTruth(
       parseBody<RebuildFromTruthRequest>(envelope.body),
       context,
@@ -247,6 +299,8 @@ async function routeEnvelope(
 
   const journalMatch = pathname.match(/^\/v1\/journals\/([^/]+)$/);
   if (method === "GET" && journalMatch) {
+    const denied = await authorizeRequestResource();
+    if (denied) return denied;
     return service.handleGetWriteJournal(journalMatch[1], context);
   }
 

@@ -205,5 +205,33 @@ describe("CogniWeave HTTP server", () => {
       opts,
     );
     expect(authedMetrics.status).toBe(200);
+
+    // CW-07A-R1: Cross-workspace body.scope without tenant_admin fails with 403 even without custom hook
+    const crossScopeReason = await routeCogniWeaveHttpRequest(
+      service,
+      {
+        method: "POST",
+        url: "/v1/reason",
+        headers: {
+          authorization: "Bearer valid_tok",
+          "x-cogniweave-tenant-id": "t_1",
+        },
+        body: JSON.stringify({
+          taskFrame: {
+            id: "tf_1",
+            scope: { workspaceId: "ws_other", projectId: "p1", agentId: "a1", visibility: "private" },
+            taskType: "operations",
+            goals: [],
+            problems: [],
+            scenarioTags: [],
+            constraints: [],
+            entities: [],
+            requiredAtomTypes: [],
+          },
+        }),
+      },
+      opts,
+    );
+    expect(crossScopeReason.status).toBe(403);
   });
 });

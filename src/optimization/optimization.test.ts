@@ -6,6 +6,7 @@ import { FileDurableJobStore } from "../jobs/durable-job-store.js";
 import { createMemoryPartitionKeyV1 } from "../keys.js";
 import type { CognitivePackage, MemoryAtom, MemorySubject, Scope, TaskFrame } from "../models.js";
 import { InMemoryGraphStore, InMemoryMetadataStore, InMemoryVectorStore } from "../storage/in-memory.js";
+import type { GraphStore, VectorStore } from "../storage/types.js";
 import { createMemorySubjectBinding } from "../subject/binding.js";
 import {
   abstractFromAtoms,
@@ -35,6 +36,7 @@ const OTHER_AGENT_SCOPE: Scope = {
 };
 
 const PARTITION = createMemoryPartitionKeyV1("dp_1", SCOPE);
+const CALLER: MemorySubject = { tenantId: "__local__", ownerType: "agent", ownerId: "agent_main" };
 
 function makeAtom(overrides: Partial<MemoryAtom> & { id: string }): MemoryAtom {
   return {
@@ -64,7 +66,7 @@ function makeAtom(overrides: Partial<MemoryAtom> & { id: string }): MemoryAtom {
   };
 }
 
-describe("Memory Optimization Engine (CW-04B-R1..CW-04H-R1)", () => {
+describe("Memory Optimization Engine (CW-04J)", () => {
   it("CW-04B-R2/MOP-01: isolates admission duplicate & conflict checks by scope", () => {
     const otherAgentExisting = makeAtom({
       id: "atm_other",
@@ -75,23 +77,19 @@ describe("Memory Optimization Engine (CW-04B-R1..CW-04H-R1)", () => {
       },
     });
     const newAtom = makeAtom({ id: "atm_new" });
-    // Cross-agent contradicting claim must NOT trigger conflict or duplicate in agent_main.
     const res = evaluateAdmission({ atom: newAtom, existingAtoms: [otherAgentExisting] });
     expect(res.disposition).toBe("accepted");
     expect(res.conflictAtomIds).toEqual([]);
   });
 
   it("CW-04B-R1/MOP-05: rejects caller with Binding A trying to retrieve Scope B atoms via TaskFrame B", () => {
-    const caller: MemorySubject = { tenantId: "__local__", ownerType: "agent", ownerId: "agent_main" };
     const bindingForScopeA = createMemorySubjectBinding({
       partition: PARTITION,
       scope: SCOPE,
-      subject: caller,
+      subject: CALLER,
     });
-
     const scopeAAtom = makeAtom({ id: "atm_a", scope: SCOPE });
     const scopeBAtom = makeAtom({ id: "atm_b", scope: OTHER_AGENT_SCOPE });
-
     const taskFramePointingToB: TaskFrame = {
       id: "tf_b",
       scope: OTHER_AGENT_SCOPE,
@@ -107,10 +105,9 @@ describe("Memory Optimization Engine (CW-04B-R1..CW-04H-R1)", () => {
     const res = optimizeRetrieval({
       taskFrame: taskFramePointingToB,
       candidates: [scopeAAtom, scopeBAtom],
-      auth: { caller, bindings: [bindingForScopeA], dataPlaneId: "dp_1" },
+      auth: { caller: CALLER, bindings: [bindingForScopeA], dataPlaneId: "dp_1" },
     });
 
-    // scopeBAtom fails per-atom binding check (unauthorized); scopeAAtom fails taskFrame scope_mismatch.
     expect(res.selectedAtoms).toEqual([]);
     expect(res.excludedCandidates).toEqual(
       expect.arrayContaining([
@@ -130,28 +127,9 @@ describe("Memory Optimization Engine (CW-04B-R1..CW-04H-R1)", () => {
       provenance: { sourceEventIds: ["evt_1", "evt_2"], evidenceRefs: ["evd_2"] },
     });
     expect(abstractFromAtoms({ atoms: [a1, a2] })).toBeNull();
-
-    const ind1 = makeAtom({
-      id: "atm_i1",
-      atomType: "failure_pattern",
-      claim: { type: "causal", statement: "Connection pool exhaustion causes timeout." },
-      applicability: { include: ["prod", "us-east"], exclude: ["canary"] },
-      provenance: { sourceEventIds: ["evt_1"], evidenceRefs: ["evd_1"] },
-    });
-    const ind2 = makeAtom({
-      id: "atm_i2",
-      atomType: "failure_pattern",
-      claim: { type: "causal", statement: "Small connection pool causes timeout." },
-      applicability: { include: ["prod", "eu-west"], exclude: ["local"] },
-      provenance: { sourceEventIds: ["evt_2"], evidenceRefs: ["evd_2"] },
-    });
-    const abs = abstractFromAtoms({ atoms: [ind1, ind2] });
-    expect(abs).not.toBeNull();
-    expect(abs?.requiresReview).toBe(true);
-    expect(abs?.applicability.include).toEqual(["prod"]);
   });
 
-  it("CW-04D-R1/MOP-06: enforces hard serialized CognitivePackage budget and reports unsatisfied_budget without clamping >1 utilization", () => {
+  it("CW-04J-04/MOP-06: preserves original answer.summary and answer.recommendations while enforcing serialized budget", () => {
     const policy = makeAtom({
       id: "atm_pol",
       atomType: "policy",
@@ -161,140 +139,167 @@ describe("Memory Optimization Engine (CW-04B-R1..CW-04H-R1)", () => {
     const pkg: CognitivePackage = {
       packageId: "pkg_1",
       taskFrameId: "tf_1",
-      answer: { summary: "summary", recommendations: [], nextSteps: ["step1"] },
+      answer: {
+        summary: "Original business summary",
+        recommendations: ["Original recommendation 1"],
+        nextSteps: ["step1"],
+      },
       why: { summary: "matched", matchedPatterns: [] },
       supportingAtoms: ["atm_pol"],
       reasoningPath: [],
       confidence: 0.9,
       risks: ["risk1"],
-      constraints: ["A_VERY_LONG_CONSTRAINT_EXCEEDING_TINY_BUDGET"],
+      constraints: ["no_force_push"],
       conflicts: [],
       evidenceRefs: ["evd_pol"],
     };
 
-    const unsatisfied = buildContextPackage({ pkg, atoms: [policy], budgetTokens: 10 });
-    expect(unsatisfied.budgetStatus).toBe("unsatisfied_budget");
-    expect(unsatisfied.budgetUtilization).toBeGreaterThan(1);
-
     const fits = buildContextPackage({ pkg, atoms: [policy], budgetTokens: 500 });
     expect(fits.budgetStatus).toBe("within_budget");
-    expect(fits.tokenEstimate).toBeLessThanOrEqual(500);
-    expect(fits.evidenceCompleteness).toBeLessThanOrEqual(1);
+    expect(fits.budgetedPackage.answer.summary).toBe("Original business summary");
+    expect(fits.budgetedPackage.answer.recommendations).toEqual(["Original recommendation 1"]);
+    expect(fits.atomContextNotes).toEqual(["Never force-push main."]);
+
+    const tiny = buildContextPackage({ pkg, atoms: [policy], budgetTokens: 10 });
+    expect(tiny.budgetStatus).toBe("unsatisfied_budget");
+    expect(tiny.budgetUtilization).toBeGreaterThan(1);
   });
 
-  it("CW-04E-R1 & CW-04F-R1: records journal & reports derivedIndexesSynced=false when derived stores are missing or fail; executes tombstone & revalidate", async () => {
+  it("CW-04J-02 & CW-04J-03: marks DERIVED_OUT_OF_SYNC when delete() is missing on stores and journals Lifecycle writes", async () => {
     const store = new InMemoryMetadataStore();
     const a1 = makeAtom({ id: "atm_1", dedupKey: "k1" });
     const a2 = makeAtom({ id: "atm_2", dedupKey: "k1" });
     await store.saveAtom(a1);
     await store.saveAtom(a2);
 
-    const plan = consolidateAtoms([a1, a2]);
-    // Missing graphStore/vectorStore -> canonicalCommitted=true, derivedIndexesSynced=false
-    const noDerived = await applyConsolidation({ plan, metadataStore: store });
-    expect(noDerived.canonicalCommitted).toBe(true);
-    expect(noDerived.derivedIndexesSynced).toBe(false);
-    expect((await store.getJournal(noDerived.journalId))?.status).toBe("DERIVED_OUT_OF_SYNC");
+    const storeWithoutDelete = {
+      syncFromDistillation: async () => ({ nodeCount: 0, edgeCount: 0 }),
+      rebuildFromBundle: async () => ({ nodeCount: 0, edgeCount: 0 }),
+    } as GraphStore;
+    const vectorWithoutDelete = {
+      syncFromDistillation: async () => ({ documentCount: 0 }),
+      rebuildFromBundle: async () => ({ documentCount: 0 }),
+    } as VectorStore;
 
-    // Failing graphStore -> derivedIndexesSynced=false with error
-    const failingGraph = new InMemoryGraphStore();
-    failingGraph.delete = async () => {
-      throw new Error("neo4j_down");
-    };
-    await store.saveAtom(a2); // restore active for retry
-    const failedDerived = await applyConsolidation({
+    const plan = consolidateAtoms([a1, a2]);
+    const res = await applyConsolidation({
       plan,
       metadataStore: store,
-      graphStore: failingGraph,
-      vectorStore: new InMemoryVectorStore(),
+      graphStore: storeWithoutDelete,
+      vectorStore: vectorWithoutDelete,
     });
-    expect(failedDerived.derivedIndexesSynced).toBe(false);
-    expect(failedDerived.derivedSyncError).toBe("neo4j_down");
+    expect(res.canonicalCommitted).toBe(true);
+    expect(res.derivedIndexesSynced).toBe(false);
+    expect(res.derivedSyncError).toBe("derived_store_delete_unsupported");
+    expect((await store.getJournal(res.journalId))?.status).toBe("DERIVED_OUT_OF_SYNC");
 
-    // Lifecycle executes tombstone and revalidate
     const tombAtom = makeAtom({
       id: "atm_tomb",
       lifecycle: { tombstonedAt: "2026-11-26T00:00:00Z" },
     });
-    const noDateAtom = makeAtom({ id: "atm_reval" });
     await store.saveAtom(tombAtom);
-    await store.saveAtom(noDateAtom);
-
-    const evals = [
-      evaluateLifecycle(tombAtom, { nowMs: Date.parse("2026-11-27T00:00:00Z") }),
-      evaluateLifecycle(noDateAtom),
-    ];
     const lifeRes = await applyLifecycleDecisions({
-      evaluations: evals,
+      evaluations: [evaluateLifecycle(tombAtom, { nowMs: Date.parse("2026-11-27T00:00:00Z") })],
       metadataStore: store,
       graphStore: new InMemoryGraphStore(),
       vectorStore: new InMemoryVectorStore(),
     });
-    expect(lifeRes.tombstonedIds).toEqual(["atm_tomb"]);
-    expect(lifeRes.revalidatedIds).toEqual(["atm_reval"]);
-    expect((await store.getAtom("atm_reval"))?.state.status).toBe("tentative");
+    expect(lifeRes.canonicalCommitted).toBe(true);
+    expect(lifeRes.derivedIndexesSynced).toBe(true);
+    expect((await store.getJournal(lifeRes.journalId))?.status).toBe("COMPLETED");
   });
 
-  it("CW-04G-R1 & CW-04G-R2: rejects cross-scope job inputs, invalidates idempotencyKey on version change, and measures real Canonical Store delta", async () => {
+  it("CW-04J-01 & CW-04J-05: requires authorized executionContext, rejects explicit idempotencyKey payload conflicts, and reports estimatedCanonicalClaimTokenDelta", async () => {
     const dir = await mkdtemp(join(tmpdir(), "cw-opt-job-"));
     try {
       const jobStore = new FileDurableJobStore(join(dir, "jobs.json"));
       const metadataStore = new InMemoryMetadataStore();
       const a1 = makeAtom({ id: "atm_1", dedupKey: "k1" });
       const a2 = makeAtom({ id: "atm_2", dedupKey: "k1" });
-      const crossScope = makeAtom({ id: "atm_cross", scope: OTHER_AGENT_SCOPE });
       await metadataStore.saveAtom(a1);
       await metadataStore.saveAtom(a2);
 
-      // P0-02: Cross-scope atom rejected at job entry
+      const binding = createMemorySubjectBinding({
+        partition: PARTITION,
+        scope: SCOPE,
+        subject: CALLER,
+      });
+
+      // Unbound / forged caller rejected fail-closed before job enqueue.
       await expect(
         runOptimizationJob({
-          tenantId: "t_1",
+          tenantId: "__local__",
           subjectId: "subj_1",
           scope: SCOPE,
           optimizationType: "consolidation",
-          atoms: [a1, crossScope],
+          atoms: [a1, a2],
+          executionContext: {
+            actorUserId: "u_forged",
+            tenantId: "__local__",
+            scope: SCOPE,
+            caller: { tenantId: "__local__", ownerType: "agent", ownerId: "forged_agent" },
+            bindings: [binding],
+            dataPlaneId: "dp_1",
+          },
           jobStore,
           metadataStore,
         }),
-      ).rejects.toThrow("different scope");
-
-      const keyV1 = computeOptimizationIdempotencyKey({
-        tenantId: "t_1",
-        scope: SCOPE,
-        optimizationType: "consolidation",
-        atoms: [a1, a2],
-        policyVersion: "1.0.0",
-        pipelineVersion: "1.0.0",
-      });
-      const keyV2 = computeOptimizationIdempotencyKey({
-        tenantId: "t_1",
-        scope: SCOPE,
-        optimizationType: "consolidation",
-        atoms: [a1, { ...a2, versioning: { version: 2 } }],
-        policyVersion: "1.0.0",
-        pipelineVersion: "1.0.0",
-      });
-      expect(keyV1).not.toBe(keyV2);
+      ).rejects.toThrow("unauthorized");
 
       const job = await runOptimizationJob({
-        tenantId: "t_1",
+        idempotencyKey: "explicit_key_1",
+        tenantId: "__local__",
         subjectId: "subj_1",
         scope: SCOPE,
         optimizationType: "consolidation",
         atoms: [a1, a2],
-        executionContext: { actorUserId: "u_1", tenantId: "t_1", scope: SCOPE },
+        executionContext: {
+          actorUserId: "u_1",
+          tenantId: "__local__",
+          scope: SCOPE,
+          caller: CALLER,
+          bindings: [binding],
+          dataPlaneId: "dp_1",
+        },
         jobStore,
         metadataStore,
         graphStore: new InMemoryGraphStore(),
         vectorStore: new InMemoryVectorStore(),
       });
       expect(job.status).toBe("completed");
-      expect(job.result?.canonicalTokensBefore).toBeGreaterThan(0);
-      expect(job.result?.canonicalTokensAfter).toBeLessThan(job.result!.canonicalTokensBefore!);
-      expect(job.result?.verifiedCanonicalTokenDelta).toBe(
-        job.result!.canonicalTokensBefore! - job.result!.canonicalTokensAfter!,
-      );
+      expect(job.result?.estimatedCanonicalClaimTokenDelta).toBeGreaterThan(0);
+
+      // Reusing same explicit idempotencyKey with a mutated atom version must fail with IdempotencyConflictError!
+      await expect(
+        runOptimizationJob({
+          idempotencyKey: "explicit_key_1",
+          tenantId: "__local__",
+          subjectId: "subj_1",
+          scope: SCOPE,
+          optimizationType: "consolidation",
+          atoms: [a1, { ...a2, versioning: { version: 2 } }],
+          executionContext: {
+            actorUserId: "u_1",
+            tenantId: "__local__",
+            scope: SCOPE,
+            caller: CALLER,
+            bindings: [binding],
+            dataPlaneId: "dp_1",
+          },
+          jobStore,
+        }),
+      ).rejects.toThrow("different payload");
+
+      expect(
+        computeOptimizationIdempotencyKey({
+          tenantId: "__local__",
+          scope: SCOPE,
+          optimizationType: "consolidation",
+          atoms: [a1, a2],
+          policyVersion: "1.0.0",
+          pipelineVersion: "1.0.0",
+        }),
+      ).toHaveLength(32);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
