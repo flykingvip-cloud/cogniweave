@@ -1,8 +1,20 @@
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
+import type { DurableJobStore } from "../jobs/durable-job-store.js";
+import { computeScopeFingerprint } from "../keys.js";
 import type { MemoryAtom, Scope } from "../models.js";
+import type { GraphStore, MetadataStore, VectorStore } from "../storage/types.js";
 import { abstractFromAtoms, type AbstractedMemory } from "./abstraction.js";
-import { consolidateAtoms, type ConsolidationResult } from "./consolidation.js";
-import { evaluateLifecycle, type LifecycleEvaluation } from "./lifecycle.js";
+import {
+  applyConsolidation,
+  consolidateAtoms,
+  type AppliedConsolidationResult,
+  type ConsolidationPlan,
+} from "./consolidation.js";
+import {
+  applyLifecycleDecisions,
+  evaluateLifecycle,
+  type LifecycleEvaluation,
+} from "./lifecycle.js";
 
 export type OptimizationJobStatus =
   | "pending"
@@ -17,16 +29,20 @@ export type OptimizationType = "full" | "consolidation" | "abstraction" | "lifec
 export interface OptimizationReport {
   reportId: string;
   inputAtomCount: number;
-  consolidation?: ConsolidationResult;
+  consolidation?: ConsolidationPlan;
+  appliedConsolidation?: AppliedConsolidationResult;
   abstraction?: AbstractedMemory | null;
   lifecycleEvaluations: LifecycleEvaluation[];
   duplicateReductionCount: number;
   estimatedTokensBefore: number;
-  estimatedTokensAfter: number;
+  plannedTokensAfter: number;
+  plannedTokenReduction: number;
+  verifiedTokenReduction: number;
 }
 
 export interface MemoryOptimizationJob {
   jobId: string;
+  idempotencyKey: string;
   tenantId: string;
   subjectId: string;
   scope: Scope;
@@ -49,11 +65,31 @@ function estimateTotalTokens(atoms: ReadonlyArray<MemoryAtom>): number {
   );
 }
 
+export function computeOptimizationIdempotencyKey(params: {
+  tenantId: string;
+  scope: Scope;
+  optimizationType: OptimizationType;
+  targetMemoryIds: ReadonlyArray<string>;
+  policyVersion: string;
+}): string {
+  const payload = JSON.stringify({
+    tenantId: params.tenantId,
+    scope: computeScopeFingerprint(params.scope),
+    optimizationType: params.optimizationType,
+    targetMemoryIds: [...params.targetMemoryIds].toSorted(),
+    policyVersion: params.policyVersion,
+  });
+  return createHash("sha256").update(payload).digest("hex").slice(0, 32);
+}
+
 /**
- * Execute a deterministic, idempotent MemoryOptimizationJob over target atoms.
+ * Execute an idempotent MemoryOptimizationJob.
+ * - Uses deterministic idempotencyKey (deduplicates via DurableJobStore when provided).
+ * - Distinguishes plannedTokenReduction vs verifiedTokenReduction (only non-zero when
+ *   canonical write-back via metadataStore actually executes).
  */
-export function runOptimizationJob(params: {
-  jobId?: string;
+export async function runOptimizationJob(params: {
+  idempotencyKey?: string;
   tenantId: string;
   subjectId: string;
   scope: Scope;
@@ -62,74 +98,182 @@ export function runOptimizationJob(params: {
   policyVersion?: string;
   pipelineVersion?: string;
   nowMs?: number;
-}): MemoryOptimizationJob {
-  const createdAt = new Date(params.nowMs ?? Date.now()).toISOString();
-  const jobId = params.jobId ?? `opt_${randomUUID().slice(0, 12)}`;
+  jobStore?: DurableJobStore;
+  metadataStore?: MetadataStore;
+  graphStore?: GraphStore;
+  vectorStore?: VectorStore;
+}): Promise<MemoryOptimizationJob> {
+  const policyVersion = params.policyVersion ?? "1.0.0";
+  const pipelineVersion = params.pipelineVersion ?? "1.0.0";
   const targetMemoryIds = params.atoms.map((a) => a.id);
+  const idempotencyKey =
+    params.idempotencyKey ??
+    computeOptimizationIdempotencyKey({
+      tenantId: params.tenantId,
+      scope: params.scope,
+      optimizationType: params.optimizationType,
+      targetMemoryIds,
+      policyVersion,
+    });
+
+  let jobId = `opt_${idempotencyKey.slice(0, 12)}`;
+  let createdAt = new Date(params.nowMs ?? Date.now()).toISOString();
+
+  if (params.jobStore) {
+    const record = await params.jobStore.enqueue({
+      kind: "optimization",
+      tenantId: params.tenantId,
+      idempotencyKey,
+      pipelineVersion,
+      payload: {
+        subjectId: params.subjectId,
+        scope: params.scope,
+        optimizationType: params.optimizationType,
+        targetMemoryIds,
+      },
+    });
+    jobId = record.jobId;
+    createdAt = record.createdAt;
+    if (record.status === "completed" && record.result) {
+      return {
+        jobId,
+        idempotencyKey,
+        tenantId: params.tenantId,
+        subjectId: params.subjectId,
+        scope: params.scope,
+        optimizationType: params.optimizationType,
+        targetMemoryIds,
+        policyVersion,
+        pipelineVersion,
+        status: "completed",
+        checkpoint: record.checkpoint,
+        result: record.result as OptimizationReport,
+        createdAt,
+        completedAt: record.completedAt,
+      };
+    }
+  }
 
   try {
     const consolidation =
       params.optimizationType === "full" || params.optimizationType === "consolidation"
         ? consolidateAtoms(params.atoms)
         : undefined;
+    if (params.jobStore) {
+      await params.jobStore.checkpoint(jobId, "consolidation_planned", 35);
+    }
 
     const abstraction =
       params.optimizationType === "full" || params.optimizationType === "abstraction"
         ? abstractFromAtoms({ atoms: params.atoms })
         : undefined;
+    if (params.jobStore) {
+      await params.jobStore.checkpoint(jobId, "abstraction_evaluated", 60);
+    }
 
     const lifecycleEvaluations =
       params.optimizationType === "full" || params.optimizationType === "lifecycle"
         ? params.atoms.map((atom) => evaluateLifecycle(atom, { nowMs: params.nowMs }))
         : [];
 
+    let appliedConsolidation: AppliedConsolidationResult | undefined;
+    let verifiedDeprecatedOrPurged = new Set<string>();
+    if (params.metadataStore) {
+      if (consolidation) {
+        appliedConsolidation = await applyConsolidation({
+          plan: consolidation,
+          metadataStore: params.metadataStore,
+          graphStore: params.graphStore,
+          vectorStore: params.vectorStore,
+          now: createdAt,
+        });
+        for (const id of appliedConsolidation.deprecatedSourceIds) {
+          verifiedDeprecatedOrPurged.add(id);
+        }
+      }
+      if (lifecycleEvaluations.length > 0) {
+        const appliedLife = await applyLifecycleDecisions({
+          evaluations: lifecycleEvaluations,
+          metadataStore: params.metadataStore,
+          graphStore: params.graphStore,
+          vectorStore: params.vectorStore,
+          now: createdAt,
+        });
+        for (const id of [
+          ...appliedLife.archivedIds,
+          ...appliedLife.deprecatedIds,
+          ...appliedLife.purgedIds,
+        ]) {
+          verifiedDeprecatedOrPurged.add(id);
+        }
+      }
+    }
+
     const estimatedTokensBefore = estimateTotalTokens(params.atoms);
     const duplicateReductionCount = consolidation?.mergedCount ?? 0;
-    const retainedIds = new Set(
+    const retainedPlannedIds = new Set(
       consolidation ? consolidation.clusters.map((c) => c.canonicalAtomId) : targetMemoryIds,
     );
-    const estimatedTokensAfter = estimateTotalTokens(
-      params.atoms.filter((a) => retainedIds.has(a.id)),
+    const plannedTokensAfter = estimateTotalTokens(
+      params.atoms.filter((a) => retainedPlannedIds.has(a.id)),
     );
+    const plannedTokenReduction = Math.max(0, estimatedTokensBefore - plannedTokensAfter);
+    const verifiedTokenReduction = params.metadataStore
+      ? estimateTotalTokens(params.atoms.filter((a) => verifiedDeprecatedOrPurged.has(a.id)))
+      : 0;
 
     const report: OptimizationReport = {
       reportId: `rep_${jobId}`,
       inputAtomCount: params.atoms.length,
       ...(consolidation ? { consolidation } : {}),
+      ...(appliedConsolidation ? { appliedConsolidation } : {}),
       ...(abstraction !== undefined ? { abstraction } : {}),
       lifecycleEvaluations,
       duplicateReductionCount,
       estimatedTokensBefore,
-      estimatedTokensAfter,
+      plannedTokensAfter,
+      plannedTokenReduction,
+      verifiedTokenReduction,
     };
+
+    const completedAt = new Date(params.nowMs ?? Date.now()).toISOString();
+    if (params.jobStore) {
+      await params.jobStore.complete(jobId, report);
+    }
 
     return {
       jobId,
+      idempotencyKey,
       tenantId: params.tenantId,
       subjectId: params.subjectId,
       scope: params.scope,
       optimizationType: params.optimizationType,
       targetMemoryIds,
-      policyVersion: params.policyVersion ?? "1.0.0",
-      pipelineVersion: params.pipelineVersion ?? "1.0.0",
+      policyVersion,
+      pipelineVersion,
       status: "completed",
       checkpoint: "done",
       result: report,
       createdAt,
-      completedAt: new Date(params.nowMs ?? Date.now()).toISOString(),
+      completedAt,
     };
   } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (params.jobStore) {
+      await params.jobStore.fail(jobId, message);
+    }
     return {
       jobId,
+      idempotencyKey,
       tenantId: params.tenantId,
       subjectId: params.subjectId,
       scope: params.scope,
       optimizationType: params.optimizationType,
       targetMemoryIds,
-      policyVersion: params.policyVersion ?? "1.0.0",
-      pipelineVersion: params.pipelineVersion ?? "1.0.0",
+      policyVersion,
+      pipelineVersion,
       status: "failed",
-      error: err instanceof Error ? err.message : String(err),
+      error: message,
       createdAt,
     };
   }
