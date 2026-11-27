@@ -1,6 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
   authorizeCanonicalResource,
+  authorizeDeclaredScope,
+  isAuthorizedMemoryResourceDescriptor,
   isRebuildObjectType,
   type AuthoritativeBindingQuery,
   type CanonicalResourceKind,
@@ -8,6 +10,7 @@ import {
   type CanonicalResourceScopeResolver,
 } from "../auth/canonical-scope.js";
 import { ScopeViolationError, StoreUnavailableError } from "../errors.js";
+import type { Scope } from "../models.js";
 import type { CogniWeaveMemoryResourceAdapter, MemoryResourceDescriptor } from "../resource/index.js";
 import type {
   DistillRequest,
@@ -205,6 +208,10 @@ async function routeEnvelopeInner(
       return responseBody(401, { error: "invalid_token" });
     }
     principal = validated;
+    if (principal.subject && principal.tenantId !== principal.subject.tenantId) {
+      metrics.unauthorizedTotal += 1;
+      return responseBody(403, { error: "tenant_mismatch" });
+    }
     const headerTenant = envelope.headers["x-cogniweave-tenant-id"];
     if (!headerTenant || headerTenant !== principal.tenantId) {
       metrics.unauthorizedTotal += 1;
@@ -239,22 +246,23 @@ async function routeEnvelopeInner(
   };
 
   // CW-09-01: declared scope only. Never fall back to request headers.
-  const authorizeDeclaredWorkspace = async (
-    workspaceId?: string,
+  // CW-09-01-R1: declared-scope routes also require Authoritative Binding for the full Scope.
+  const authorizeDeclared = async (
+    scope?: Scope,
   ): Promise<RestResponse<unknown> | null> => {
     if (!requireAuth) return null;
-    if (!principal) {
-      return responseBody(401, { error: "unauthorized" });
-    }
-    const targetWs = (workspaceId ?? "").trim();
-    if (!targetWs) {
+    const decision = await authorizeDeclaredScope({
+      principal,
+      scope,
+      authorizeWorkspace: workspaceAllowed,
+      bindingQuery: options?.authoritativeBindingQuery,
+      ensureDataPlaneId: options?.ensureDataPlaneId,
+    });
+    if (!decision.allowed) {
       metrics.unauthorizedTotal += 1;
-      return responseBody(403, { error: "missing_workspace_scope" });
+      return responseBody(decision.httpStatus, { error: decision.error });
     }
-    if (!(await workspaceAllowed(targetWs))) {
-      metrics.unauthorizedTotal += 1;
-      return responseBody(403, { error: "scope_tenant_forbidden" });
-    }
+    context.authorizedScope = decision.scope;
     return null;
   };
 
@@ -303,37 +311,37 @@ async function routeEnvelopeInner(
 
   if (method === "POST" && pathname === "/v1/tasks/frame") {
     const body = parseBody<FrameTaskRequest>(envelope.body);
-    const denied = await authorizeDeclaredWorkspace(body.scope?.workspaceId);
+    const denied = await authorizeDeclared(body.scope);
     if (denied) return denied;
     return service.handleFrameTask(body, context);
   }
   if (method === "POST" && pathname === "/v1/reason") {
     const body = parseBody<ReasonRequest>(envelope.body);
-    const denied = await authorizeDeclaredWorkspace(body.taskFrame?.scope?.workspaceId);
+    const denied = await authorizeDeclared(body.taskFrame?.scope);
     if (denied) return denied;
     return service.handleReason(body, context);
   }
   if (method === "POST" && pathname === "/v1/reason/debug") {
     const body = parseBody<ReasonRequest>(envelope.body);
-    const denied = await authorizeDeclaredWorkspace(body.taskFrame?.scope?.workspaceId);
+    const denied = await authorizeDeclared(body.taskFrame?.scope);
     if (denied) return denied;
     return service.handleReasonDebug(body, context);
   }
   if (method === "POST" && pathname === "/v1/ingest") {
     const body = parseBody<DistillRequest>(envelope.body);
-    const denied = await authorizeDeclaredWorkspace(body.scope?.workspaceId);
+    const denied = await authorizeDeclared(body.scope);
     if (denied) return denied;
     return service.handleIngest(body, context);
   }
   if (method === "POST" && pathname === "/v1/distill") {
     const body = parseBody<DistillRequest>(envelope.body);
-    const denied = await authorizeDeclaredWorkspace(body.scope?.workspaceId);
+    const denied = await authorizeDeclared(body.scope);
     if (denied) return denied;
     return service.handleDistill(body, context);
   }
   if (method === "POST" && pathname === "/v1/write-back") {
     const body = parseBody<WriteBackRequest>(envelope.body);
-    const denied = await authorizeDeclaredWorkspace(body.scope?.workspaceId);
+    const denied = await authorizeDeclared(body.scope);
     if (denied) return denied;
     return service.handleWriteBack(body, context);
   }
@@ -342,15 +350,75 @@ async function routeEnvelopeInner(
   if (options?.resourceAdapter) {
     if (method === "GET" && pathname === "/v1/memory-resources") {
       const declaredWorkspace = (envelope.headers["x-cogniweave-workspace-id"] ?? "").trim();
-      const denied = await authorizeDeclaredWorkspace(declaredWorkspace);
-      if (denied) return denied;
+      if (requireAuth) {
+        if (!principal) {
+          metrics.unauthorizedTotal += 1;
+          return responseBody(401, { error: "unauthorized" });
+        }
+        if (!principal.subject) {
+          metrics.unauthorizedTotal += 1;
+          return responseBody(503, { error: "principal_unavailable" });
+        }
+        if (principal.tenantId !== principal.subject.tenantId) {
+          metrics.unauthorizedTotal += 1;
+          return responseBody(403, { error: "tenant_mismatch" });
+        }
+        if (!declaredWorkspace) {
+          metrics.unauthorizedTotal += 1;
+          return responseBody(403, { error: "missing_workspace_scope" });
+        }
+        if (!(await workspaceAllowed(declaredWorkspace))) {
+          metrics.unauthorizedTotal += 1;
+          return responseBody(403, { error: "scope_tenant_forbidden" });
+        }
+        if (!options?.authoritativeBindingQuery) {
+          metrics.unauthorizedTotal += 1;
+          return responseBody(503, { error: "binding_store_unavailable" });
+        }
+      }
       const listed = await options.resourceAdapter.listResources(principal?.tenantId);
-      return responseBody(
-        200,
-        declaredWorkspace
-          ? listed.filter((desc) => desc.scope.workspaceId === declaredWorkspace)
-          : listed,
-      );
+      const inWorkspace = declaredWorkspace
+        ? listed.filter((desc) => desc.scope.workspaceId === declaredWorkspace)
+        : listed;
+      if (!requireAuth) {
+        return responseBody(200, inWorkspace);
+      }
+      if (!principal) {
+        metrics.unauthorizedTotal += 1;
+        return responseBody(401, { error: "unauthorized" });
+      }
+      const listPrincipal = principal;
+      const visible: typeof inWorkspace = [];
+      for (const desc of inWorkspace) {
+        if (desc.tenantId && desc.tenantId !== listPrincipal.tenantId) {
+          continue;
+        }
+        const decision = await authorizeDeclaredScope({
+          principal: listPrincipal,
+          scope: desc.scope,
+          authorizeWorkspace: workspaceAllowed,
+          bindingQuery: options?.authoritativeBindingQuery,
+          ensureDataPlaneId: options?.ensureDataPlaneId,
+        });
+        if (!decision.allowed) {
+          if (decision.httpStatus === 503) {
+            metrics.unauthorizedTotal += 1;
+            return responseBody(decision.httpStatus, { error: decision.error });
+          }
+          continue;
+        }
+        if (
+          !isAuthorizedMemoryResourceDescriptor({
+            principal: listPrincipal,
+            descriptor: desc,
+            bindingId: decision.bindingId,
+          })
+        ) {
+          continue;
+        }
+        visible.push(desc);
+      }
+      return responseBody(200, visible);
     }
     const resMatch = pathname.match(/^\/v1\/memory-resources\/([^/]+)$/);
     if (method === "GET" && resMatch) {
@@ -409,13 +477,13 @@ async function routeEnvelopeInner(
 
   if (method === "POST" && pathname === "/v1/evidence/resolve") {
     const body = parseBody<ResolveEvidenceRequest>(envelope.body);
-    const denied = await authorizeDeclaredWorkspace(body.scope?.workspaceId);
+    const denied = await authorizeDeclared(body.scope);
     if (denied) return denied;
     return service.handleResolveEvidence(body, context);
   }
   if (method === "POST" && pathname === "/v1/repair/indexes") {
     const body = parseBody<RepairIndexesRequest>(envelope.body);
-    const denied = await authorizeDeclaredWorkspace(body.scope?.workspaceId);
+    const denied = await authorizeDeclared(body.scope);
     if (denied) return denied;
     return service.handleRepairIndexes(body, context);
   }

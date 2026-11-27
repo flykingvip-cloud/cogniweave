@@ -4,7 +4,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { createDenyByDefaultBindingQuery } from "../auth/canonical-scope.js";
+import { createMemoryPartitionKeyV1 } from "../keys.js";
 import type { MemorySubject, Scope } from "../models.js";
+import { createMemorySubjectBinding } from "../subject/binding.js";
 import { CogniWeaveMemoryResourceAdapter } from "../resource/index.js";
 import { InMemoryCogniWeaveEngine } from "../runtime/in-memory-engine.js";
 import { InMemoryMetadataStore } from "../storage/in-memory.js";
@@ -361,6 +363,10 @@ describe("CW-09-01 REST canonical scope authorization", () => {
     expect(source).toContain('authorizeCanonical("journal"');
     expect(source).toContain('authorizeCanonical("memory_resource"');
     expect(source).toContain("authorizeCanonical(body.objectType");
+    expect(source).toContain("authorizeDeclared(body.scope)");
+    expect(source).toContain("authorizeDeclared(body.taskFrame?.scope)");
+    expect(source).toContain("authorizeDeclaredScope");
+    expect(source).not.toContain("authorizeDeclaredWorkspace");
     expect(source).not.toContain('workspaceId ?? envelope.headers["x-cogniweave-workspace-id"]');
     expect(source).toContain("Never fall back to request headers");
   });
@@ -765,5 +771,202 @@ describe("CW-09-01 REST canonical scope authorization", () => {
     );
     expect(response.status).toBe(403);
     expect(response.body).toEqual({ error: "missing_workspace_scope" });
+  });
+
+  it("denies declared-scope create and write routes without a live subject binding", async () => {
+    const { service, opts } = await setup();
+    const noBinding = {
+      ...opts,
+      authoritativeBindingQuery: createDenyByDefaultBindingQuery([]),
+    };
+    const routes: Array<{ method: string; url: string; body: unknown }> = [
+      { method: "POST", url: "/v1/tasks/frame", body: { rawInput: RAW_INPUT, scope } },
+      {
+        method: "POST",
+        url: "/v1/reason",
+        body: {
+          taskFrame: {
+            id: "tf_1",
+            scope,
+            taskType: "operations",
+            goals: [],
+            problems: [],
+            scenarioTags: [],
+            constraints: [],
+            entities: [],
+            requiredAtomTypes: [],
+          },
+        },
+      },
+      {
+        method: "POST",
+        url: "/v1/ingest",
+        body: { rawInput: RAW_INPUT, scope, sourceType: "chat", sourceSessionId: "sess_1" },
+      },
+      {
+        method: "POST",
+        url: "/v1/distill",
+        body: { rawInput: RAW_INPUT, scope, sourceType: "chat", sourceSessionId: "sess_1" },
+      },
+      {
+        method: "POST",
+        url: "/v1/write-back",
+        body: { rawInput: RAW_INPUT, scope, sourceType: "chat", sourceSessionId: "sess_1" },
+      },
+      { method: "POST", url: "/v1/evidence/resolve", body: { scope, atomId: "atm_1" } },
+      { method: "POST", url: "/v1/repair/indexes", body: { scope } },
+    ];
+    for (const route of routes) {
+      const response = await routeCogniWeaveHttpRequest(
+        service,
+        {
+          method: route.method,
+          url: route.url,
+          headers: authHeaders(),
+          body: JSON.stringify(route.body),
+        },
+        noBinding,
+      );
+      expect({ url: route.url, status: response.status, body: response.body }).toEqual({
+        url: route.url,
+        status: 403,
+        body: { error: "subject_binding_denied" },
+      });
+    }
+  });
+
+  it("denies declared-scope writes for a cross-subject principal in an allowed workspace", async () => {
+    const { service, opts } = await setup();
+    const otherSubject: MemorySubject = { tenantId: "t_1", ownerType: "user", ownerId: "u_other" };
+    const response = await routeCogniWeaveHttpRequest(
+      service,
+      {
+        method: "POST",
+        url: "/v1/tasks/frame",
+        headers: authHeaders(),
+        body: JSON.stringify({ rawInput: RAW_INPUT, scope }),
+      },
+      {
+        ...opts,
+        validateToken: async () => ({
+          tenantId: "t_1",
+          userId: "u_other",
+          allowedWorkspaceIds: ["ws_1"],
+          subject: otherSubject,
+        }),
+      },
+    );
+    expect(response.status).toBe(403);
+    expect(response.body).toEqual({ error: "subject_binding_denied" });
+  });
+
+  it("denies declared-scope writes after the subject binding is revoked", async () => {
+    const { service, metadataStore, opts } = await setup();
+    const live = await metadataStore.listMemorySubjectBindings!({ scope, liveOnly: true });
+    const revoked = live.map((binding) => ({ ...binding, unboundAt: "2026-11-27T00:00:00.000Z" }));
+    const response = await routeCogniWeaveHttpRequest(
+      service,
+      {
+        method: "POST",
+        url: "/v1/write-back",
+        headers: authHeaders(),
+        body: JSON.stringify({ rawInput: RAW_INPUT, scope, sourceType: "chat", sourceSessionId: "sess_revoked" }),
+      },
+      {
+        ...opts,
+        authoritativeBindingQuery: createDenyByDefaultBindingQuery(revoked),
+      },
+    );
+    expect(response.status).toBe(403);
+    expect(response.body).toEqual({ error: "subject_binding_denied" });
+  });
+
+  it("filters /v1/memory-resources so same-workspace resources for other subjects are not listed", async () => {
+    const { service, engine, adapter, opts, metadataStore } = await setup();
+    await seed(service, engine);
+    const dataPlaneId = await metadataStore.ensureDataPlaneId();
+    const live = await opts.authoritativeBindingQuery.listLiveBindings({
+      tenantId: subject.tenantId,
+      dataPlaneId,
+      scope,
+    });
+    const bindingId = live[0]?.id;
+    expect(bindingId).toBeTruthy();
+
+    const otherSubject: MemorySubject = { tenantId: "t_1", ownerType: "user", ownerId: "u_other" };
+    const otherBinding = createMemorySubjectBinding({
+      partition: createMemoryPartitionKeyV1(dataPlaneId, scope),
+      scope,
+      subject: otherSubject,
+    });
+
+    await adapter.registerResource({
+      resourceId: "res_self",
+      resourceType: "user_memory",
+      tenantId: "t_1",
+      ownerType: "user",
+      ownerId: "u_1",
+      subjectBindingId: bindingId!,
+      scope,
+      visibility: "private",
+      privacyLevel: "private",
+      lifecycleStatus: "active",
+      supportedAtomTypes: [],
+      capabilities: ["retrieve"],
+      sourceAuthority: "user",
+      evidenceSupport: true,
+    });
+    await adapter.registerResource({
+      resourceId: "res_other_subject",
+      resourceType: "user_memory",
+      tenantId: "t_1",
+      ownerType: "user",
+      ownerId: "u_other",
+      subjectBindingId: otherBinding.id,
+      scope,
+      visibility: "private",
+      privacyLevel: "private",
+      lifecycleStatus: "active",
+      supportedAtomTypes: [],
+      capabilities: ["retrieve"],
+      sourceAuthority: "user",
+      evidenceSupport: true,
+    });
+
+    const listed = await routeCogniWeaveHttpRequest(
+      service,
+      {
+        method: "GET",
+        url: "/v1/memory-resources",
+        headers: authHeaders({ "x-cogniweave-workspace-id": "ws_1" }),
+      },
+      opts,
+    );
+    expect(listed.status).toBe(200);
+    expect((listed.body as Array<{ resourceId: string }>).map((row) => row.resourceId)).toEqual(["res_self"]);
+  });
+
+  it("rejects a REST principal whose tenant differs from its subject tenant", async () => {
+    const { service, opts } = await setup();
+    const response = await routeCogniWeaveHttpRequest(
+      service,
+      {
+        method: "POST",
+        url: "/v1/tasks/frame",
+        headers: { authorization: "Bearer valid_tok", "x-cogniweave-tenant-id": "t_a" },
+        body: JSON.stringify({ rawInput: RAW_INPUT, scope }),
+      },
+      {
+        ...opts,
+        validateToken: async () => ({
+          tenantId: "t_a",
+          userId: "u_1",
+          allowedWorkspaceIds: ["ws_1"],
+          subject: { tenantId: "t_b", ownerType: "user", ownerId: "u_1" },
+        }),
+      },
+    );
+    expect(response.status).toBe(403);
+    expect(response.body).toEqual({ error: "tenant_mismatch" });
   });
 });

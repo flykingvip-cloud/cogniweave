@@ -406,11 +406,15 @@ export type {
   CanonicalResourceKind,
   CanonicalResourceScope,
   CanonicalResourceScopeResolver,
+  DeclaredScopeAuthorizationDecision,
   ResourceCallerPrincipal,
   RebuildObjectType,
 } from "./auth/canonical-scope.js";
 export {
   authorizeCanonicalResource,
+  authorizeDeclaredScope,
+  isAuthorizedMemoryResourceDescriptor,
+  isPrincipalTenantConsistent,
   createDenyByDefaultBindingQuery,
   deriveJournalScope,
   isCompleteScope,
