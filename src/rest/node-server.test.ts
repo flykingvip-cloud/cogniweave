@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { createDenyByDefaultBindingQuery } from "../auth/canonical-scope.js";
+import { createDenyByDefaultPrincipalProvider } from "../auth/principal.js";
 import type { MemorySubject, Scope } from "../models.js";
 import { CogniWeaveMemoryResourceAdapter } from "../resource/index.js";
 import { InMemoryCogniWeaveEngine } from "../runtime/in-memory-engine.js";
@@ -765,5 +766,68 @@ describe("CW-09-01 REST canonical scope authorization", () => {
     );
     expect(response.status).toBe(403);
     expect(response.body).toEqual({ error: "missing_workspace_scope" });
+  });
+});
+
+describe("CW-09-02 REST trusted principal provider (unit)", () => {
+  it("resolves a provider principal and fails closed when the provider throws or the token is unknown", async () => {
+    const engine = new InMemoryCogniWeaveEngine({
+      environment: "service",
+      metadataBackend: "memory",
+      graphBackend: "memory",
+      evidenceBackend: "memory",
+      vectorBackend: "memory",
+    });
+    const service = new CogniWeaveRestService(engine);
+    const provider = createDenyByDefaultPrincipalProvider([
+      {
+        token: "good_tok",
+        principal: {
+          tenantId: "t_1",
+          userId: "u_1",
+          subject: { tenantId: "t_1", ownerType: "user", ownerId: "u_1" },
+        },
+      },
+    ]);
+
+    const ok = await routeCogniWeaveHttpRequest(
+      service,
+      {
+        method: "GET",
+        url: "/v1/metrics",
+        headers: { authorization: "Bearer good_tok", "x-cogniweave-tenant-id": "t_1" },
+      },
+      { trustedPrincipalProvider: provider },
+    );
+    expect(ok.status).toBe(200);
+
+    const forged = await routeCogniWeaveHttpRequest(
+      service,
+      {
+        method: "GET",
+        url: "/v1/metrics",
+        headers: { authorization: "Bearer forged", "x-cogniweave-tenant-id": "t_1" },
+      },
+      { trustedPrincipalProvider: provider },
+    );
+    expect(forged.status).toBe(401);
+    expect(forged.body).toEqual({ error: "invalid_token" });
+
+    const throwing = {
+      async resolvePrincipal() {
+        throw new Error("idp down");
+      },
+    };
+    const down = await routeCogniWeaveHttpRequest(
+      service,
+      {
+        method: "GET",
+        url: "/v1/metrics",
+        headers: { authorization: "Bearer good_tok", "x-cogniweave-tenant-id": "t_1" },
+      },
+      { trustedPrincipalProvider: throwing },
+    );
+    expect(down.status).toBe(503);
+    expect(down.body).toEqual({ error: "principal_unavailable" });
   });
 });

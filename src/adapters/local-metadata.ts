@@ -320,6 +320,10 @@ export function buildLocalMetadataSchema(): string[] {
   ];
 }
 
+/**
+ * File/SQLite canonical metadata. Suitable for local/dev single-instance use.
+ * Not multi-instance safe and is not production Binding-store evidence (CW-09-02 / CW-09-09).
+ */
 export class LocalMetadataStore implements MetadataStore {
   readonly descriptor: AdapterDescriptor;
   readonly path: string;

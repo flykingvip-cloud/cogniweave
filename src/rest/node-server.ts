@@ -7,7 +7,10 @@ import {
   type CanonicalResourceScope,
   type CanonicalResourceScopeResolver,
 } from "../auth/canonical-scope.js";
+import type { TrustedPrincipalProvider } from "../auth/principal.js";
+import { isUsableTrustedPrincipal } from "../auth/principal.js";
 import { ScopeViolationError, StoreUnavailableError } from "../errors.js";
+import type { EngineEnvironment } from "../models.js";
 import type { CogniWeaveMemoryResourceAdapter, MemoryResourceDescriptor } from "../resource/index.js";
 import type {
   DistillRequest,
@@ -35,6 +38,11 @@ export interface CogniWeaveHttpServerOptions {
   authorizeTenantScope?: (principal: RestPrincipal, workspaceId: string) => Promise<boolean> | boolean;
   /** Optional Memory Resource Adapter to expose /v1/memory-resources/* HTTP routes. */
   resourceAdapter?: CogniWeaveMemoryResourceAdapter;
+  /**
+   * CW-09-02: OpenBot-provided principal resolver. Alternative to validateToken.
+   * CogniWeave does not implement an IdP. Missing in service/cloud => 401/503, never request-field fallback.
+   */
+  trustedPrincipalProvider?: TrustedPrincipalProvider;
   /** CW-09-01: required in service/cloud for Subject Binding intersection. Missing => 503. */
   authoritativeBindingQuery?: AuthoritativeBindingQuery;
   ensureDataPlaneId?: () => Promise<string>;
@@ -195,16 +203,48 @@ async function routeEnvelopeInner(
   if (requireAuth) {
     const authHeader = envelope.headers.authorization;
     const token = authHeader?.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : "";
-    if (!token || !options?.validateToken) {
+    const environment: EngineEnvironment =
+      env === "local" || env === "service" || env === "cloud" ? env : "service";
+    if (options?.trustedPrincipalProvider) {
+      if (!token) {
+        metrics.unauthorizedTotal += 1;
+        return responseBody(401, { error: "unauthorized" });
+      }
+      try {
+        const resolved = await options.trustedPrincipalProvider.resolvePrincipal({
+          bearerToken: token,
+          environment,
+        });
+        if (!isUsableTrustedPrincipal(resolved)) {
+          metrics.unauthorizedTotal += 1;
+          return responseBody(401, { error: "invalid_token" });
+        }
+        principal = {
+          tenantId: resolved.tenantId,
+          userId: resolved.userId,
+          roles: resolved.roles,
+          allowedWorkspaceIds: resolved.allowedWorkspaceIds,
+          subject: resolved.subject,
+        };
+      } catch {
+        metrics.unauthorizedTotal += 1;
+        return responseBody(503, { error: "principal_unavailable" });
+      }
+    } else if (options?.validateToken) {
+      if (!token) {
+        metrics.unauthorizedTotal += 1;
+        return responseBody(401, { error: "unauthorized" });
+      }
+      const validated = await options.validateToken(token);
+      if (!validated) {
+        metrics.unauthorizedTotal += 1;
+        return responseBody(401, { error: "invalid_token" });
+      }
+      principal = validated;
+    } else {
       metrics.unauthorizedTotal += 1;
       return responseBody(401, { error: "unauthorized" });
     }
-    const validated = await options.validateToken(token);
-    if (!validated) {
-      metrics.unauthorizedTotal += 1;
-      return responseBody(401, { error: "invalid_token" });
-    }
-    principal = validated;
     const headerTenant = envelope.headers["x-cogniweave-tenant-id"];
     if (!headerTenant || headerTenant !== principal.tenantId) {
       metrics.unauthorizedTotal += 1;

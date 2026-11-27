@@ -6,6 +6,8 @@ import type {
   EventSkeleton,
   EvidenceRecord,
   MemoryAtom,
+  MemorySubjectBinding,
+  MemorySubjectOwnerType,
   ProblemRecord,
   RelationRecord,
   ScenarioRecord,
@@ -73,6 +75,7 @@ export interface PostgresMetadataTables {
   sourceLifecycleOperations: string;
   sourceObjectLinks: string;
   writeOperations: string;
+  memorySubjectBindings: string;
 }
 
 export const POSTGRES_METADATA_TABLES: PostgresMetadataTables = {
@@ -91,6 +94,7 @@ export const POSTGRES_METADATA_TABLES: PostgresMetadataTables = {
   sourceLifecycleOperations: "cogniweave_source_lifecycle_operations",
   sourceObjectLinks: "cogniweave_source_object_links",
   writeOperations: "cogniweave_write_operations",
+  memorySubjectBindings: "cogniweave_memory_subject_bindings",
 };
 
 function quoteIdentifier(value: string): string {
@@ -261,6 +265,22 @@ export function buildPostgresMetadataSchema(schema = "public"): string[] {
       payload jsonb not null,
       completed_at timestamptz not null
     );`,
+    `create table if not exists ${t(POSTGRES_METADATA_TABLES.memorySubjectBindings)} (
+      id text primary key,
+      data_plane_id text not null,
+      scope_fingerprint text not null,
+      tenant_id text not null,
+      owner_type text not null,
+      owner_id text not null,
+      workspace_id text not null,
+      project_id text not null,
+      agent_id text not null,
+      visibility text not null,
+      unbound_at timestamptz,
+      payload jsonb not null,
+      created_at timestamptz not null,
+      updated_at timestamptz not null
+    );`,
     `create index if not exists idx_cogniweave_source_bindings_identity
       on ${t(POSTGRES_METADATA_TABLES.sourceBindings)}(source_identity_id);`,
     `create index if not exists idx_cogniweave_source_bindings_locator
@@ -269,6 +289,10 @@ export function buildPostgresMetadataSchema(schema = "public"): string[] {
       on ${t(POSTGRES_METADATA_TABLES.sourceObjectLinks)}(source_binding_id);`,
     `create index if not exists idx_cogniweave_source_object_links_object
       on ${t(POSTGRES_METADATA_TABLES.sourceObjectLinks)}(object_type, object_id);`,
+    `create index if not exists idx_cogniweave_subject_bindings_partition
+      on ${t(POSTGRES_METADATA_TABLES.memorySubjectBindings)}(data_plane_id, scope_fingerprint);`,
+    `create index if not exists idx_cogniweave_subject_bindings_subject
+      on ${t(POSTGRES_METADATA_TABLES.memorySubjectBindings)}(tenant_id, owner_type, owner_id);`,
   ];
 }
 
@@ -985,6 +1009,121 @@ export class PostgresMetadataStore implements MetadataStore {
       `delete from ${this.table(this.tables.journals)} where id = $1`,
       [journalId],
       "deleteJournal",
+    );
+  }
+
+
+  async saveMemorySubjectBinding(binding: MemorySubjectBinding): Promise<void> {
+    await this.query(
+      `insert into ${this.table(this.tables.memorySubjectBindings)}
+        (id, data_plane_id, scope_fingerprint, tenant_id, owner_type, owner_id,
+         workspace_id, project_id, agent_id, visibility, unbound_at, payload, created_at, updated_at)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::timestamptz, $12::jsonb, $13::timestamptz, $14::timestamptz)
+       on conflict (id) do update
+       set data_plane_id = excluded.data_plane_id,
+           scope_fingerprint = excluded.scope_fingerprint,
+           tenant_id = excluded.tenant_id,
+           owner_type = excluded.owner_type,
+           owner_id = excluded.owner_id,
+           workspace_id = excluded.workspace_id,
+           project_id = excluded.project_id,
+           agent_id = excluded.agent_id,
+           visibility = excluded.visibility,
+           unbound_at = excluded.unbound_at,
+           payload = excluded.payload,
+           updated_at = excluded.updated_at`,
+      [
+        binding.id,
+        binding.partition.dataPlaneId,
+        binding.partition.scopeFingerprint,
+        binding.subject.tenantId,
+        binding.subject.ownerType,
+        binding.subject.ownerId,
+        binding.scope.workspaceId,
+        binding.scope.projectId,
+        binding.scope.agentId,
+        binding.scope.visibility,
+        binding.unboundAt ?? null,
+        encodePayload(binding),
+        binding.createdAt,
+        binding.updatedAt,
+      ],
+      "saveMemorySubjectBinding",
+    );
+  }
+
+  async getMemorySubjectBinding(id: string): Promise<MemorySubjectBinding | undefined> {
+    return this.getPayloadById<MemorySubjectBinding>(
+      this.tables.memorySubjectBindings,
+      id,
+      "getMemorySubjectBinding",
+    );
+  }
+
+  async listMemorySubjectBindings(filter?: {
+    scope?: Scope;
+    tenantId?: string;
+    ownerType?: MemorySubjectOwnerType;
+    ownerId?: string;
+    dataPlaneId?: string;
+    scopeFingerprint?: string;
+    liveOnly?: boolean;
+  }): Promise<MemorySubjectBinding[]> {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (filter?.scope) {
+      params.push(
+        filter.scope.workspaceId,
+        filter.scope.projectId,
+        filter.scope.agentId,
+        filter.scope.visibility,
+      );
+      clauses.push(
+        `workspace_id = $${params.length - 3} and project_id = $${params.length - 2} and agent_id = $${params.length - 1} and visibility = $${params.length}`,
+      );
+    }
+    if (filter?.tenantId) {
+      params.push(filter.tenantId);
+      clauses.push(`tenant_id = $${params.length}`);
+    }
+    if (filter?.ownerType) {
+      params.push(filter.ownerType);
+      clauses.push(`owner_type = $${params.length}`);
+    }
+    if (filter?.ownerId) {
+      params.push(filter.ownerId);
+      clauses.push(`owner_id = $${params.length}`);
+    }
+    if (filter?.dataPlaneId) {
+      params.push(filter.dataPlaneId);
+      clauses.push(`data_plane_id = $${params.length}`);
+    }
+    if (filter?.scopeFingerprint) {
+      params.push(filter.scopeFingerprint);
+      clauses.push(`scope_fingerprint = $${params.length}`);
+    }
+    if (filter?.liveOnly) {
+      clauses.push("unbound_at is null");
+    }
+    const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
+    const result = await this.query<PayloadRow>(
+      `select payload from ${this.table(this.tables.memorySubjectBindings)}
+       ${where}
+       order by updated_at asc, id asc`,
+      params,
+      "listMemorySubjectBindings",
+    );
+    return result.rows.flatMap((row) => {
+      const payload = decodePayload<MemorySubjectBinding>(row);
+      return payload ? [payload] : [];
+    });
+  }
+
+  async deleteMemorySubjectBinding(id: string): Promise<void> {
+    await this.query(
+      `delete from ${this.table(this.tables.memorySubjectBindings)} where id = $1`,
+      [id],
+      "deleteMemorySubjectBinding",
     );
   }
 

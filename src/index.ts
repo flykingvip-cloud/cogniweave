@@ -102,16 +102,22 @@ export type {
 } from "./contracts.js";
 
 export {
+  BindingStoreUnavailableError,
   CogniWeaveError,
+  DelegationDeniedError,
+  DelegationStoreUnavailableError,
   DistillationError,
   EvidenceAccessError,
+  ExecutionAuthorizationError,
   IdempotencyConflictError,
+  PrincipalUnavailableError,
   ReasoningError,
   ScopeViolationError,
   StorageConsistencyError,
   StoreUnavailableError,
   ValidationError,
 } from "./errors.js";
+export type { ExecutionAuthorizationErrorCode } from "./errors.js";
 
 export {
   OPERATION_KEY_VERSION,
@@ -419,6 +425,34 @@ export {
   resolveCanonicalResourceScope,
   REBUILD_OBJECT_TYPES,
 } from "./auth/canonical-scope.js";
+
+export type { TrustedPrincipal, TrustedPrincipalProvider, ResolveTrustedPrincipalInput } from "./auth/principal.js";
+export { createDenyByDefaultPrincipalProvider, isUsableTrustedPrincipal } from "./auth/principal.js";
+
+export type {
+  ActiveDelegationQuery,
+  DelegationAuthorization,
+  DelegationAuthorizationStore,
+} from "./auth/delegation.js";
+export {
+  createMemoryDelegationAuthorizationStore,
+  isActiveDelegation,
+  sameMemorySubject,
+} from "./auth/delegation.js";
+
+export type {
+  ExecutionAuthorizationDecision,
+  TrustedExecutionAuthorizationOptions,
+  TrustedExecutionAuthorizationSuccess,
+  TrustedExecutionRequest,
+} from "./auth/authorize.js";
+export {
+  authorizeAtomBindings,
+  authorizeTrustedExecution,
+  createAuthoritativeBindingQueryFromMetadataStore,
+  isProductionLikeEnvironment,
+  resolveRequireAuth,
+} from "./auth/authorize.js";
 
 export type {
   DistillRequest,

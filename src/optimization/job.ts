@@ -1,9 +1,14 @@
 import { createHash } from "node:crypto";
+import {
+  authorizeAtomBindings,
+  authorizeTrustedExecution,
+  type ExecutionAuthorizationDecision,
+  type TrustedExecutionAuthorizationOptions,
+} from "../auth/authorize.js";
 import type { DurableJobStore } from "../jobs/durable-job-store.js";
-import { computeScopeFingerprint, createMemoryPartitionKeyV1 } from "../keys.js";
+import { computeScopeFingerprint } from "../keys.js";
 import type { MemoryAtom, MemorySubject, MemorySubjectBinding, Scope } from "../models.js";
 import type { GraphStore, MetadataStore, VectorStore } from "../storage/types.js";
-import { authorizeMemoryAccess } from "../subject/binding.js";
 import { abstractFromAtoms, type AbstractedMemory } from "./abstraction.js";
 import {
   applyConsolidation,
@@ -33,9 +38,15 @@ export interface OptimizationExecutionContext {
   tenantId: string;
   scope: Scope;
   caller: MemorySubject;
-  /** Authoritative fallback bindings when metadataStore.listMemorySubjectBindings is unavailable. */
+  /**
+   * @deprecated CW-09-02: caller-submitted bindings are not evidence and are ignored.
+   * Production authorization queries an AuthoritativeBindingQuery / MetadataStore.
+   */
   bindings?: ReadonlyArray<MemorySubjectBinding>;
-  /** Explicit delegation list if actorUserId acts on behalf of another caller ownerId. */
+  /**
+   * @deprecated CW-09-02: not proof of delegation. Lawful delegation must be a
+   * DelegationAuthorizationStore record.
+   */
   delegatedActorFor?: ReadonlyArray<string>;
   dataPlaneId: string;
   workerId?: string;
@@ -76,6 +87,8 @@ export interface MemoryOptimizationJob {
   error?: string;
   createdAt: string;
   completedAt?: string;
+  /** CW-09-02 audit trace: Actor, Delegator, Caller, Subject, Binding, Tenant, Scope, Decision, Trace. */
+  authorization?: ExecutionAuthorizationDecision;
 }
 
 function estimateClaimTokens(atoms: ReadonlyArray<MemoryAtom>): number {
@@ -117,9 +130,11 @@ export function computeOptimizationIdempotencyKey(params: {
 }
 
 /**
- * CW-04J-01 / CW-04J-05:
- * - Requires executionContext (no optional bypass) and verifies SubjectBinding authorization
- *   for the target scope partition AND every input atom before job enqueue or Canonical Store read/write.
+ * CW-04J-01 / CW-04J-05 / CW-09-02:
+ * - Requires executionContext and verifies the trusted identity chain before enqueue or store I/O:
+ *   Trusted Principal → Actor → Delegation Authorization → Caller Subject →
+ *   Authoritative Binding → Job Subject.
+ * - `delegatedActorFor` and `executionContext.bindings` are ignored and are not evidence.
  * - Includes atomDigests in DurableJobStore payload so even explicit idempotencyKeys reject changed inputs.
  * - Uses honest Estimated Canonical Claim Token naming.
  */
@@ -131,6 +146,8 @@ export async function runOptimizationJob(params: {
   optimizationType: OptimizationType;
   atoms: ReadonlyArray<MemoryAtom>;
   executionContext: OptimizationExecutionContext;
+  /** CW-09-02 trusted identity + delegation + binding query. Default is fail-closed. */
+  authorization?: TrustedExecutionAuthorizationOptions;
   policyVersion?: string;
   pipelineVersion?: string;
   nowMs?: number;
@@ -140,64 +157,40 @@ export async function runOptimizationJob(params: {
   vectorStore?: VectorStore;
 }): Promise<MemoryOptimizationJob> {
   const ctx = params.executionContext;
-  if (!ctx || !ctx.actorUserId.trim()) {
-    throw new Error("OptimizationExecutionContext with actorUserId is required");
+  if (!ctx) {
+    throw new Error("OptimizationExecutionContext is required");
   }
   const expectedScopeFp = computeScopeFingerprint(params.scope);
-  if (ctx.tenantId !== params.tenantId || ctx.caller.tenantId !== params.tenantId) {
+  if (ctx.tenantId !== params.tenantId) {
     throw new Error("OptimizationExecutionContext tenant mismatch");
   }
   if (computeScopeFingerprint(ctx.scope) !== expectedScopeFp) {
     throw new Error("OptimizationExecutionContext scope mismatch");
   }
-  // CW-08-02: Bind actorUserId -> caller.ownerId and subjectId -> caller.ownerId
-  if (params.subjectId !== ctx.caller.ownerId) {
-    throw new Error(
-      `Optimization subjectId (${params.subjectId}) does not match caller (${ctx.caller.ownerId})`,
-    );
-  }
-  const actorAuthorizedForCaller =
-    ctx.actorUserId === ctx.caller.ownerId ||
-    (ctx.delegatedActorFor ?? []).includes(ctx.caller.ownerId);
-  if (!actorAuthorizedForCaller) {
-    throw new Error(
-      `Actor ${ctx.actorUserId} is not authorized to act for subject ${ctx.caller.ownerId}`,
-    );
-  }
 
-  // Prefer authoritative bindings from MetadataStore when available.
-  const authoritativeBindings = params.metadataStore?.listMemorySubjectBindings
-    ? await params.metadataStore.listMemorySubjectBindings({
-        tenantId: params.tenantId,
-        dataPlaneId: ctx.dataPlaneId,
-        liveOnly: true,
-      })
-    : (ctx.bindings ?? []);
-
-  const targetPartition = createMemoryPartitionKeyV1(ctx.dataPlaneId, params.scope);
-  const scopeAcl = authorizeMemoryAccess(authoritativeBindings, {
-    partition: targetPartition,
-    caller: ctx.caller,
+  const now = new Date(params.nowMs ?? Date.now()).toISOString();
+  const authz = await authorizeTrustedExecution({
+    request: {
+      tenantId: params.tenantId,
+      subjectId: params.subjectId,
+      scope: params.scope,
+      dataPlaneId: ctx.dataPlaneId,
+      declaredActorUserId: ctx.actorUserId,
+      declaredCaller: ctx.caller,
+      now,
+    },
+    authorization: params.authorization,
+    metadataStore: params.metadataStore,
   });
-  if (!scopeAcl.allowed) {
-    throw new Error(`Optimization job unauthorized for target scope: ${scopeAcl.reason}`);
-  }
+  const authorizedCaller = authz.caller;
 
-  for (const atom of params.atoms) {
-    if (computeScopeFingerprint(atom.scope) !== expectedScopeFp) {
-      throw new Error(
-        `Atom ${atom.id} belongs to a different scope than target optimization job scope`,
-      );
-    }
-    const atomPartition = createMemoryPartitionKeyV1(ctx.dataPlaneId, atom.scope);
-    const atomAcl = authorizeMemoryAccess(authoritativeBindings, {
-      partition: atomPartition,
-      caller: ctx.caller,
-    });
-    if (!atomAcl.allowed) {
-      throw new Error(`Optimization job unauthorized for atom ${atom.id}: ${atomAcl.reason}`);
-    }
-  }
+  await authorizeAtomBindings({
+    atoms: params.atoms,
+    expectedScope: params.scope,
+    dataPlaneId: ctx.dataPlaneId,
+    caller: authorizedCaller,
+    bindings: authz.bindings,
+  });
 
   const policyVersion = params.policyVersion ?? "1.0.0";
   const pipelineVersion = params.pipelineVersion ?? "1.0.0";
@@ -250,6 +243,7 @@ export async function runOptimizationJob(params: {
         result: record.result as OptimizationReport,
         createdAt,
         completedAt: record.completedAt,
+        authorization: authz.decision,
       };
     }
     const workerId = ctx.workerId ?? `opt_worker_${ctx.actorUserId}`;
@@ -398,6 +392,7 @@ export async function runOptimizationJob(params: {
       result: report,
       createdAt,
       completedAt,
+      authorization: authz.decision,
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -417,6 +412,7 @@ export async function runOptimizationJob(params: {
       status: "failed",
       error: message,
       createdAt,
+      authorization: authz.decision,
     };
   }
 }
