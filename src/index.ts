@@ -425,6 +425,8 @@ export {
 
 export type { EmbeddingProvider } from "./adapters/contracts.js";
 
+export * from "./optimization/index.js";
+
 export type {
   CliCommand,
   CogniWeaveCliBootstrapTargetResult,
