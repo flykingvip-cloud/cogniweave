@@ -2,6 +2,7 @@ import type { IngestResult } from "../contracts.js";
 import type {
   CognitivePackage,
   DistillationResult,
+  MemorySubject,
   MemoryTrace,
   ReasonDebugPayload,
   Scope,
@@ -22,11 +23,15 @@ export interface RestPrincipal {
   userId: string;
   roles?: string[];
   allowedWorkspaceIds?: string[];
+  /** CW-09-01 additive; required for Subject Binding intersection when auth is on. */
+  subject?: MemorySubject;
 }
 
 export interface RestContext {
   headers?: RestHeaders;
   principal?: RestPrincipal;
+  /** Set by the HTTP gate after canonical authorization; never taken from request headers. */
+  authorizedScope?: Scope;
 }
 
 export interface RestResponse<T> {
@@ -82,6 +87,7 @@ export interface RepairIndexesRequest {
 export interface RebuildFromTruthRequest {
   objectType: string;
   objectId: string;
+  scope?: Scope;
 }
 
 export interface RestApiSurface {

@@ -18,7 +18,17 @@ import type {
   TraceOptions,
 } from "../contracts.js";
 import { withAtomV2Defaults } from "../domain/atom-v2.js";
-import { IdempotencyConflictError, ScopeViolationError } from "../errors.js";
+import {
+  deriveJournalScope,
+  isCompleteScope,
+  isRebuildObjectType,
+  journalObjectIdsForType,
+  resolveCanonicalResourceScope as resolveCanonicalResourceScopeFromLookup,
+  type CanonicalResourceKind,
+  type CanonicalResourceLookup,
+  type CanonicalResourceScope,
+} from "../auth/canonical-scope.js";
+import { IdempotencyConflictError, ScopeViolationError, StoreUnavailableError, ValidationError } from "../errors.js";
 import {
   repairDerivedIndexes as repairJournalDerivedIndexes,
   rebuildFromTruth as rebuildDerivedFromTruth,
@@ -1658,6 +1668,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     const journal: WriteJournal = {
       id: journalId,
       eventKey: distillation.keys.eventKey,
+      scope: resolveScope(input.scope, this.config),
       objectIds: {
         eventIds: [distillation.event.id],
         atomIds: distillation.atoms.map((atom) => atom.id),
@@ -2307,10 +2318,61 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return target.id;
   }
 
+  private canonicalLookup(): CanonicalResourceLookup {
+    return {
+      getAtom: (id) => this.metadataStore.getAtom(id),
+      getEvent: (id) => this.metadataStore.getEvent(id),
+      getJournal: (id) => this.metadataStore.getJournal(id),
+      getEntity: (id) => this.metadataStore.getEntity(id),
+      getScenario: (id) => this.metadataStore.getScenario(id),
+      getProblem: (id) => this.metadataStore.getProblem(id),
+      getEvidence: (id) => this.metadataStore.getEvidence(id),
+      getRelation: (id) => this.metadataStore.getRelation(id),
+      getPackageTrace: async (id) => this.packageTraces.get(id),
+      getReasoningSession: async (id) => this.reasoningSessions.get(id),
+    };
+  }
+
+  async resolveCanonicalResourceScope(
+    kind: CanonicalResourceKind,
+    id: string,
+  ): Promise<CanonicalResourceScope> {
+    return resolveCanonicalResourceScopeFromLookup(kind, id, this.canonicalLookup());
+  }
+
+  private async resolveJournalCanonicalScope(journal: WriteJournal): Promise<Scope | undefined> {
+    return deriveJournalScope(journal, this.canonicalLookup());
+  }
+
+  private async journalsMatchingResolvedScope(
+    journals: WriteJournal[],
+    requestedScope?: Scope,
+  ): Promise<WriteJournal[]> {
+    const matched: WriteJournal[] = [];
+    for (const journal of journals) {
+      const scope = await this.resolveJournalCanonicalScope(journal);
+      if (!isCompleteScope(scope)) {
+        continue;
+      }
+      if (requestedScope && !matchesScope(scope, requestedScope)) {
+        continue;
+      }
+      matched.push(journal);
+    }
+    return matched;
+  }
+
   async repairIndexes(options?: {
     journalId?: string;
     scope?: Scope;
   }): Promise<Record<string, unknown>> {
+    const requestedScope = options?.scope
+      ? resolveScope(options.scope, this.config)
+      : undefined;
+    if (!requestedScope && this.config.environment !== "local") {
+      throw new ScopeViolationError("repairIndexes requires explicit scope");
+    }
+
     let journals = options?.journalId
       ? [await this.metadataStore.getJournal(options.journalId)].filter((v): v is WriteJournal =>
           Boolean(v),
@@ -2319,18 +2381,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
           (journal) => journal.status === "DERIVED_OUT_OF_SYNC",
         );
 
-    if (options?.scope) {
-      const scopedJournals: WriteJournal[] = [];
-      for (const journal of journals) {
-        const event = journal.objectIds.eventIds[0]
-          ? await this.metadataStore.getEvent(journal.objectIds.eventIds[0])
-          : undefined;
-        if (!event || matchesScope(event.scope, options.scope)) {
-          scopedJournals.push(journal);
-        }
-      }
-      journals = scopedJournals;
-    }
+    journals = await this.journalsMatchingResolvedScope(journals, requestedScope);
 
     const repaired = [];
     for (const journal of journals) {
@@ -2349,21 +2400,32 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   async rebuildFromTruth(_options: {
     objectType: string;
     objectId: string;
+    scope?: ScopeInput;
   }): Promise<Record<string, unknown>> {
+    const requestedScope = resolveReadScopeOrThrow(_options.scope, this.config, "rebuildFromTruth");
+    const objectType = _options.objectType;
+    if (!isRebuildObjectType(objectType)) {
+      throw new ValidationError(`rebuildFromTruth received unsupported objectType: ${objectType}`);
+    }
+    const resolved = await this.resolveCanonicalResourceScope(objectType, _options.objectId);
+    if (resolved.unresolvedReason === "store_unavailable") {
+      throw new StoreUnavailableError("rebuildFromTruth canonical store unavailable");
+    }
+    if (!resolved.found || !isCompleteScope(resolved.scope)) {
+      return { status: "NOT_FOUND" };
+    }
+    assertScopeAccess(resolved.scope, requestedScope, "rebuildFromTruth");
+
     const journals = await this.metadataStore.listJournals();
     const journal = journals.find((candidate) =>
-      [
-        ...candidate.objectIds.eventIds,
-        ...candidate.objectIds.atomIds,
-        ...candidate.objectIds.entityIds,
-        ...candidate.objectIds.scenarioIds,
-        ...candidate.objectIds.problemIds,
-        ...candidate.objectIds.evidenceIds,
-        ...candidate.objectIds.relationIds,
-      ].includes(_options.objectId),
+      journalObjectIdsForType(candidate, objectType).includes(_options.objectId),
     );
     if (!journal) {
       return { status: "NOT_FOUND" };
+    }
+    const journalScope = await this.resolveJournalCanonicalScope(journal);
+    if (!isCompleteScope(journalScope) || !matchesScope(journalScope, requestedScope)) {
+      throw new ScopeViolationError("rebuildFromTruth scope violation");
     }
     const result = await rebuildDerivedFromTruth({
       metadataStore: this.metadataStore,
@@ -2387,16 +2449,14 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       ["COMPLETED", "DERIVED_OUT_OF_SYNC", "METADATA_COMMITTED"].includes(journal.status),
     );
     if (options?.scope) {
-      const scoped: WriteJournal[] = [];
-      for (const journal of journals) {
-        const event = journal.objectIds.eventIds[0]
-          ? await this.metadataStore.getEvent(journal.objectIds.eventIds[0])
-          : undefined;
-        if (!event || matchesScope(event.scope, options.scope)) {
-          scoped.push(journal);
-        }
-      }
-      journals = scoped;
+      journals = await this.journalsMatchingResolvedScope(
+        journals,
+        resolveScope(options.scope, this.config),
+      );
+    } else if (this.config.environment !== "local") {
+      throw new ScopeViolationError("recoverFromCanonical requires explicit scope");
+    } else {
+      journals = await this.journalsMatchingResolvedScope(journals);
     }
 
     let journalsRebuilt = 0;
@@ -2490,19 +2550,11 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     if (!journal) {
       throw new Error(`Unknown journal: ${journalId}`);
     }
-    const firstEventId = journal.objectIds.eventIds[0];
-    if (!firstEventId) {
-      throw new ScopeViolationError(
-        "getWriteJournal cannot validate scope without event reference",
-      );
+    const canonicalScope = await this.resolveJournalCanonicalScope(journal);
+    if (!isCompleteScope(canonicalScope)) {
+      throw new ScopeViolationError("getWriteJournal cannot resolve authoritative scope");
     }
-    const event = await this.metadataStore.getEvent(firstEventId);
-    if (!event) {
-      throw new ScopeViolationError(
-        "getWriteJournal cannot validate scope because event was not found",
-      );
-    }
-    assertScopeAccess(event.scope, requestedScope, "getWriteJournal");
+    assertScopeAccess(canonicalScope, requestedScope, "getWriteJournal");
     return journal;
   }
 

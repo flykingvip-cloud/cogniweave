@@ -505,6 +505,8 @@ export interface WriteJournalDerivedPlan {
 export interface WriteJournal {
   id: string;
   eventKey: string;
+  /** CW-09-01 additive canonical ownership. New writes persist this; legacy rows may derive it. */
+  scope?: Scope;
   objectIds: WriteJournalObjectIds;
   derivedPlan: WriteJournalDerivedPlan;
   status: "RECEIVED" | "METADATA_COMMITTED" | "DERIVED_OUT_OF_SYNC" | "COMPLETED" | "FAILED";

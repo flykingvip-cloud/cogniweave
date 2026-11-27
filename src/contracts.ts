@@ -24,6 +24,11 @@ import type {
   WriteJournal,
 } from "./models.js";
 
+import type {
+  CanonicalResourceKind,
+  CanonicalResourceScope,
+} from "./auth/canonical-scope.js";
+
 export interface IngestInput {
   rawInput: string | Record<string, unknown>;
   scope: Scope;
@@ -122,6 +127,8 @@ export interface RepairIndexesOptions {
 export interface RebuildFromTruthOptions {
   objectType: string;
   objectId: string;
+  /** CW-09-01: required for authorization; compared against canonical ownership. */
+  scope?: Scope;
 }
 
 export interface RecoverFromCanonicalOptions {
@@ -216,6 +223,14 @@ export interface CogniWeaveEngine {
   repairIndexes(options?: RepairIndexesOptions): Promise<Record<string, unknown>>;
   rebuildFromTruth(options: RebuildFromTruthOptions): Promise<Record<string, unknown>>;
   getWriteJournal(journalId: string, scope?: ScopeInput): Promise<WriteJournal>;
+  /**
+   * CW-09-01: resolve Tenant/Workspace/Subject ownership from the Canonical Store.
+   * Does not authorize the caller; callers must still pass a matching scope into mutating APIs.
+   */
+  resolveCanonicalResourceScope(
+    kind: CanonicalResourceKind,
+    id: string,
+  ): Promise<CanonicalResourceScope>;
 
   /**
    * CW2-P0-02: rebuild derived indexes from canonical metadata after restart.
