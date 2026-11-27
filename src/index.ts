@@ -426,6 +426,8 @@ export {
 export type { EmbeddingProvider } from "./adapters/contracts.js";
 
 export * from "./optimization/index.js";
+export * from "./governance/index.js";
+export * from "./resource/index.js";
 
 export type {
   CliCommand,
