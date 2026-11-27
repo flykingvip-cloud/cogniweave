@@ -14,6 +14,7 @@ export interface AbstractedMemory {
   evidenceRefs: string[];
   confidence: number;
   knownExceptions: string[];
+  requiresReview: true;
 }
 
 function tokenize(text: string): string[] {
@@ -25,11 +26,32 @@ function tokenize(text: string): string[] {
 }
 
 /**
- * MOP-03 Memory Abstraction Engine (Evidence-constrained).
- * - Requires >= 2 independent source events (same event's atoms don't count as independent).
+ * Count distinct independent observations: each selected atom must contribute
+ * at least one sourceEventId not already claimed by another selected atom.
+ */
+function selectIndependentAtoms(atoms: ReadonlyArray<MemoryAtom>): {
+  selected: MemoryAtom[];
+  independentEventIds: string[];
+} {
+  const claimedEvents = new Set<string>();
+  const selected: MemoryAtom[] = [];
+  const independentEventIds: string[] = [];
+
+  for (const atom of atoms) {
+    const freshEvent = atom.provenance.sourceEventIds.find((e) => !claimedEvents.has(e));
+    if (!freshEvent) continue;
+    for (const e of atom.provenance.sourceEventIds) claimedEvents.add(e);
+    selected.push(atom);
+    independentEventIds.push(freshEvent);
+  }
+  return { selected, independentEventIds };
+}
+
+/**
+ * MOP-03 Memory Abstraction Engine (CW-04C-R1).
+ * - Requires >= 2 independent atoms each backed by a distinct unshared source event.
  * - Intersects applicability.include (never expands scope by union).
- * - Unions applicability.exclude as knownExceptions.
- * - Extracts shared invariant terms rather than copying statements[0].
+ * - Always flags requiresReview: true for policy/human governance before promotion.
  */
 export function abstractFromAtoms(params: {
   atoms: ReadonlyArray<MemoryAtom>;
@@ -40,43 +62,30 @@ export function abstractFromAtoms(params: {
     (atom) =>
       (atom.state.status === "active" || atom.state.status === "tentative") &&
       (atom.state.conflictsWith?.length ?? 0) === 0 &&
-      !atom.lifecycle?.tombstonedAt,
+      !atom.lifecycle?.tombstonedAt &&
+      (atom.provenance.evidenceRefs?.length ?? 0) > 0,
   );
-  if (active.length < 2) {
-    return null;
-  }
+  if (active.length < 2) return null;
 
   const primaryType = active[0].atomType;
   const primaryScopeFp = computeScopeFingerprint(active[0].scope);
-  const compatible = active.filter(
+  const candidates = active.filter(
     (atom) =>
       atom.atomType === primaryType &&
-      computeScopeFingerprint(atom.scope) === primaryScopeFp &&
-      (atom.provenance.evidenceRefs?.length ?? 0) > 0,
+      computeScopeFingerprint(atom.scope) === primaryScopeFp,
   );
-  if (compatible.length < 2) {
+
+  const { selected: compatible, independentEventIds } = selectIndependentAtoms(candidates);
+  if (compatible.length < 2 || independentEventIds.length < 2) {
     return null;
   }
 
-  // Verify source-event independence.
-  const independentEvents = new Set<string>();
-  for (const atom of compatible) {
-    for (const evtId of atom.provenance.sourceEventIds) {
-      independentEvents.add(evtId);
-    }
-  }
-  if (independentEvents.size < 2) {
-    return null;
-  }
-
-  // Intersection of applicability.include (safe non-expanding applicability).
   let commonInclude = new Set<string>(compatible[0].applicability.include);
   for (let i = 1; i < compatible.length; i += 1) {
     const next = new Set(compatible[i].applicability.include);
     commonInclude = new Set([...commonInclude].filter((x) => next.has(x)));
   }
 
-  // Intersection of trigger conditions & shared claim tokens.
   let commonConditions = new Set<string>(compatible[0].trigger.conditions);
   let commonTokens = new Set<string>(tokenize(compatible[0].claim.statement));
   const excludeSet = new Set<string>();
@@ -97,7 +106,6 @@ export function abstractFromAtoms(params: {
     for (const ev of atom.provenance.evidenceRefs) evidenceSet.add(ev);
   }
 
-  // Check if commonInclude conflicts with any known exception.
   for (const exc of excludeSet) {
     commonInclude.delete(exc);
   }
@@ -109,11 +117,10 @@ export function abstractFromAtoms(params: {
 
   const claimStatement =
     sharedTerms.length > 0
-      ? `Invariant ${primaryType} across ${independentEvents.size} independent events: [${sharedTerms.join(", ")}]`
-      : `Invariant ${primaryType} for conditions [${[...commonConditions].join(", ")}] across ${independentEvents.size} events`;
+      ? `Invariant ${primaryType} across ${independentEventIds.length} independent events: [${sharedTerms.join(", ")}]`
+      : `Invariant ${primaryType} for conditions [${[...commonConditions].join(", ")}] across ${independentEventIds.length} events`;
 
-  // Conservative confidence: bounded by min(confidence), scaled by independent event corroboration.
-  const corroborationFactor = Math.min(1, 0.7 + independentEvents.size * 0.1);
+  const corroborationFactor = Math.min(1, 0.7 + independentEventIds.length * 0.1);
   const confidence = Number((minConfidence * corroborationFactor).toFixed(4));
 
   return {
@@ -121,19 +128,14 @@ export function abstractFromAtoms(params: {
     atomType: primaryType,
     claimStatement,
     commonTokens: sharedTerms,
-    applicability: {
-      include: [...commonInclude],
-      exclude: [...excludeSet],
-    },
-    trigger: {
-      conditions: [...commonConditions],
-      contextTags: [...tagSet],
-    },
+    applicability: { include: [...commonInclude], exclude: [...excludeSet] },
+    trigger: { conditions: [...commonConditions], contextTags: [...tagSet] },
     constraints: [...excludeSet],
     supportingAtomIds,
-    independentSourceEventIds: [...independentEvents],
+    independentSourceEventIds: independentEventIds,
     evidenceRefs: [...evidenceSet],
     confidence,
     knownExceptions: params.knownExceptions ?? [...excludeSet],
+    requiresReview: true,
   };
 }

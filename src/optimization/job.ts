@@ -13,6 +13,7 @@ import {
 import {
   applyLifecycleDecisions,
   evaluateLifecycle,
+  type AppliedLifecycleResult,
   type LifecycleEvaluation,
 } from "./lifecycle.js";
 
@@ -26,18 +27,29 @@ export type OptimizationJobStatus =
 
 export type OptimizationType = "full" | "consolidation" | "abstraction" | "lifecycle";
 
+export interface OptimizationExecutionContext {
+  actorUserId: string;
+  tenantId: string;
+  scope: Scope;
+  allowLifecycleMutations?: boolean;
+}
+
 export interface OptimizationReport {
   reportId: string;
   inputAtomCount: number;
   consolidation?: ConsolidationPlan;
   appliedConsolidation?: AppliedConsolidationResult;
+  appliedLifecycle?: AppliedLifecycleResult;
   abstraction?: AbstractedMemory | null;
   lifecycleEvaluations: LifecycleEvaluation[];
   duplicateReductionCount: number;
   estimatedTokensBefore: number;
   plannedTokensAfter: number;
   plannedTokenReduction: number;
-  verifiedTokenReduction: number;
+  estimatedTokensOfPersistedRemovedAtoms: number;
+  canonicalTokensBefore?: number;
+  canonicalTokensAfter?: number;
+  verifiedCanonicalTokenDelta?: number;
 }
 
 export interface MemoryOptimizationJob {
@@ -65,28 +77,42 @@ function estimateTotalTokens(atoms: ReadonlyArray<MemoryAtom>): number {
   );
 }
 
+/**
+ * CW-04G-R1: Content-aware idempotency key incorporating atom versions and claim/evidence hashes.
+ */
 export function computeOptimizationIdempotencyKey(params: {
   tenantId: string;
   scope: Scope;
   optimizationType: OptimizationType;
-  targetMemoryIds: ReadonlyArray<string>;
+  atoms: ReadonlyArray<MemoryAtom>;
   policyVersion: string;
+  pipelineVersion: string;
 }): string {
+  const atomDigests = [...params.atoms]
+    .toSorted((a, b) => a.id.localeCompare(b.id))
+    .map((a) => ({
+      id: a.id,
+      version: a.versioning.version,
+      status: a.state.status,
+      claim: a.claim.statement,
+      evidence: [...a.provenance.evidenceRefs].toSorted(),
+    }));
   const payload = JSON.stringify({
     tenantId: params.tenantId,
     scope: computeScopeFingerprint(params.scope),
     optimizationType: params.optimizationType,
-    targetMemoryIds: [...params.targetMemoryIds].toSorted(),
+    atomDigests,
     policyVersion: params.policyVersion,
+    pipelineVersion: params.pipelineVersion,
   });
   return createHash("sha256").update(payload).digest("hex").slice(0, 32);
 }
 
 /**
- * Execute an idempotent MemoryOptimizationJob.
- * - Uses deterministic idempotencyKey (deduplicates via DurableJobStore when provided).
- * - Distinguishes plannedTokenReduction vs verifiedTokenReduction (only non-zero when
- *   canonical write-back via metadataStore actually executes).
+ * CW-04G-R1 / CW-04G-R2 / P0-02:
+ * - Enforces OptimizationExecutionContext (rejects any atom outside target scope).
+ * - Content-hashed idempotencyKey prevents stale job reuse when atoms change.
+ * - Measures real Canonical Store active-atom tokens before & after persistence.
  */
 export async function runOptimizationJob(params: {
   idempotencyKey?: string;
@@ -95,6 +121,7 @@ export async function runOptimizationJob(params: {
   scope: Scope;
   optimizationType: OptimizationType;
   atoms: ReadonlyArray<MemoryAtom>;
+  executionContext?: OptimizationExecutionContext;
   policyVersion?: string;
   pipelineVersion?: string;
   nowMs?: number;
@@ -103,6 +130,23 @@ export async function runOptimizationJob(params: {
   graphStore?: GraphStore;
   vectorStore?: VectorStore;
 }): Promise<MemoryOptimizationJob> {
+  const expectedScopeFp = computeScopeFingerprint(params.scope);
+  if (params.executionContext) {
+    if (params.executionContext.tenantId !== params.tenantId) {
+      throw new Error("OptimizationExecutionContext tenant mismatch");
+    }
+    if (computeScopeFingerprint(params.executionContext.scope) !== expectedScopeFp) {
+      throw new Error("OptimizationExecutionContext scope mismatch");
+    }
+  }
+  for (const atom of params.atoms) {
+    if (computeScopeFingerprint(atom.scope) !== expectedScopeFp) {
+      throw new Error(
+        `Atom ${atom.id} belongs to a different scope than target optimization job scope`,
+      );
+    }
+  }
+
   const policyVersion = params.policyVersion ?? "1.0.0";
   const pipelineVersion = params.pipelineVersion ?? "1.0.0";
   const targetMemoryIds = params.atoms.map((a) => a.id);
@@ -112,8 +156,9 @@ export async function runOptimizationJob(params: {
       tenantId: params.tenantId,
       scope: params.scope,
       optimizationType: params.optimizationType,
-      targetMemoryIds,
+      atoms: params.atoms,
       policyVersion,
+      pipelineVersion,
     });
 
   let jobId = `opt_${idempotencyKey.slice(0, 12)}`;
@@ -155,6 +200,15 @@ export async function runOptimizationJob(params: {
   }
 
   try {
+    let canonicalTokensBefore: number | undefined;
+    if (params.metadataStore) {
+      const allBefore = await params.metadataStore.listAtoms();
+      const activeBefore = allBefore.filter(
+        (a) => computeScopeFingerprint(a.scope) === expectedScopeFp && a.state.status !== "deprecated",
+      );
+      canonicalTokensBefore = estimateTotalTokens(activeBefore);
+    }
+
     const consolidation =
       params.optimizationType === "full" || params.optimizationType === "consolidation"
         ? consolidateAtoms(params.atoms)
@@ -177,7 +231,9 @@ export async function runOptimizationJob(params: {
         : [];
 
     let appliedConsolidation: AppliedConsolidationResult | undefined;
-    let verifiedDeprecatedOrPurged = new Set<string>();
+    let appliedLifecycle: AppliedLifecycleResult | undefined;
+    const verifiedDeprecatedOrPurged = new Set<string>();
+
     if (params.metadataStore) {
       if (consolidation) {
         appliedConsolidation = await applyConsolidation({
@@ -191,8 +247,11 @@ export async function runOptimizationJob(params: {
           verifiedDeprecatedOrPurged.add(id);
         }
       }
-      if (lifecycleEvaluations.length > 0) {
-        const appliedLife = await applyLifecycleDecisions({
+      if (
+        lifecycleEvaluations.length > 0 &&
+        params.executionContext?.allowLifecycleMutations !== false
+      ) {
+        appliedLifecycle = await applyLifecycleDecisions({
           evaluations: lifecycleEvaluations,
           metadataStore: params.metadataStore,
           graphStore: params.graphStore,
@@ -200,13 +259,25 @@ export async function runOptimizationJob(params: {
           now: createdAt,
         });
         for (const id of [
-          ...appliedLife.archivedIds,
-          ...appliedLife.deprecatedIds,
-          ...appliedLife.purgedIds,
+          ...appliedLifecycle.archivedIds,
+          ...appliedLifecycle.deprecatedIds,
+          ...appliedLifecycle.tombstonedIds,
+          ...appliedLifecycle.purgedIds,
         ]) {
           verifiedDeprecatedOrPurged.add(id);
         }
       }
+    }
+
+    let canonicalTokensAfter: number | undefined;
+    let verifiedCanonicalTokenDelta: number | undefined;
+    if (params.metadataStore && canonicalTokensBefore !== undefined) {
+      const allAfter = await params.metadataStore.listAtoms();
+      const activeAfter = allAfter.filter(
+        (a) => computeScopeFingerprint(a.scope) === expectedScopeFp && a.state.status !== "deprecated",
+      );
+      canonicalTokensAfter = estimateTotalTokens(activeAfter);
+      verifiedCanonicalTokenDelta = Math.max(0, canonicalTokensBefore - canonicalTokensAfter);
     }
 
     const estimatedTokensBefore = estimateTotalTokens(params.atoms);
@@ -218,7 +289,7 @@ export async function runOptimizationJob(params: {
       params.atoms.filter((a) => retainedPlannedIds.has(a.id)),
     );
     const plannedTokenReduction = Math.max(0, estimatedTokensBefore - plannedTokensAfter);
-    const verifiedTokenReduction = params.metadataStore
+    const estimatedTokensOfPersistedRemovedAtoms = params.metadataStore
       ? estimateTotalTokens(params.atoms.filter((a) => verifiedDeprecatedOrPurged.has(a.id)))
       : 0;
 
@@ -227,13 +298,17 @@ export async function runOptimizationJob(params: {
       inputAtomCount: params.atoms.length,
       ...(consolidation ? { consolidation } : {}),
       ...(appliedConsolidation ? { appliedConsolidation } : {}),
+      ...(appliedLifecycle ? { appliedLifecycle } : {}),
       ...(abstraction !== undefined ? { abstraction } : {}),
       lifecycleEvaluations,
       duplicateReductionCount,
       estimatedTokensBefore,
       plannedTokensAfter,
       plannedTokenReduction,
-      verifiedTokenReduction,
+      estimatedTokensOfPersistedRemovedAtoms,
+      ...(canonicalTokensBefore !== undefined ? { canonicalTokensBefore } : {}),
+      ...(canonicalTokensAfter !== undefined ? { canonicalTokensAfter } : {}),
+      ...(verifiedCanonicalTokenDelta !== undefined ? { verifiedCanonicalTokenDelta } : {}),
     };
 
     const completedAt = new Date(params.nowMs ?? Date.now()).toISOString();

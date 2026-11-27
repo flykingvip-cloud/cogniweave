@@ -1,8 +1,7 @@
 import { scoreRetrieval } from "../domain/atom-v2.js";
-import { computeScopeFingerprint } from "../keys.js";
+import { computeScopeFingerprint, createMemoryPartitionKeyV1 } from "../keys.js";
 import type {
   MemoryAtom,
-  MemoryPartitionKeyV1,
   MemorySubject,
   MemorySubjectBinding,
   Scope,
@@ -25,7 +24,7 @@ export interface RetrievalCandidateDecision {
   taskBonus: number;
   score: number;
   estimatedTokens: number;
-  authorized: boolean;
+  authorized: true;
 }
 
 export interface ExcludedRetrievalCandidate {
@@ -34,7 +33,7 @@ export interface ExcludedRetrievalCandidate {
 }
 
 export interface RetrievalDecisionTrace {
-  authorizedBy: "subject_binding" | "pre_authorized" | "denied";
+  authorizedBy: "per_atom_subject_binding";
   tokenAccounting: "exact" | "estimated";
   latencyMs: number;
   totalCandidates: number;
@@ -48,6 +47,12 @@ export interface OptimizedRetrievalResult {
   evidenceRefs: string[];
   estimatedTokenCost: number;
   trace: RetrievalDecisionTrace;
+}
+
+export interface RetrievalAuthContext {
+  caller: MemorySubject;
+  bindings: ReadonlyArray<MemorySubjectBinding>;
+  dataPlaneId: string;
 }
 
 function defaultTokenCounter(text: string): number {
@@ -90,28 +95,26 @@ function taskFrameMatchScore(taskFrame: TaskFrame, atom: MemoryAtom): number {
 }
 
 function scopeMatches(target: Scope, candidate: Scope): boolean {
-  return computeScopeFingerprint(target) === computeScopeFingerprint(candidate) ||
+  return (
+    computeScopeFingerprint(target) === computeScopeFingerprint(candidate) ||
     (target.workspaceId === candidate.workspaceId &&
       target.projectId === candidate.projectId &&
-      candidate.visibility === "shared");
+      candidate.visibility === "shared")
+  );
 }
 
 /**
- * MOP-05 Task-driven Retrieval Optimizer.
- * Enforces explicit SubjectBinding authorization (fail-closed if auth provided and denied),
- * uses full TaskFrame context, supports pluggable tokenCounter, and emits RetrievalDecisionTrace.
+ * MOP-05 Task-driven Retrieval Optimizer (CW-04B-R1).
+ * - Removes boolean preAuthorized bypass completely.
+ * - Authorizes EVERY candidate atom individually against its own Partition + Scope + SubjectBinding,
+ *   preventing a caller with Binding A from retrieving Scope B / Tenant B atoms via a wider TaskFrame.
  */
 export function optimizeRetrieval(params: {
   taskFrame: TaskFrame;
   candidates: ReadonlyArray<MemoryAtom>;
+  auth: RetrievalAuthContext;
   contextBudgetTokens?: number;
   includeConflicted?: boolean;
-  preAuthorized?: boolean;
-  auth?: {
-    caller: MemorySubject;
-    bindings: ReadonlyArray<MemorySubjectBinding>;
-    partition: MemoryPartitionKeyV1;
-  };
   tokenCounter?: (text: string) => number;
 }): OptimizedRetrievalResult {
   const started = performance.now();
@@ -119,45 +122,26 @@ export function optimizeRetrieval(params: {
   const countTokens = params.tokenCounter ?? defaultTokenCounter;
   const tokenAccounting: "exact" | "estimated" = params.tokenCounter ? "exact" : "estimated";
 
-  let authorized = false;
-  let authorizedBy: RetrievalDecisionTrace["authorizedBy"] = "denied";
-  if (params.auth) {
-    const acl = authorizeMemoryAccess(params.auth.bindings, {
-      partition: params.auth.partition,
-      caller: params.auth.caller,
-    });
-    authorized = acl.allowed;
-    authorizedBy = acl.allowed ? "subject_binding" : "denied";
-  } else if (params.preAuthorized) {
-    authorized = true;
-    authorizedBy = "pre_authorized";
-  }
-
-  if (!authorized) {
-    return {
-      selectedAtoms: [],
-      excludedCandidates: params.candidates.map((c) => ({ atomId: c.id, reason: "unauthorized" })),
-      evidenceRefs: [],
-      estimatedTokenCost: 0,
-      trace: {
-        authorizedBy: "denied",
-        tokenAccounting,
-        latencyMs: Number((performance.now() - started).toFixed(3)),
-        totalCandidates: params.candidates.length,
-        selectedCount: 0,
-        excludedCount: params.candidates.length,
-      },
-    };
-  }
-
   const excludedCandidates: ExcludedRetrievalCandidate[] = [];
   const scored: RetrievalCandidateDecision[] = [];
 
   for (const atom of params.candidates) {
+    // Per-atom authorization against the atom's own partition & scope.
+    const atomPartition = createMemoryPartitionKeyV1(params.auth.dataPlaneId, atom.scope);
+    const acl = authorizeMemoryAccess(params.auth.bindings, {
+      partition: atomPartition,
+      caller: params.auth.caller,
+    });
+    if (!acl.allowed) {
+      excludedCandidates.push({ atomId: atom.id, reason: "unauthorized" });
+      continue;
+    }
+
     if (!scopeMatches(params.taskFrame.scope, atom.scope)) {
       excludedCandidates.push({ atomId: atom.id, reason: "scope_mismatch" });
       continue;
     }
+
     const retrievability = isAtomRetrievable(atom, {
       includeConflicted: params.includeConflicted,
     });
@@ -212,7 +196,7 @@ export function optimizeRetrieval(params: {
     evidenceRefs: [...evidenceSet],
     estimatedTokenCost: usedTokens,
     trace: {
-      authorizedBy,
+      authorizedBy: "per_atom_subject_binding",
       tokenAccounting,
       latencyMs: Number((performance.now() - started).toFixed(3)),
       totalCandidates: params.candidates.length,

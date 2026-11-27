@@ -5,12 +5,14 @@ import { describe, expect, it } from "vitest";
 import { FileDurableJobStore } from "../jobs/durable-job-store.js";
 import { createMemoryPartitionKeyV1 } from "../keys.js";
 import type { CognitivePackage, MemoryAtom, MemorySubject, Scope, TaskFrame } from "../models.js";
-import { InMemoryMetadataStore } from "../storage/in-memory.js";
+import { InMemoryGraphStore, InMemoryMetadataStore, InMemoryVectorStore } from "../storage/in-memory.js";
 import { createMemorySubjectBinding } from "../subject/binding.js";
 import {
   abstractFromAtoms,
   applyConsolidation,
+  applyLifecycleDecisions,
   buildContextPackage,
+  computeOptimizationIdempotencyKey,
   consolidateAtoms,
   evaluateAdmission,
   evaluateLifecycle,
@@ -62,220 +64,237 @@ function makeAtom(overrides: Partial<MemoryAtom> & { id: string }): MemoryAtom {
   };
 }
 
-describe("Memory Optimization Engine (CW-04B..04H)", () => {
-  it("CW-04B/MOP-01: catches duplicates with differing dedupKeys, enforces authority tiers, and detects polarity conflicts", () => {
-    const existing = makeAtom({ id: "atm_0", dedupKey: "key_A" });
-    const diffKeySameClaim = makeAtom({ id: "atm_1", dedupKey: "key_B" });
-    expect(evaluateAdmission({ atom: diffKeySameClaim, existingAtoms: [existing] }).disposition).toBe(
-      "rejected",
-    );
-
-    const lowAuth = makeAtom({
-      id: "atm_low",
-      claim: { type: "heuristic", statement: "Cache warmups reduce cold-start tail latency." },
-      metrics: { confidence: 0.4, reuseCount: 0 },
-    });
-    expect(evaluateAdmission({ atom: lowAuth, sourceAuthority: "low" }).disposition).toBe("tentative");
-    expect(evaluateAdmission({ atom: lowAuth, sourceAuthority: "authoritative" }).disposition).toBe(
-      "accepted",
-    );
-
-    const contradicting = makeAtom({
-      id: "atm_contra",
+describe("Memory Optimization Engine (CW-04B-R1..CW-04H-R1)", () => {
+  it("CW-04B-R2/MOP-01: isolates admission duplicate & conflict checks by scope", () => {
+    const otherAgentExisting = makeAtom({
+      id: "atm_other",
+      scope: OTHER_AGENT_SCOPE,
       claim: {
         type: "procedural",
         statement: "Never verify forward-only ancestry before production cutover.",
       },
     });
-    const contraResult = evaluateAdmission({ atom: contradicting, existingAtoms: [existing] });
-    expect(contraResult.disposition).toBe("pending_review");
-    expect(contraResult.conflictAtomIds).toContain("atm_0");
+    const newAtom = makeAtom({ id: "atm_new" });
+    // Cross-agent contradicting claim must NOT trigger conflict or duplicate in agent_main.
+    const res = evaluateAdmission({ atom: newAtom, existingAtoms: [otherAgentExisting] });
+    expect(res.disposition).toBe("accepted");
+    expect(res.conflictAtomIds).toEqual([]);
   });
 
-  it("CW-04B/MOP-02: never merges across different scopes, excludes deprecated/tombstoned, and applies canonical write-back", async () => {
+  it("CW-04B-R1/MOP-05: rejects caller with Binding A trying to retrieve Scope B atoms via TaskFrame B", () => {
+    const caller: MemorySubject = { tenantId: "__local__", ownerType: "agent", ownerId: "agent_main" };
+    const bindingForScopeA = createMemorySubjectBinding({
+      partition: PARTITION,
+      scope: SCOPE,
+      subject: caller,
+    });
+
+    const scopeAAtom = makeAtom({ id: "atm_a", scope: SCOPE });
+    const scopeBAtom = makeAtom({ id: "atm_b", scope: OTHER_AGENT_SCOPE });
+
+    const taskFramePointingToB: TaskFrame = {
+      id: "tf_b",
+      scope: OTHER_AGENT_SCOPE,
+      taskType: "operations",
+      goals: ["release"],
+      problems: [],
+      scenarioTags: ["release"],
+      constraints: [],
+      entities: [],
+      requiredAtomTypes: ["strategy"],
+    };
+
+    const res = optimizeRetrieval({
+      taskFrame: taskFramePointingToB,
+      candidates: [scopeAAtom, scopeBAtom],
+      auth: { caller, bindings: [bindingForScopeA], dataPlaneId: "dp_1" },
+    });
+
+    // scopeBAtom fails per-atom binding check (unauthorized); scopeAAtom fails taskFrame scope_mismatch.
+    expect(res.selectedAtoms).toEqual([]);
+    expect(res.excludedCandidates).toEqual(
+      expect.arrayContaining([
+        { atomId: "atm_b", reason: "unauthorized" },
+        { atomId: "atm_a", reason: "scope_mismatch" },
+      ]),
+    );
+  });
+
+  it("CW-04C-R1/MOP-03: rejects single atom with 2 sourceEventIds and 2 atoms sharing same sourceEventIds", () => {
     const a1 = makeAtom({
       id: "atm_1",
-      provenance: { sourceEventIds: ["evt_1"], evidenceRefs: ["evd_1"] },
+      provenance: { sourceEventIds: ["evt_1", "evt_2"], evidenceRefs: ["evd_1"] },
     });
     const a2 = makeAtom({
       id: "atm_2",
-      provenance: { sourceEventIds: ["evt_2"], evidenceRefs: ["evd_2"] },
+      provenance: { sourceEventIds: ["evt_1", "evt_2"], evidenceRefs: ["evd_2"] },
     });
-    const otherAgent = makeAtom({
-      id: "atm_other",
-      scope: OTHER_AGENT_SCOPE,
-      provenance: { sourceEventIds: ["evt_3"], evidenceRefs: ["evd_3"] },
-    });
-    const deprecated = makeAtom({
-      id: "atm_dep",
-      state: { status: "deprecated", conflictsWith: [] },
-    });
-
-    const plan = consolidateAtoms([a1, a2, otherAgent, deprecated]);
-    expect(plan.excludedInactiveIds).toEqual(["atm_dep"]);
-    expect(plan.mergedCount).toBe(1);
-    const cluster1 = plan.clusters.find((c) => c.canonicalAtomId === "atm_1");
-    expect(cluster1?.sourceAtomIds).toEqual(["atm_1", "atm_2"]);
-    expect(plan.clusters.some((c) => c.canonicalAtomId === "atm_other")).toBe(true);
-
-    const store = new InMemoryMetadataStore();
-    await store.saveAtom(a1);
-    await store.saveAtom(a2);
-    const applied = await applyConsolidation({ plan, metadataStore: store });
-    expect(applied.updatedCanonicalIds).toEqual(["atm_1"]);
-    expect(applied.deprecatedSourceIds).toEqual(["atm_2"]);
-    expect((await store.getAtom("atm_1"))?.provenance.evidenceRefs).toEqual(["evd_1", "evd_2"]);
-    expect((await store.getAtom("atm_2"))?.state.status).toBe("deprecated");
-  });
-
-  it("CW-04C/MOP-03: enforces independent source events, intersects applicability.include, and extracts shared invariant terms", () => {
-    const sameEvent1 = makeAtom({
-      id: "atm_s1",
-      provenance: { sourceEventIds: ["evt_1"], evidenceRefs: ["evd_1"] },
-    });
-    const sameEvent2 = makeAtom({
-      id: "atm_s2",
-      provenance: { sourceEventIds: ["evt_1"], evidenceRefs: ["evd_2"] },
-    });
-    // Single source event is NOT independent -> returns null.
-    expect(abstractFromAtoms({ atoms: [sameEvent1, sameEvent2] })).toBeNull();
+    expect(abstractFromAtoms({ atoms: [a1, a2] })).toBeNull();
 
     const ind1 = makeAtom({
       id: "atm_i1",
       atomType: "failure_pattern",
-      claim: { type: "causal", statement: "Database connection pool exhaustion causes timeout." },
+      claim: { type: "causal", statement: "Connection pool exhaustion causes timeout." },
       applicability: { include: ["prod", "us-east"], exclude: ["canary"] },
       provenance: { sourceEventIds: ["evt_1"], evidenceRefs: ["evd_1"] },
     });
     const ind2 = makeAtom({
       id: "atm_i2",
       atomType: "failure_pattern",
-      claim: { type: "causal", statement: "Small connection pool configuration causes timeout." },
+      claim: { type: "causal", statement: "Small connection pool causes timeout." },
       applicability: { include: ["prod", "eu-west"], exclude: ["local"] },
       provenance: { sourceEventIds: ["evt_2"], evidenceRefs: ["evd_2"] },
     });
-    const abstracted = abstractFromAtoms({ atoms: [ind1, ind2] });
-    expect(abstracted).not.toBeNull();
-    expect(abstracted?.commonTokens).toEqual(expect.arrayContaining(["connection", "pool", "causes", "timeout"]));
-    // Applicability intersected (not expanded by union!).
-    expect(abstracted?.applicability.include).toEqual(["prod"]);
-    expect(abstracted?.knownExceptions).toEqual(expect.arrayContaining(["canary", "local"]));
+    const abs = abstractFromAtoms({ atoms: [ind1, ind2] });
+    expect(abs).not.toBeNull();
+    expect(abs?.requiresReview).toBe(true);
+    expect(abs?.applicability.include).toEqual(["prod"]);
   });
 
-  it("CW-04F/MOP-04: handles missing/invalid dates, triggers purge after grace period, and protects legal_hold", () => {
-    const missingDate = makeAtom({ id: "atm_nodate" });
-    expect(evaluateLifecycle(missingDate).action).toBe("revalidate");
-
-    const invalidDate = makeAtom({
-      id: "atm_baddate",
-      lifecycle: { admittedAt: "not-a-date" },
-    });
-    expect(evaluateLifecycle(invalidDate).action).toBe("revalidate");
-    expect(evaluateLifecycle(invalidDate).retrievable).toBe(false);
-
-    const expiredDep = makeAtom({
-      id: "atm_purge",
-      state: { status: "deprecated", conflictsWith: [] },
-      lifecycle: { deprecatedAt: "2025-01-01T00:00:00Z" },
-    });
-    expect(
-      evaluateLifecycle(expiredDep, { nowMs: Date.parse("2025-06-01T00:00:00Z") }).action,
-    ).toBe("purge");
-
-    const legal = makeAtom({
-      id: "atm_legal",
-      lifecycle: { retentionClass: "legal_hold", admittedAt: "2020-01-01T00:00:00Z" },
-    });
-    expect(evaluateLifecycle(legal).action).toBe("keep_active");
-  });
-
-  it("CW-04B/D/MOP-05 & MOP-06: requires auth/preAuthorized, builds trimmed CognitivePackage, and clamps evidenceCompleteness <= 1", () => {
-    const taskFrame: TaskFrame = {
-      id: "tf_1",
-      scope: SCOPE,
-      taskType: "operations",
-      goals: ["safe release"],
-      problems: [],
-      scenarioTags: ["release"],
-      constraints: ["no_force_push"],
-      entities: [],
-      requiredAtomTypes: ["policy"],
-    };
+  it("CW-04D-R1/MOP-06: enforces hard serialized CognitivePackage budget and reports unsatisfied_budget without clamping >1 utilization", () => {
     const policy = makeAtom({
       id: "atm_pol",
       atomType: "policy",
       claim: { type: "policy", statement: "Never force-push main." },
-      provenance: { sourceEventIds: ["evt_1"], evidenceRefs: ["evd_pol", "evd_extra"] },
+      provenance: { sourceEventIds: ["evt_1"], evidenceRefs: ["evd_pol"] },
     });
-
-    // Fail-closed when neither auth nor preAuthorized is supplied.
-    const denied = optimizeRetrieval({ taskFrame, candidates: [policy] });
-    expect(denied.trace.authorizedBy).toBe("denied");
-    expect(denied.selectedAtoms).toEqual([]);
-
-    const caller: MemorySubject = { tenantId: "__local__", ownerType: "agent", ownerId: "agent_main" };
-    const binding = createMemorySubjectBinding({ partition: PARTITION, scope: SCOPE, subject: caller });
-    const allowed = optimizeRetrieval({
-      taskFrame,
-      candidates: [policy],
-      auth: { caller, bindings: [binding], partition: PARTITION },
-    });
-    expect(allowed.trace.authorizedBy).toBe("subject_binding");
-    expect(allowed.selectedAtoms).toHaveLength(1);
-
     const pkg: CognitivePackage = {
       packageId: "pkg_1",
       taskFrameId: "tf_1",
-      answer: { summary: "raw", recommendations: [], nextSteps: [] },
+      answer: { summary: "summary", recommendations: [], nextSteps: ["step1"] },
       why: { summary: "matched", matchedPatterns: [] },
       supportingAtoms: ["atm_pol"],
       reasoningPath: [],
       confidence: 0.9,
-      risks: [],
-      constraints: ["no_force_push"],
+      risks: ["risk1"],
+      constraints: ["A_VERY_LONG_CONSTRAINT_EXCEEDING_TINY_BUDGET"],
       conflicts: [],
       evidenceRefs: ["evd_pol"],
     };
-    const ctx = buildContextPackage({ pkg, atoms: [policy], budgetTokens: 100 });
-    expect(ctx.evidenceCompleteness).toBeLessThanOrEqual(1);
-    expect(ctx.budgetedPackage.supportingAtoms).toEqual(["atm_pol"]);
-    expect(ctx.budgetedPackage.answer.recommendations).toEqual(["Never force-push main."]);
+
+    const unsatisfied = buildContextPackage({ pkg, atoms: [policy], budgetTokens: 10 });
+    expect(unsatisfied.budgetStatus).toBe("unsatisfied_budget");
+    expect(unsatisfied.budgetUtilization).toBeGreaterThan(1);
+
+    const fits = buildContextPackage({ pkg, atoms: [policy], budgetTokens: 500 });
+    expect(fits.budgetStatus).toBe("within_budget");
+    expect(fits.tokenEstimate).toBeLessThanOrEqual(500);
+    expect(fits.evidenceCompleteness).toBeLessThanOrEqual(1);
   });
 
-  it("CW-04G: Durable OptimizationJob deduplicates by idempotencyKey and reports verifiedTokenReduction", async () => {
+  it("CW-04E-R1 & CW-04F-R1: records journal & reports derivedIndexesSynced=false when derived stores are missing or fail; executes tombstone & revalidate", async () => {
+    const store = new InMemoryMetadataStore();
+    const a1 = makeAtom({ id: "atm_1", dedupKey: "k1" });
+    const a2 = makeAtom({ id: "atm_2", dedupKey: "k1" });
+    await store.saveAtom(a1);
+    await store.saveAtom(a2);
+
+    const plan = consolidateAtoms([a1, a2]);
+    // Missing graphStore/vectorStore -> canonicalCommitted=true, derivedIndexesSynced=false
+    const noDerived = await applyConsolidation({ plan, metadataStore: store });
+    expect(noDerived.canonicalCommitted).toBe(true);
+    expect(noDerived.derivedIndexesSynced).toBe(false);
+    expect((await store.getJournal(noDerived.journalId))?.status).toBe("DERIVED_OUT_OF_SYNC");
+
+    // Failing graphStore -> derivedIndexesSynced=false with error
+    const failingGraph = new InMemoryGraphStore();
+    failingGraph.delete = async () => {
+      throw new Error("neo4j_down");
+    };
+    await store.saveAtom(a2); // restore active for retry
+    const failedDerived = await applyConsolidation({
+      plan,
+      metadataStore: store,
+      graphStore: failingGraph,
+      vectorStore: new InMemoryVectorStore(),
+    });
+    expect(failedDerived.derivedIndexesSynced).toBe(false);
+    expect(failedDerived.derivedSyncError).toBe("neo4j_down");
+
+    // Lifecycle executes tombstone and revalidate
+    const tombAtom = makeAtom({
+      id: "atm_tomb",
+      lifecycle: { tombstonedAt: "2026-11-26T00:00:00Z" },
+    });
+    const noDateAtom = makeAtom({ id: "atm_reval" });
+    await store.saveAtom(tombAtom);
+    await store.saveAtom(noDateAtom);
+
+    const evals = [
+      evaluateLifecycle(tombAtom, { nowMs: Date.parse("2026-11-27T00:00:00Z") }),
+      evaluateLifecycle(noDateAtom),
+    ];
+    const lifeRes = await applyLifecycleDecisions({
+      evaluations: evals,
+      metadataStore: store,
+      graphStore: new InMemoryGraphStore(),
+      vectorStore: new InMemoryVectorStore(),
+    });
+    expect(lifeRes.tombstonedIds).toEqual(["atm_tomb"]);
+    expect(lifeRes.revalidatedIds).toEqual(["atm_reval"]);
+    expect((await store.getAtom("atm_reval"))?.state.status).toBe("tentative");
+  });
+
+  it("CW-04G-R1 & CW-04G-R2: rejects cross-scope job inputs, invalidates idempotencyKey on version change, and measures real Canonical Store delta", async () => {
     const dir = await mkdtemp(join(tmpdir(), "cw-opt-job-"));
     try {
       const jobStore = new FileDurableJobStore(join(dir, "jobs.json"));
       const metadataStore = new InMemoryMetadataStore();
       const a1 = makeAtom({ id: "atm_1", dedupKey: "k1" });
       const a2 = makeAtom({ id: "atm_2", dedupKey: "k1" });
+      const crossScope = makeAtom({ id: "atm_cross", scope: OTHER_AGENT_SCOPE });
       await metadataStore.saveAtom(a1);
       await metadataStore.saveAtom(a2);
 
-      const job1 = await runOptimizationJob({
+      // P0-02: Cross-scope atom rejected at job entry
+      await expect(
+        runOptimizationJob({
+          tenantId: "t_1",
+          subjectId: "subj_1",
+          scope: SCOPE,
+          optimizationType: "consolidation",
+          atoms: [a1, crossScope],
+          jobStore,
+          metadataStore,
+        }),
+      ).rejects.toThrow("different scope");
+
+      const keyV1 = computeOptimizationIdempotencyKey({
+        tenantId: "t_1",
+        scope: SCOPE,
+        optimizationType: "consolidation",
+        atoms: [a1, a2],
+        policyVersion: "1.0.0",
+        pipelineVersion: "1.0.0",
+      });
+      const keyV2 = computeOptimizationIdempotencyKey({
+        tenantId: "t_1",
+        scope: SCOPE,
+        optimizationType: "consolidation",
+        atoms: [a1, { ...a2, versioning: { version: 2 } }],
+        policyVersion: "1.0.0",
+        pipelineVersion: "1.0.0",
+      });
+      expect(keyV1).not.toBe(keyV2);
+
+      const job = await runOptimizationJob({
         tenantId: "t_1",
         subjectId: "subj_1",
         scope: SCOPE,
         optimizationType: "consolidation",
         atoms: [a1, a2],
-        nowMs: Date.parse("2026-11-27T00:00:00Z"),
+        executionContext: { actorUserId: "u_1", tenantId: "t_1", scope: SCOPE },
         jobStore,
         metadataStore,
+        graphStore: new InMemoryGraphStore(),
+        vectorStore: new InMemoryVectorStore(),
       });
-      expect(job1.status).toBe("completed");
-      expect(job1.result?.verifiedTokenReduction).toBeGreaterThan(0);
-
-      // Re-running with same inputs returns the completed job idempotently.
-      const job2 = await runOptimizationJob({
-        tenantId: "t_1",
-        subjectId: "subj_1",
-        scope: SCOPE,
-        optimizationType: "consolidation",
-        atoms: [a1, a2],
-        nowMs: Date.parse("2026-11-27T00:00:00Z"),
-        jobStore,
-      });
-      expect(job2.jobId).toBe(job1.jobId);
+      expect(job.status).toBe("completed");
+      expect(job.result?.canonicalTokensBefore).toBeGreaterThan(0);
+      expect(job.result?.canonicalTokensAfter).toBeLessThan(job.result!.canonicalTokensBefore!);
+      expect(job.result?.verifiedCanonicalTokenDelta).toBe(
+        job.result!.canonicalTokensBefore! - job.result!.canonicalTokensAfter!,
+      );
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

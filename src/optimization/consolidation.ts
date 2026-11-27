@@ -1,5 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { computeScopeFingerprint } from "../keys.js";
-import type { MemoryAtom, Scope } from "../models.js";
+import type { MemoryAtom, Scope, WriteJournal } from "../models.js";
 import type { GraphStore, MetadataStore, VectorStore } from "../storage/types.js";
 
 export type ConsolidationRelation =
@@ -29,6 +30,10 @@ export interface ConsolidationPlan {
 
 export interface AppliedConsolidationResult {
   plan: ConsolidationPlan;
+  journalId: string;
+  canonicalCommitted: boolean;
+  derivedIndexesSynced: boolean;
+  derivedSyncError?: string;
   updatedCanonicalIds: string[];
   deprecatedSourceIds: string[];
 }
@@ -82,11 +87,6 @@ function isInactiveAtom(atom: MemoryAtom): boolean {
   );
 }
 
-/**
- * MOP-02 Phase 1: Pure Consolidation Planning.
- * Enforces strict Scope isolation (never merges across different Scope fingerprints),
- * excludes deprecated/tombstoned atoms, and preserves conflicts.
- */
 export function consolidateAtoms(atoms: ReadonlyArray<MemoryAtom>): ConsolidationPlan {
   const excludedInactiveIds: string[] = [];
   const activeAtoms: MemoryAtom[] = [];
@@ -134,10 +134,8 @@ export function consolidateAtoms(atoms: ReadonlyArray<MemoryAtom>): Consolidatio
     for (let j = i + 1; j < activeAtoms.length; j += 1) {
       const candidate = activeAtoms[j];
       if (consumed.has(candidate.id)) continue;
-      // Strict Scope isolation: never merge across different scope fingerprints.
-      if (computeScopeFingerprint(candidate.scope) !== primaryScopeFp) {
-        continue;
-      }
+      if (computeScopeFingerprint(candidate.scope) !== primaryScopeFp) continue;
+
       const candidateConflicts = new Set(candidate.state.conflictsWith ?? []);
       if (
         candidate.state.status === "conflicted" ||
@@ -185,9 +183,10 @@ export function consolidateAtoms(atoms: ReadonlyArray<MemoryAtom>): Consolidatio
 }
 
 /**
- * MOP-02 Phase 2: Canonical Consolidation Write-back.
- * Persists merged evidence onto the canonical atom, bumps version,
- * deprecates redundant source atoms, and cleans derived vector/graph indexes.
+ * MOP-02 Phase 2: Transactional Canonical Consolidation Write-back (CW-04E-R1).
+ * - Wraps canonical updates in metadataStore.withTransaction() when available.
+ * - Writes a WriteJournal entry tracking canonical commit vs derived index sync.
+ * - Explicitly reports derivedIndexesSynced=false if GraphStore/VectorStore are absent or fail.
  */
 export async function applyConsolidation(params: {
   plan: ConsolidationPlan;
@@ -199,52 +198,108 @@ export async function applyConsolidation(params: {
   const updatedCanonicalIds: string[] = [];
   const deprecatedSourceIds: string[] = [];
   const now = params.now ?? new Date().toISOString();
+  const journalId = `jrnl_cons_${randomUUID().slice(0, 12)}`;
+  const journal: WriteJournal = {
+    id: journalId,
+    eventKey: journalId,
+    status: "RECEIVED",
+    phase: "RECEIVED",
+    retryCount: 0,
+    objectIds: {
+      eventIds: [],
+      atomIds: [],
+      entityIds: [],
+      scenarioIds: [],
+      problemIds: [],
+      evidenceIds: [],
+      relationIds: [],
+    },
+    derivedPlan: {
+      graphNodeIds: [],
+      graphEdgeIds: [],
+      vectorDocIds: [],
+    },
+    updatedAt: now,
+  };
+  await params.metadataStore.putJournal(journal);
 
-  for (const cluster of params.plan.clusters) {
-    if (cluster.sourceAtomIds.length <= 1 || cluster.decision === "conflicting") {
-      continue;
-    }
-    const canonical = await params.metadataStore.getAtom(cluster.canonicalAtomId);
-    if (!canonical) continue;
+  const runCanonicalWrites = async () => {
+    for (const cluster of params.plan.clusters) {
+      if (cluster.sourceAtomIds.length <= 1 || cluster.decision === "conflicting") continue;
+      const canonical = await params.metadataStore.getAtom(cluster.canonicalAtomId);
+      if (!canonical) continue;
 
-    await params.metadataStore.saveAtom({
-      ...canonical,
-      provenance: {
-        ...canonical.provenance,
-        evidenceRefs: [...new Set([...canonical.provenance.evidenceRefs, ...cluster.evidenceRefs])],
-      },
-      versioning: {
-        ...canonical.versioning,
-        version: canonical.versioning.version + 1,
-      },
-    });
-    updatedCanonicalIds.push(canonical.id);
-
-    for (const sourceId of cluster.sourceAtomIds) {
-      if (sourceId === canonical.id) continue;
-      const src = await params.metadataStore.getAtom(sourceId);
-      if (!src) continue;
       await params.metadataStore.saveAtom({
-        ...src,
-        state: { ...src.state, status: "deprecated" },
-        lifecycle: { ...src.lifecycle, deprecatedAt: now },
-        versioning: {
-          ...src.versioning,
-          version: src.versioning.version + 1,
-          parentVersion: canonical.id,
+        ...canonical,
+        provenance: {
+          ...canonical.provenance,
+          evidenceRefs: [...new Set([...canonical.provenance.evidenceRefs, ...cluster.evidenceRefs])],
         },
+        versioning: { ...canonical.versioning, version: canonical.versioning.version + 1 },
       });
-      deprecatedSourceIds.push(src.id);
+      updatedCanonicalIds.push(canonical.id);
+
+      for (const sourceId of cluster.sourceAtomIds) {
+        if (sourceId === canonical.id) continue;
+        const src = await params.metadataStore.getAtom(sourceId);
+        if (!src) continue;
+        await params.metadataStore.saveAtom({
+          ...src,
+          state: { ...src.state, status: "deprecated" },
+          lifecycle: { ...src.lifecycle, deprecatedAt: now },
+          versioning: {
+            ...src.versioning,
+            version: src.versioning.version + 1,
+            parentVersion: canonical.id,
+          },
+        });
+        deprecatedSourceIds.push(src.id);
+      }
+    }
+  };
+
+  if (params.metadataStore.withTransaction) {
+    await params.metadataStore.withTransaction(runCanonicalWrites);
+  } else {
+    await runCanonicalWrites();
+  }
+
+  let derivedIndexesSynced = false;
+  let derivedSyncError: string | undefined;
+
+  if (deprecatedSourceIds.length === 0) {
+    derivedIndexesSynced = true;
+  } else if (!params.graphStore || !params.vectorStore) {
+    derivedIndexesSynced = false;
+    derivedSyncError = "graphStore_or_vectorStore_not_configured";
+  } else {
+    try {
+      await params.graphStore.delete?.(deprecatedSourceIds);
+      await params.vectorStore.delete?.(deprecatedSourceIds);
+      derivedIndexesSynced = true;
+    } catch (err) {
+      derivedIndexesSynced = false;
+      derivedSyncError = err instanceof Error ? err.message : String(err);
     }
   }
 
-  if (deprecatedSourceIds.length > 0) {
-    await params.graphStore?.delete?.(deprecatedSourceIds);
-    await params.vectorStore?.delete?.(deprecatedSourceIds);
-  }
+  await params.metadataStore.updateJournal(journalId, {
+    status: derivedIndexesSynced ? "COMPLETED" : "DERIVED_OUT_OF_SYNC",
+    phase: derivedIndexesSynced ? "COMPLETED" : "METADATA_COMMITTED",
+    objectIds: {
+      ...journal.objectIds,
+      atomIds: [...updatedCanonicalIds, ...deprecatedSourceIds],
+    },
+    lastError: derivedSyncError,
+    updatedAt: new Date().toISOString(),
+  });
 
   return {
     plan: params.plan,
+    journalId,
+    canonicalCommitted: true,
+    derivedIndexesSynced,
+    ...(derivedSyncError ? { derivedSyncError } : {}),
     updatedCanonicalIds,
     deprecatedSourceIds,
   };

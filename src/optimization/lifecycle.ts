@@ -35,14 +35,20 @@ export interface LifecycleEvaluation {
   action: LifecycleAction;
   decayedValue: number;
   retrievable: boolean;
+  legalHold: boolean;
   reason: string;
 }
 
-/**
- * MOP-04 Memory Lifecycle Optimizer.
- * Handles missing/invalid timestamps safely, separates legal_hold retention from retrieval,
- * supports configurable Retention Policy, and emits purge when archived/tombstoned beyond grace period.
- */
+export interface AppliedLifecycleResult {
+  archivedIds: string[];
+  deprecatedIds: string[];
+  tombstonedIds: string[];
+  revalidatedIds: string[];
+  deprioritizedIds: string[];
+  purgedIds: string[];
+  derivedIndexesSynced: boolean;
+}
+
 export function evaluateLifecycle(
   atom: MemoryAtom,
   options?: {
@@ -63,7 +69,10 @@ export function evaluateLifecycle(
       action: "keep_active",
       decayedValue: atom.metrics.confidence,
       retrievable,
-      reason: "protected_by_legal_hold",
+      legalHold: true,
+      reason: options?.evidenceInvalidated
+        ? "legal_hold_retained_but_evidence_invalidated"
+        : "protected_by_legal_hold",
     };
   }
 
@@ -73,6 +82,7 @@ export function evaluateLifecycle(
       action: "revalidate",
       decayedValue: 0,
       retrievable: false,
+      legalHold: false,
       reason: "evidence_invalidated",
     };
   }
@@ -83,52 +93,51 @@ export function evaluateLifecycle(
       action: "deprecate",
       decayedValue: 0,
       retrievable: false,
+      legalHold: false,
       reason: `superseded_by:${options.supersededByAtomId}`,
     };
   }
 
   if (atom.lifecycle?.tombstonedAt) {
     const tombMs = Date.parse(atom.lifecycle.tombstonedAt);
-    if (Number.isFinite(tombMs)) {
-      const daysSinceTomb = (nowMs - tombMs) / (1000 * 60 * 60 * 24);
-      if (daysSinceTomb >= policy.purgeAfterArchiveDays) {
-        return {
-          atomId: atom.id,
-          action: "purge",
-          decayedValue: 0,
-          retrievable: false,
-          reason: "tombstone_grace_expired",
-        };
-      }
+    if (Number.isFinite(tombMs) && (nowMs - tombMs) / (1000 * 60 * 60 * 24) >= policy.purgeAfterArchiveDays) {
+      return {
+        atomId: atom.id,
+        action: "purge",
+        decayedValue: 0,
+        retrievable: false,
+        legalHold: false,
+        reason: "tombstone_grace_expired",
+      };
     }
     return {
       atomId: atom.id,
       action: "tombstone",
       decayedValue: 0,
       retrievable: false,
+      legalHold: false,
       reason: "already_tombstoned",
     };
   }
 
   if (atom.state.status === "deprecated") {
     const depMs = atom.lifecycle?.deprecatedAt ? Date.parse(atom.lifecycle.deprecatedAt) : Number.NaN;
-    if (Number.isFinite(depMs)) {
-      const daysSinceDep = (nowMs - depMs) / (1000 * 60 * 60 * 24);
-      if (daysSinceDep >= policy.purgeAfterArchiveDays) {
-        return {
-          atomId: atom.id,
-          action: "purge",
-          decayedValue: 0,
-          retrievable: false,
-          reason: "deprecated_grace_expired",
-        };
-      }
+    if (Number.isFinite(depMs) && (nowMs - depMs) / (1000 * 60 * 60 * 24) >= policy.purgeAfterArchiveDays) {
+      return {
+        atomId: atom.id,
+        action: "purge",
+        decayedValue: 0,
+        retrievable: false,
+        legalHold: false,
+        reason: "deprecated_grace_expired",
+      };
     }
     return {
       atomId: atom.id,
       action: "archive",
       decayedValue: 0,
       retrievable: false,
+      legalHold: false,
       reason: "deprecated_ready_for_archive",
     };
   }
@@ -139,6 +148,7 @@ export function evaluateLifecycle(
       action: "revalidate",
       decayedValue: Number((atom.metrics.confidence * 0.5).toFixed(4)),
       retrievable: false,
+      legalHold: false,
       reason: "conflicted_requires_revalidation",
     };
   }
@@ -150,6 +160,7 @@ export function evaluateLifecycle(
       action: "revalidate",
       decayedValue: atom.metrics.confidence,
       retrievable: atom.state.status === "active",
+      legalHold: false,
       reason: "missing_timestamp_requires_revalidation",
     };
   }
@@ -160,6 +171,7 @@ export function evaluateLifecycle(
       action: "revalidate",
       decayedValue: atom.metrics.confidence,
       retrievable: false,
+      legalHold: false,
       reason: "invalid_timestamp_requires_revalidation",
     };
   }
@@ -183,6 +195,7 @@ export function evaluateLifecycle(
       action: "archive",
       decayedValue,
       retrievable: false,
+      legalHold: false,
       reason: "ephemeral_stale_unused",
     };
   }
@@ -193,6 +206,7 @@ export function evaluateLifecycle(
       action: "revalidate",
       decayedValue,
       retrievable: true,
+      legalHold: false,
       reason: "value_decayed_below_threshold",
     };
   }
@@ -203,6 +217,7 @@ export function evaluateLifecycle(
       action: "deprioritize",
       decayedValue,
       retrievable: true,
+      legalHold: false,
       reason: "low_recent_utility",
     };
   }
@@ -212,12 +227,14 @@ export function evaluateLifecycle(
     action: "keep_active",
     decayedValue,
     retrievable: true,
+    legalHold: false,
     reason: "healthy_active_memory",
   };
 }
 
 /**
- * Execute lifecycle evaluations against Canonical Store and derived indexes.
+ * CW-04F-R1: Complete Lifecycle State Execution across Canonical Store and Derived Indexes.
+ * Persists purge, tombstone, archive, deprecate, revalidate, and deprioritize transitions.
  */
 export async function applyLifecycleDecisions(params: {
   evaluations: ReadonlyArray<LifecycleEvaluation>;
@@ -225,10 +242,14 @@ export async function applyLifecycleDecisions(params: {
   graphStore?: GraphStore;
   vectorStore?: VectorStore;
   now?: string;
-}): Promise<{ archivedIds: string[]; deprecatedIds: string[]; purgedIds: string[] }> {
+}): Promise<AppliedLifecycleResult> {
   const archivedIds: string[] = [];
   const deprecatedIds: string[] = [];
+  const tombstonedIds: string[] = [];
+  const revalidatedIds: string[] = [];
+  const deprioritizedIds: string[] = [];
   const purgedIds: string[] = [];
+  const removeFromDerivedIds: string[] = [];
   const now = params.now ?? new Date().toISOString();
 
   for (const ev of params.evaluations) {
@@ -239,6 +260,20 @@ export async function applyLifecycleDecisions(params: {
     if (ev.action === "purge") {
       await params.metadataStore.deleteAtom(atom.id);
       purgedIds.push(atom.id);
+      removeFromDerivedIds.push(atom.id);
+    } else if (ev.action === "tombstone") {
+      await params.metadataStore.saveAtom({
+        ...atom,
+        state: { ...atom.state, status: "deprecated" },
+        lifecycle: {
+          ...atom.lifecycle,
+          tombstonedAt: atom.lifecycle?.tombstonedAt ?? now,
+          deprecatedAt: atom.lifecycle?.deprecatedAt ?? now,
+        },
+        versioning: { ...atom.versioning, version: atom.versioning.version + 1 },
+      });
+      tombstonedIds.push(atom.id);
+      removeFromDerivedIds.push(atom.id);
     } else if (ev.action === "deprecate" || ev.action === "archive") {
       await params.metadataStore.saveAtom({
         ...atom,
@@ -248,13 +283,45 @@ export async function applyLifecycleDecisions(params: {
       });
       if (ev.action === "archive") archivedIds.push(atom.id);
       else deprecatedIds.push(atom.id);
+      removeFromDerivedIds.push(atom.id);
+    } else if (ev.action === "revalidate") {
+      await params.metadataStore.saveAtom({
+        ...atom,
+        state: { ...atom.state, status: "tentative" },
+        versioning: { ...atom.versioning, version: atom.versioning.version + 1 },
+      });
+      revalidatedIds.push(atom.id);
+    } else if (ev.action === "deprioritize") {
+      await params.metadataStore.saveAtom({
+        ...atom,
+        governance: {
+          ...atom.governance,
+          retrievalScore: ev.decayedValue,
+          lastScoredAt: now,
+          scoreVersion: 1,
+        },
+      });
+      deprioritizedIds.push(atom.id);
     }
   }
 
-  if (purgedIds.length > 0) {
-    await params.graphStore?.delete?.(purgedIds);
-    await params.vectorStore?.delete?.(purgedIds);
+  let derivedIndexesSynced = true;
+  if (removeFromDerivedIds.length > 0) {
+    if (!params.graphStore || !params.vectorStore) {
+      derivedIndexesSynced = false;
+    } else {
+      await params.graphStore.delete?.(removeFromDerivedIds);
+      await params.vectorStore.delete?.(removeFromDerivedIds);
+    }
   }
 
-  return { archivedIds, deprecatedIds, purgedIds };
+  return {
+    archivedIds,
+    deprecatedIds,
+    tombstonedIds,
+    revalidatedIds,
+    deprioritizedIds,
+    purgedIds,
+    derivedIndexesSynced,
+  };
 }

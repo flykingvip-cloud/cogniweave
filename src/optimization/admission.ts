@@ -1,4 +1,5 @@
 import { scoreAdmission } from "../domain/atom-v2.js";
+import { computeScopeFingerprint } from "../keys.js";
 import type { MemoryAtom } from "../models.js";
 
 export type AdmissionDisposition = "accepted" | "tentative" | "rejected" | "pending_review";
@@ -15,6 +16,7 @@ export interface AdmissionEvaluationResult {
   disposition: AdmissionDisposition;
   admissionScore: number;
   sourceAuthority: SourceAuthorityLevel;
+  conflictMode: "heuristic_polarity";
   requiresReview: boolean;
   duplicateOfAtomId?: string;
   conflictAtomIds: string[];
@@ -32,12 +34,11 @@ function normalizeText(value: string): string {
   return value.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-function hasOpposingPolarity(a: string, b: string): boolean {
+function hasOpposingPolarityHeuristic(a: string, b: string): boolean {
   const negA = /\b(never|not|avoid|disable|forbid|dont|don't)\b/i.test(a);
   const negB = /\b(never|not|avoid|disable|forbid|dont|don't)\b/i.test(b);
-  if (negA === negB) {
-    return false;
-  }
+  if (negA === negB) return false;
+
   const stripNeg = (s: string) =>
     new Set(
       s
@@ -48,9 +49,8 @@ function hasOpposingPolarity(a: string, b: string): boolean {
     );
   const wordsA = stripNeg(a);
   const wordsB = stripNeg(b);
-  if (wordsA.size === 0 || wordsB.size === 0) {
-    return false;
-  }
+  if (wordsA.size === 0 || wordsB.size === 0) return false;
+
   let overlap = 0;
   for (const w of wordsA) {
     if (wordsB.has(w)) overlap += 1;
@@ -59,31 +59,37 @@ function hasOpposingPolarity(a: string, b: string): boolean {
 }
 
 /**
- * MOP-01 Memory Admission Engine.
- * Reuses scoreAdmission(), enforces tiered SourceAuthority thresholds,
- * checks dedupKey AND claim-statement fallback, and detects conflicts against existingAtoms.
+ * MOP-01 Memory Admission Engine (CW-04B-R2).
+ * Isolates existingAtoms to the exact same ScopeFingerprint + visibility before
+ * running duplicate detection and heuristic polarity conflict checks.
  */
 export function evaluateAdmission(input: AdmissionEvaluationInput): AdmissionEvaluationResult {
   const { atom } = input;
   const sourceAuthority: SourceAuthorityLevel = input.sourceAuthority ?? "medium";
   const admissionScore = scoreAdmission(atom);
   const reasons: string[] = [];
-  const existing = input.existingAtoms ?? [];
-  const normalizedStatement = normalizeText(atom.claim.statement);
+  const targetScopeFp = computeScopeFingerprint(atom.scope);
 
-  // Check both dedupKey and normalized claim text fallback (even if dedupKeys differ).
-  const exactDup = existing.find(
+  // CW-04B-R2: Scope-isolate existingAtoms so cross-agent/cross-workspace claims never pollute admission.
+  const sameScopeExisting = (input.existingAtoms ?? []).filter(
     (candidate) =>
       candidate.id !== atom.id &&
       candidate.state.status !== "deprecated" &&
-      ((candidate.dedupKey && atom.dedupKey && candidate.dedupKey === atom.dedupKey) ||
-        normalizeText(candidate.claim.statement) === normalizedStatement),
+      computeScopeFingerprint(candidate.scope) === targetScopeFp,
+  );
+
+  const normalizedStatement = normalizeText(atom.claim.statement);
+  const exactDup = sameScopeExisting.find(
+    (candidate) =>
+      (candidate.dedupKey && atom.dedupKey && candidate.dedupKey === atom.dedupKey) ||
+      normalizeText(candidate.claim.statement) === normalizedStatement,
   );
   if (exactDup) {
     return {
       disposition: "rejected",
       admissionScore,
       sourceAuthority,
+      conflictMode: "heuristic_polarity",
       requiresReview: false,
       duplicateOfAtomId: exactDup.id,
       conflictAtomIds: [],
@@ -91,13 +97,8 @@ export function evaluateAdmission(input: AdmissionEvaluationInput): AdmissionEva
     };
   }
 
-  const detectedConflicts = existing
-    .filter(
-      (candidate) =>
-        candidate.id !== atom.id &&
-        candidate.state.status !== "deprecated" &&
-        hasOpposingPolarity(atom.claim.statement, candidate.claim.statement),
-    )
+  const detectedConflicts = sameScopeExisting
+    .filter((candidate) => hasOpposingPolarityHeuristic(atom.claim.statement, candidate.claim.statement))
     .map((c) => c.id);
   const conflictAtomIds = [...new Set([...(atom.state.conflictsWith ?? []), ...detectedConflicts])];
 
@@ -112,6 +113,7 @@ export function evaluateAdmission(input: AdmissionEvaluationInput): AdmissionEva
       disposition: "pending_review",
       admissionScore,
       sourceAuthority,
+      conflictMode: "heuristic_polarity",
       requiresReview: true,
       conflictAtomIds,
       reasons,
@@ -124,6 +126,7 @@ export function evaluateAdmission(input: AdmissionEvaluationInput): AdmissionEva
       disposition: "pending_review",
       admissionScore,
       sourceAuthority,
+      conflictMode: "heuristic_polarity",
       requiresReview: true,
       conflictAtomIds,
       reasons,
@@ -136,6 +139,7 @@ export function evaluateAdmission(input: AdmissionEvaluationInput): AdmissionEva
       disposition: "tentative",
       admissionScore,
       sourceAuthority,
+      conflictMode: "heuristic_polarity",
       requiresReview: false,
       conflictAtomIds,
       reasons,
@@ -149,6 +153,7 @@ export function evaluateAdmission(input: AdmissionEvaluationInput): AdmissionEva
       disposition: "tentative",
       admissionScore,
       sourceAuthority,
+      conflictMode: "heuristic_polarity",
       requiresReview: false,
       conflictAtomIds,
       reasons,
@@ -160,6 +165,7 @@ export function evaluateAdmission(input: AdmissionEvaluationInput): AdmissionEva
     disposition: "accepted",
     admissionScore,
     sourceAuthority,
+    conflictMode: "heuristic_polarity",
     requiresReview: false,
     conflictAtomIds,
     reasons,
