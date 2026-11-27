@@ -91,8 +91,35 @@ export interface EngineConfig {
     connectionString?: string;
   };
   graphBackend: string;
+  neo4j?: {
+    client?: {
+      run<Row = Record<string, unknown>>(
+        cypher: string,
+        params?: Record<string, unknown>,
+      ): Promise<{ records: Row[] }>;
+      transaction?<T>(
+        runner: (transaction: {
+          run: <Row = Record<string, unknown>>(
+            cypher: string,
+            params?: Record<string, unknown>,
+          ) => Promise<{ records: Row[] }>;
+        }) => Promise<T>,
+      ): Promise<T>;
+    };
+    database?: string;
+    namespace?: string;
+  };
   evidenceBackend: string;
   vectorBackend?: string;
+  pgvector?: {
+    client?: NonNullable<EngineConfig["postgres"]>["client"];
+    schema?: string;
+    embeddingDimension?: number;
+    embeddingProvider?: {
+      readonly dimension: number;
+      embed(texts: readonly string[]): Promise<number[][]>;
+    };
+  };
   enableLlmTaskFraming?: boolean;
   enableLlmDistillation?: boolean;
   enableVectorSeedRetrieval?: boolean;

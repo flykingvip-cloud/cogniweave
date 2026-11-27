@@ -179,6 +179,7 @@ export interface GraphStore {
     result: DistillationResult,
   ): Promise<{ nodeCount: number; edgeCount: number }>;
   rebuildFromBundle(bundle: MetadataBundle): Promise<{ nodeCount: number; edgeCount: number }>;
+  delete?(ids: string[]): Promise<number>;
 }
 
 export type VectorSearchHit = {

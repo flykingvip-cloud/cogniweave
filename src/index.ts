@@ -423,6 +423,8 @@ export {
   routeCogniWeaveHttpRequest,
 } from "./rest/node-server.js";
 
+export type { EmbeddingProvider } from "./adapters/contracts.js";
+
 export type {
   CliCommand,
   CogniWeaveCliBootstrapTargetResult,

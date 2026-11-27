@@ -2869,6 +2869,36 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         await this.purgeOrphanObjectsForBinding(binding.id, "entity");
         await this.purgeOrphanObjectsForBinding(binding.id, "scenario");
         await this.purgeOrphanObjectsForBinding(binding.id, "problem");
+        const purgedIds: string[] = [];
+        for (const atomId of affectedAtomIds) {
+          if (!(await this.metadataStore.getAtom(atomId))) {
+            purgedIds.push(atomId);
+          }
+        }
+        for (const relationId of affectedRelationIds) {
+          if (!(await this.metadataStore.getRelation(relationId))) {
+            purgedIds.push(relationId);
+          }
+        }
+        for (const entityId of affectedEntityIds) {
+          if (!(await this.metadataStore.getEntity(entityId))) {
+            purgedIds.push(entityId);
+          }
+        }
+        for (const scenarioId of affectedScenarioIds) {
+          if (!(await this.metadataStore.getScenario(scenarioId))) {
+            purgedIds.push(scenarioId);
+          }
+        }
+        for (const problemId of affectedProblemIds) {
+          if (!(await this.metadataStore.getProblem(problemId))) {
+            purgedIds.push(problemId);
+          }
+        }
+        if (purgedIds.length > 0) {
+          await this.graphStore.delete?.(purgedIds);
+          await this.vectorStore.delete?.(purgedIds);
+        }
       }
     }
 

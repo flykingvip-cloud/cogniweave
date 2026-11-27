@@ -19,3 +19,8 @@ export interface AdapterResolution {
   descriptor: AdapterDescriptor;
   implementation: "in-memory" | "local-sqlite" | "sql-first" | "placeholder";
 }
+
+export interface EmbeddingProvider {
+  readonly dimension: number;
+  embed(texts: readonly string[]): Promise<number[][]>;
+}

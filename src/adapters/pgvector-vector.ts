@@ -1,7 +1,8 @@
 import { StorageConsistencyError } from "../errors.js";
 import type { DistillationResult } from "../models.js";
-import type { MetadataBundle, VectorStore } from "../storage/types.js";
-import type { AdapterDescriptor, BackendAdapterConfig } from "./contracts.js";
+import type { Scope } from "../models.js";
+import type { MetadataBundle, VectorSearchHit, VectorStore } from "../storage/types.js";
+import type { AdapterDescriptor, BackendAdapterConfig, EmbeddingProvider } from "./contracts.js";
 import type {
   PostgresQueryResult,
   PostgresSqlClient,
@@ -12,6 +13,7 @@ export interface PgVectorStoreConfig extends BackendAdapterConfig {
   client?: PostgresSqlClient;
   schema?: string;
   embeddingDimension?: number;
+  embeddingProvider?: EmbeddingProvider;
 }
 
 export interface PgVectorTables {
@@ -73,18 +75,58 @@ export class PgVectorStore implements VectorStore {
   readonly embeddingDimension: number;
 
   private readonly client?: PostgresSqlClient;
+  private readonly embeddingProvider?: EmbeddingProvider;
 
   constructor(config: PgVectorStoreConfig) {
     this.schema = config.schema ?? "public";
     this.client = config.client;
     this.embeddingDimension = config.embeddingDimension ?? 1536;
+    if (
+      config.embeddingProvider &&
+      config.embeddingProvider.dimension !== this.embeddingDimension
+    ) {
+      throw new StorageConsistencyError(
+        `PgVector embeddingProvider dimension (${config.embeddingProvider.dimension}) does not match store embeddingDimension (${this.embeddingDimension})`,
+      );
+    }
+    this.embeddingProvider = config.embeddingProvider;
     this.tables = PGVECTOR_TABLES;
     this.descriptor = {
       kind: "vector",
       backend: config.backend,
       environment: config.environment,
-      capabilities: ["seed-sync", "seed-rebuild", "similarity-search", "schema-bootstrap"],
+      capabilities: [
+        "seed-sync",
+        "seed-rebuild",
+        "similarity-search",
+        "schema-bootstrap",
+        ...(this.embeddingProvider ? ["embedding-provider"] : []),
+      ],
     };
+  }
+
+  private formatVectorLiteral(vector: readonly number[]): string {
+    if (vector.length !== this.embeddingDimension) {
+      throw new StorageConsistencyError(
+        `Embedding vector dimension mismatch: expected ${this.embeddingDimension}, got ${vector.length}`,
+      );
+    }
+    return `[${vector.join(",")}]`;
+  }
+
+  private async embedDocuments(
+    documents: ReadonlyArray<{ content: string }>,
+  ): Promise<Array<string | null>> {
+    if (!this.embeddingProvider || documents.length === 0) {
+      return documents.map(() => null);
+    }
+    const vectors = await this.embeddingProvider.embed(documents.map((doc) => doc.content));
+    if (vectors.length !== documents.length) {
+      throw new StorageConsistencyError(
+        `EmbeddingProvider returned ${vectors.length} vectors for ${documents.length} documents`,
+      );
+    }
+    return vectors.map((vec) => this.formatVectorLiteral(vec));
   }
 
   getSchemaStatements(): string[] {
@@ -106,13 +148,15 @@ export class PgVectorStore implements VectorStore {
 
   async syncFromDistillation(result: DistillationResult): Promise<{ documentCount: number }> {
     const documents = this.buildSeedDocuments(result);
+    const embeddings = await this.embedDocuments(documents);
     await this.runInTransaction(async (client) => {
-      for (const document of documents) {
+      for (let i = 0; i < documents.length; i += 1) {
+        const document = documents[i];
         await this.queryWith(
           client,
           `insert into ${this.table(this.tables.seedDocuments)}
             (id, workspace_id, project_id, agent_id, source_type, content, embedding, payload)
-           values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+           values ($1, $2, $3, $4, $5, $6, $7::vector, $8::jsonb)
            on conflict (id) do update
            set workspace_id = excluded.workspace_id,
                project_id = excluded.project_id,
@@ -129,7 +173,7 @@ export class PgVectorStore implements VectorStore {
             document.scope.agentId,
             document.sourceType,
             document.content,
-            null,
+            embeddings[i],
             encodePayload(document),
           ],
           "syncFromDistillation",
@@ -141,13 +185,15 @@ export class PgVectorStore implements VectorStore {
 
   async rebuildFromBundle(bundle: MetadataBundle): Promise<{ documentCount: number }> {
     const documents = this.buildSeedDocumentsFromBundle(bundle);
+    const embeddings = await this.embedDocuments(documents);
     await this.runInTransaction(async (client) => {
-      for (const document of documents) {
+      for (let i = 0; i < documents.length; i += 1) {
+        const document = documents[i];
         await this.queryWith(
           client,
           `insert into ${this.table(this.tables.seedDocuments)}
             (id, workspace_id, project_id, agent_id, source_type, content, embedding, payload)
-           values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+           values ($1, $2, $3, $4, $5, $6, $7::vector, $8::jsonb)
            on conflict (id) do update
            set workspace_id = excluded.workspace_id,
                project_id = excluded.project_id,
@@ -164,7 +210,7 @@ export class PgVectorStore implements VectorStore {
             document.scope.agentId,
             document.sourceType,
             document.content,
-            null,
+            embeddings[i],
             encodePayload(document),
           ],
           "rebuildFromBundle",
@@ -172,6 +218,55 @@ export class PgVectorStore implements VectorStore {
       }
     });
     return { documentCount: documents.length };
+  }
+
+  async search(params: {
+    query: string;
+    scope?: Scope;
+    limit?: number;
+  }): Promise<VectorSearchHit[]> {
+    if (!this.embeddingProvider) {
+      return [];
+    }
+    const [queryVec] = await this.embeddingProvider.embed([params.query]);
+    if (!queryVec) {
+      return [];
+    }
+    const vectorLiteral = this.formatVectorLiteral(queryVec);
+    const limit = Math.max(1, params.limit ?? 10);
+    const whereScope = params.scope
+      ? "and workspace_id = $2 and project_id = $3 and agent_id = $4"
+      : "";
+    const queryParams: unknown[] = params.scope
+      ? [vectorLiteral, params.scope.workspaceId, params.scope.projectId, params.scope.agentId, limit]
+      : [vectorLiteral, limit];
+    const limitParam = params.scope ? "$5" : "$2";
+    const result = await this.query<{ id: string; source_type: string; score: number }>(
+      `select id, source_type, (1 - (embedding <=> $1::vector)) as score
+       from ${this.table(this.tables.seedDocuments)}
+       where embedding is not null ${whereScope}
+       order by embedding <=> $1::vector asc
+       limit ${limitParam}`,
+      queryParams,
+      "search",
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      sourceType: row.source_type,
+      score: typeof row.score === "number" ? row.score : Number(row.score ?? 0),
+    }));
+  }
+
+  async delete(ids: string[]): Promise<number> {
+    if (ids.length === 0) {
+      return 0;
+    }
+    const result = await this.query(
+      `delete from ${this.table(this.tables.seedDocuments)} where id = any($1::text[])`,
+      [ids],
+      "delete",
+    );
+    return result.rowCount ?? 0;
   }
 
   private buildSeedDocuments(result: DistillationResult): Array<{

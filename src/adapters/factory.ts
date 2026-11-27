@@ -61,6 +61,9 @@ export function createAdapterBundle(config: EngineConfig): AdapterBundle {
         ? new Neo4jGraphStore({
             backend: config.graphBackend,
             environment: config.environment,
+            client: config.neo4j?.client,
+            database: config.neo4j?.database,
+            namespace: config.neo4j?.namespace,
           })
         : new PlaceholderGraphStore({
             backend: config.graphBackend,
@@ -75,6 +78,10 @@ export function createAdapterBundle(config: EngineConfig): AdapterBundle {
         ? new PgVectorStore({
             backend: vectorBackend,
             environment: config.environment,
+            client: config.pgvector?.client ?? config.postgres?.client,
+            schema: config.pgvector?.schema ?? config.postgres?.schema,
+            embeddingDimension: config.pgvector?.embeddingDimension,
+            embeddingProvider: config.pgvector?.embeddingProvider,
           })
         : new PlaceholderVectorStore({
             backend: vectorBackend,

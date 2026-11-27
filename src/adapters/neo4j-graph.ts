@@ -174,6 +174,20 @@ export class Neo4jGraphStore implements GraphStore {
     return { nodeCount: nodes.length, edgeCount: edges.length };
   }
 
+  async delete(ids: string[]): Promise<number> {
+    if (ids.length === 0) {
+      return 0;
+    }
+    const result = await this.runInTransaction(async (transaction) =>
+      transaction.run<{ deletedCount?: number }>(
+        `MATCH (n) WHERE n.id IN $ids DETACH DELETE n RETURN count(n) AS deletedCount`,
+        { ids },
+      ),
+    );
+    const count = result.records[0]?.deletedCount;
+    return typeof count === "number" ? count : ids.length;
+  }
+
   private buildDocuments(result: DistillationResult): Neo4jGraphDocument[] {
     return [
       {

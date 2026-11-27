@@ -301,4 +301,58 @@ describe("PgVectorStore", () => {
 
     expect(bundle.resolutions[2]?.implementation).toBe("sql-first");
   });
+
+  it("generates embeddings via EmbeddingProvider, validates dimension, searches, and deletes", async () => {
+    const queries: Array<{ sql: string; params?: readonly unknown[] }> = [];
+    const client: PostgresSqlClient = {
+      async query<Row = Record<string, unknown>>(
+        sql: string,
+        params?: readonly unknown[],
+      ): Promise<PostgresQueryResult<Row>> {
+        queries.push({ sql, params });
+        if (sql.includes("order by embedding <=>")) {
+          return {
+            rows: [{ id: "atm_1", source_type: "atom", score: 0.94 } as Row],
+            rowCount: 1,
+          };
+        }
+        return { rows: [], rowCount: 1 };
+      },
+    };
+
+    expect(
+      () =>
+        new PgVectorStore({
+          backend: "pgvector",
+          environment: "service",
+          client,
+          embeddingDimension: 3,
+          embeddingProvider: {
+            dimension: 4,
+            embed: async () => [],
+          },
+        }),
+    ).toThrow("does not match store embeddingDimension");
+
+    const store = new PgVectorStore({
+      backend: "pgvector",
+      environment: "service",
+      client,
+      embeddingDimension: 3,
+      embeddingProvider: {
+        dimension: 3,
+        embed: async (texts) => texts.map(() => [0.1, 0.2, 0.3]),
+      },
+    });
+
+    await store.syncFromDistillation(makeDistillationResult());
+    const insert = queries.find((q) => q.sql.includes("insert into"));
+    expect(insert?.params?.[6]).toBe("[0.1,0.2,0.3]");
+
+    const hits = await store.search({ query: "async buffering", scope: makeScope(), limit: 5 });
+    expect(hits).toEqual([{ id: "atm_1", sourceType: "atom", score: 0.94 }]);
+
+    const deleted = await store.delete(["atm_1"]);
+    expect(deleted).toBe(1);
+  });
 });

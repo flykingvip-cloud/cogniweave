@@ -570,6 +570,25 @@ export class InMemoryGraphStore implements GraphStore {
       edgeCount: bundle.relations.length,
     };
   }
+
+  async delete(ids: string[]): Promise<number> {
+    if (ids.length === 0) {
+      return 0;
+    }
+    const idSet = new Set(ids);
+    let removed = 0;
+    for (const id of idSet) {
+      if (this.nodes.delete(id)) {
+        removed += 1;
+      }
+    }
+    for (const [edgeId, edge] of this.edges.entries()) {
+      if (idSet.has(edgeId) || idSet.has(edge.fromId) || idSet.has(edge.toId)) {
+        this.edges.delete(edgeId);
+      }
+    }
+    return removed;
+  }
 }
 
 export class InMemoryVectorStore implements VectorStore {

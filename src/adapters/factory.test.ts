@@ -48,4 +48,46 @@ describe("createAdapterBundle", () => {
       }),
     ).toThrow('metadataBackend "local" requires metadataStorePath');
   });
+
+  it("wires neo4j client, pgvector client fallback, and embeddingProvider", async () => {
+    const cypherCalls: string[] = [];
+    const pgCalls: string[] = [];
+
+    const bundle = createAdapterBundle({
+      environment: "service",
+      metadataBackend: "postgres",
+      postgres: {
+        client: {
+          async query(sql) {
+            pgCalls.push(sql);
+            return { rows: [], rowCount: 0 };
+          },
+        },
+      },
+      graphBackend: "neo4j",
+      neo4j: {
+        client: {
+          async run(cypher) {
+            cypherCalls.push(cypher);
+            return { records: [] };
+          },
+        },
+      },
+      evidenceBackend: "s3",
+      vectorBackend: "pgvector",
+      pgvector: {
+        embeddingDimension: 2,
+        embeddingProvider: {
+          dimension: 2,
+          embed: async (texts) => texts.map(() => [0.5, 0.5]),
+        },
+      },
+    });
+
+    await bundle.graphStore.delete?.(["atm_1"]);
+    await bundle.vectorStore.delete?.(["atm_1"]);
+
+    expect(cypherCalls[0]).toContain("DETACH DELETE");
+    expect(pgCalls[0]).toContain("delete from");
+  });
 });
