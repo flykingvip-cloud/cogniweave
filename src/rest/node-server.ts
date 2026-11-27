@@ -12,8 +12,15 @@ import type {
 } from "./contracts.js";
 import type { CogniWeaveRestService } from "./service.js";
 
+export interface CogniWeaveHttpAuthPrincipal {
+  tenantId: string;
+  userId: string;
+}
+
 export interface CogniWeaveHttpServerOptions {
   basePath?: string;
+  requireAuth?: boolean;
+  validateToken?: (token: string) => Promise<CogniWeaveHttpAuthPrincipal | null>;
 }
 
 export interface CogniWeaveRequestEnvelope {
@@ -95,6 +102,29 @@ async function routeEnvelope(
 
   const context = { headers: envelope.headers };
   const method = envelope.method.toUpperCase();
+
+  if (method === "GET" && pathname === "/healthz") {
+    return responseBody(200, { ok: true, service: "cogniweave" });
+  }
+  if (method === "GET" && pathname === "/v1/metrics") {
+    return responseBody(200, { ok: true, timestamp: new Date().toISOString() });
+  }
+
+  if (options?.requireAuth) {
+    const authHeader = envelope.headers.authorization;
+    const token = authHeader?.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : "";
+    if (!token || !options.validateToken) {
+      return responseBody(401, { error: "unauthorized" });
+    }
+    const principal = await options.validateToken(token);
+    if (!principal) {
+      return responseBody(401, { error: "invalid_token" });
+    }
+    const headerTenant = envelope.headers["x-cogniweave-tenant-id"];
+    if (headerTenant && headerTenant !== principal.tenantId) {
+      return responseBody(403, { error: "tenant_mismatch" });
+    }
+  }
 
   if (method === "POST" && pathname === "/v1/tasks/frame") {
     return service.handleFrameTask(parseBody<FrameTaskRequest>(envelope.body), context);

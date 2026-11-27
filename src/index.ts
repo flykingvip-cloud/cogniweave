@@ -428,6 +428,17 @@ export type { EmbeddingProvider } from "./adapters/contracts.js";
 export * from "./optimization/index.js";
 export * from "./governance/index.js";
 export * from "./resource/index.js";
+export {
+  FileDurableJobStore,
+  type DurableJobKind,
+  type DurableJobRecord,
+  type DurableJobStatus,
+  type DurableJobStore,
+} from "./jobs/durable-job-store.js";
+export {
+  HttpCloudIntelligenceClient,
+  type HttpCloudClientOptions,
+} from "./sync/http-cloud-client.js";
 
 export type {
   CliCommand,
