@@ -33,20 +33,65 @@ export function sameMemorySubject(a: MemorySubject, b: MemorySubject): boolean {
   return a.tenantId === b.tenantId && a.ownerType === b.ownerType && a.ownerId === b.ownerId;
 }
 
+export type DelegationRevalidationFailure =
+  | "missing_or_incomplete"
+  | "revoked"
+  | "expired_or_unparsable"
+  | "tenant_mismatch"
+  | "delegate_mismatch"
+  | "subject_mismatch"
+  | "scope_mismatch"
+  | "delegator_subject_mismatch";
+
+function isCompleteSubject(subject: MemorySubject | undefined): subject is MemorySubject {
+  return Boolean(subject?.tenantId?.trim() && subject.ownerId?.trim() && subject.ownerType);
+}
+
+/**
+ * Independent authorization-layer check of a Delegation Store return value.
+ * A non-empty row is not proof: every identifying field is re-validated here.
+ *
+ * Business relationship: the delegator must be the Memory Subject granting the
+ * actor permission to act for that same subject in the given tenant and scope.
+ * Illegal or unparsable expiry is denied (Date.parse NaN is not treated as live).
+ */
+export function revalidateDelegationRecord(
+  record: DelegationAuthorization | null | undefined,
+  query: ActiveDelegationQuery,
+): DelegationRevalidationFailure | null {
+  if (!record) return "missing_or_incomplete";
+  if (!record.id?.trim()) return "missing_or_incomplete";
+  if (!record.tenantId?.trim()) return "missing_or_incomplete";
+  if (!record.delegateActorId?.trim()) return "missing_or_incomplete";
+  if (!record.grantedAt?.trim() || !record.expiresAt?.trim()) return "missing_or_incomplete";
+  if (!isCompleteSubject(record.subject) || !isCompleteSubject(record.delegator)) {
+    return "missing_or_incomplete";
+  }
+  if (!record.scope) return "missing_or_incomplete";
+  if (record.revokedAt) return "revoked";
+  const expiresAtMs = Date.parse(record.expiresAt);
+  const nowMs = Date.parse(query.now);
+  if (!Number.isFinite(expiresAtMs) || !Number.isFinite(nowMs) || expiresAtMs <= nowMs) {
+    return "expired_or_unparsable";
+  }
+  if (record.tenantId !== query.tenantId) return "tenant_mismatch";
+  if (record.delegator.tenantId !== query.tenantId) return "tenant_mismatch";
+  if (record.delegateActorId !== query.actorUserId) return "delegate_mismatch";
+  if (!sameMemorySubject(record.subject, query.subject)) return "subject_mismatch";
+  // Delegator is the subject who grants the actor access; a mismatched
+  // delegator cannot authorize a different subject.
+  if (!sameMemorySubject(record.delegator, record.subject)) return "delegator_subject_mismatch";
+  if (computeScopeFingerprint(record.scope) !== computeScopeFingerprint(query.scope)) {
+    return "scope_mismatch";
+  }
+  return null;
+}
+
 export function isActiveDelegation(
   record: DelegationAuthorization,
   query: ActiveDelegationQuery,
 ): boolean {
-  if (record.revokedAt) return false;
-  if (Date.parse(record.expiresAt) <= Date.parse(query.now)) return false;
-  if (record.tenantId !== query.tenantId) return false;
-  if (record.delegateActorId !== query.actorUserId) return false;
-  if (!sameMemorySubject(record.subject, query.subject)) return false;
-  if (record.delegator.tenantId !== query.tenantId) return false;
-  if (computeScopeFingerprint(record.scope) !== computeScopeFingerprint(query.scope)) {
-    return false;
-  }
-  return true;
+  return revalidateDelegationRecord(record, query) === null;
 }
 
 /**

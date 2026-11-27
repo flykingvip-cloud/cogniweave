@@ -3,6 +3,7 @@ import {
   authorizeAtomBindings,
   authorizeTrustedExecution,
   type ExecutionAuthorizationDecision,
+  type TrustedAuthorizationAssembly,
   type TrustedExecutionAuthorizationOptions,
 } from "../auth/authorize.js";
 import type { DurableJobStore } from "../jobs/durable-job-store.js";
@@ -146,8 +147,13 @@ export async function runOptimizationJob(params: {
   optimizationType: OptimizationType;
   atoms: ReadonlyArray<MemoryAtom>;
   executionContext: OptimizationExecutionContext;
-  /** CW-09-02 trusted identity + delegation + binding query. Default is fail-closed. */
+  /** Request-level authorization options (bearer token, environment). Not a credential bag. */
   authorization?: TrustedExecutionAuthorizationOptions;
+  /**
+   * Trusted runtime assembly of Principal Provider, Binding Query, and
+   * Delegation Store. Required in service/cloud. Not a business-request field.
+   */
+  trustedServices?: TrustedAuthorizationAssembly;
   policyVersion?: string;
   pipelineVersion?: string;
   nowMs?: number;
@@ -169,6 +175,7 @@ export async function runOptimizationJob(params: {
   }
 
   const now = new Date(params.nowMs ?? Date.now()).toISOString();
+  const productionLike = (params.authorization?.environment ?? "service") !== "local";
   const authz = await authorizeTrustedExecution({
     request: {
       tenantId: params.tenantId,
@@ -180,7 +187,10 @@ export async function runOptimizationJob(params: {
       now,
     },
     authorization: params.authorization,
-    metadataStore: params.metadataStore,
+    trustedServices: params.trustedServices ?? params.authorization?.trustedServices,
+    // Production must not treat the job's data-plane metadataStore as a
+    // caller-substitutable Binding Query. Local/test may still use it.
+    ...(productionLike ? {} : { metadataStore: params.metadataStore }),
   });
   const authorizedCaller = authz.caller;
 

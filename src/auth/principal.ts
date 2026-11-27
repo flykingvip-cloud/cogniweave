@@ -32,13 +32,18 @@ export function isUsableTrustedPrincipal(
   principal: TrustedPrincipal | null | undefined,
 ): principal is TrustedPrincipal {
   if (!principal) return false;
-  return Boolean(
-    principal.tenantId.trim() &&
+  if (
+    !(
+      principal.tenantId.trim() &&
       principal.userId.trim() &&
       principal.subject.tenantId.trim() &&
       principal.subject.ownerId.trim() &&
-      principal.subject.ownerType,
-  );
+      principal.subject.ownerType
+    )
+  ) {
+    return false;
+  }
+  return principal.tenantId === principal.subject.tenantId;
 }
 
 /**

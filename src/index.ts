@@ -437,15 +437,18 @@ export type {
   ActiveDelegationQuery,
   DelegationAuthorization,
   DelegationAuthorizationStore,
+  DelegationRevalidationFailure,
 } from "./auth/delegation.js";
 export {
   createMemoryDelegationAuthorizationStore,
   isActiveDelegation,
+  revalidateDelegationRecord,
   sameMemorySubject,
 } from "./auth/delegation.js";
 
 export type {
   ExecutionAuthorizationDecision,
+  TrustedAuthorizationAssembly,
   TrustedExecutionAuthorizationOptions,
   TrustedExecutionAuthorizationSuccess,
   TrustedExecutionRequest,

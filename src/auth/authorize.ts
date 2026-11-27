@@ -10,7 +10,12 @@ import type { EngineEnvironment, MemorySubject, MemorySubjectBinding, Scope } fr
 import type { MetadataStore } from "../storage/types.js";
 import { authorizeMemoryAccess } from "../subject/binding.js";
 import type { AuthoritativeBindingQuery } from "./canonical-scope.js";
-import { sameMemorySubject, type DelegationAuthorization, type DelegationAuthorizationStore } from "./delegation.js";
+import {
+  revalidateDelegationRecord,
+  sameMemorySubject,
+  type DelegationAuthorization,
+  type DelegationAuthorizationStore,
+} from "./delegation.js";
 import {
   isUsableTrustedPrincipal,
   type TrustedPrincipal,
@@ -46,6 +51,18 @@ export type TrustedExecutionRequest = {
   traceId?: string;
 };
 
+/**
+ * Services assembled by the trusted runtime / OpenBot integration layer.
+ * In service/cloud these are the only accepted source of Principal Provider,
+ * Binding Query, and Delegation Store. They are not ordinary request fields.
+ */
+export type TrustedAuthorizationAssembly = {
+  principalProvider: TrustedPrincipalProvider;
+  bindingQuery?: AuthoritativeBindingQuery;
+  delegationStore?: DelegationAuthorizationStore;
+  metadataStore?: Pick<MetadataStore, "listMemorySubjectBindings">;
+};
+
 export type TrustedExecutionAuthorizationOptions = {
   /**
    * Production default is fail-closed. `false` is honored only for environment
@@ -53,9 +70,20 @@ export type TrustedExecutionAuthorizationOptions = {
    */
   requireAuth?: boolean;
   environment?: EngineEnvironment;
-  principal?: TrustedPrincipal;
-  principalProvider?: TrustedPrincipalProvider;
   bearerToken?: string;
+  /** Preferred production source of provider, binding query, and delegation store. */
+  trustedServices?: TrustedAuthorizationAssembly;
+  /**
+   * Direct principal injection. Honored only when environment is `"local"`
+   * and `allowInjectedPrincipal` is true. Not production evidence.
+   */
+  principal?: TrustedPrincipal;
+  allowInjectedPrincipal?: boolean;
+  /**
+   * Loose fields below are rejected in service/cloud. Use `trustedServices`.
+   * They remain available on the isolated local/test path only.
+   */
+  principalProvider?: TrustedPrincipalProvider;
   delegationStore?: DelegationAuthorizationStore;
   bindingQuery?: AuthoritativeBindingQuery;
 };
@@ -153,9 +181,25 @@ export function createAuthoritativeBindingQueryFromMetadataStore(
  *
  * Caller-declared `actorUserId`, `delegatedActorFor`, and `ctx.bindings` are never evidence.
  */
+function allowsLocalAuthorizationInjection(
+  authorization: TrustedExecutionAuthorizationOptions | undefined,
+  environment: EngineEnvironment,
+): boolean {
+  return environment === "local" && authorization?.allowInjectedPrincipal === true;
+}
+
 export async function authorizeTrustedExecution(input: {
   request: TrustedExecutionRequest;
   authorization?: TrustedExecutionAuthorizationOptions;
+  /**
+   * Trusted runtime assembly. In service/cloud this is the only accepted
+   * source of Principal Provider, Binding Query, and Delegation Store.
+   */
+  trustedServices?: TrustedAuthorizationAssembly;
+  /**
+   * Loose binding sources. Rejected in service/cloud; honored only on the
+   * isolated local/test path. Not production evidence.
+   */
   bindingQuery?: AuthoritativeBindingQuery;
   metadataStore?: Pick<MetadataStore, "listMemorySubjectBindings">;
 }): Promise<TrustedExecutionAuthorizationSuccess> {
@@ -164,6 +208,9 @@ export async function authorizeTrustedExecution(input: {
   const traceId = request.traceId ?? `auth_${randomUUID()}`;
   const requireAuth = resolveRequireAuth(input.authorization);
   const environment = input.authorization?.environment ?? (requireAuth ? "service" : "local");
+  const production = isProductionLikeEnvironment(environment);
+  const trustedServices = input.trustedServices ?? input.authorization?.trustedServices;
+  const localInjection = allowsLocalAuthorizationInjection(input.authorization, environment);
 
   const denyBase = {
     tenantId: request.tenantId,
@@ -175,30 +222,95 @@ export async function authorizeTrustedExecution(input: {
     subject: request.declaredCaller,
   };
 
+  if (production) {
+    if (input.authorization?.principal) {
+      const decision = buildDecision({
+        ...denyBase,
+        decision: "deny",
+        reason: "untrusted_principal_injection",
+      });
+      throw new PrincipalUnavailableError(
+        "Production execution does not accept a caller-declared Trusted Principal; resolve identity through a trusted Principal Provider",
+        decision,
+      );
+    }
+    if (input.authorization?.principalProvider) {
+      const decision = buildDecision({
+        ...denyBase,
+        decision: "deny",
+        reason: "untrusted_principal_provider",
+      });
+      throw new PrincipalUnavailableError(
+        "Production Principal Provider must be assembled on trustedServices, not as a loose request field",
+        decision,
+      );
+    }
+    if (input.authorization?.bindingQuery || input.bindingQuery) {
+      const decision = buildDecision({
+        ...denyBase,
+        decision: "deny",
+        reason: "untrusted_binding_query",
+      });
+      throw new BindingStoreUnavailableError(
+        "Production Binding Query must be assembled on trustedServices, not substituted by a request argument",
+        decision,
+      );
+    }
+    if (input.authorization?.delegationStore) {
+      const decision = buildDecision({
+        ...denyBase,
+        decision: "deny",
+        reason: "untrusted_delegation_store",
+      });
+      throw new DelegationStoreUnavailableError(
+        "Production Delegation Store must be assembled on trustedServices, not substituted by a request argument",
+        decision,
+      );
+    }
+  }
+
   let principal: TrustedPrincipal | undefined;
   if (requireAuth) {
-    if (input.authorization?.principal && isUsableTrustedPrincipal(input.authorization.principal)) {
+    if (localInjection && isUsableTrustedPrincipal(input.authorization?.principal)) {
       principal = input.authorization.principal;
-    } else if (input.authorization?.principalProvider) {
-      try {
-        const resolved = await input.authorization.principalProvider.resolvePrincipal({
-          bearerToken: input.authorization.bearerToken,
-          environment,
-        });
-        if (isUsableTrustedPrincipal(resolved)) {
-          principal = resolved;
+    } else {
+      const provider = production
+        ? trustedServices?.principalProvider
+        : (trustedServices?.principalProvider ?? input.authorization?.principalProvider);
+      if (provider) {
+        try {
+          const resolved = await provider.resolvePrincipal({
+            bearerToken: input.authorization?.bearerToken,
+            environment,
+          });
+          if (isUsableTrustedPrincipal(resolved)) {
+            principal = resolved;
+          }
+        } catch (error) {
+          const decision = buildDecision({
+            ...denyBase,
+            decision: "deny",
+            reason: "principal_unavailable",
+          });
+          throw new PrincipalUnavailableError(
+            error instanceof Error ? error.message : "Trusted principal provider failed",
+            decision,
+          );
         }
-      } catch (error) {
-        const decision = buildDecision({
-          ...denyBase,
-          decision: "deny",
-          reason: "principal_unavailable",
-        });
-        throw new PrincipalUnavailableError(
-          error instanceof Error ? error.message : "Trusted principal provider failed",
-          decision,
-        );
       }
+    }
+    if (principal && principal.tenantId !== principal.subject.tenantId) {
+      const decision = buildDecision({
+        ...denyBase,
+        actorUserId: principal.userId,
+        principalTokenId: principal.tokenId,
+        decision: "deny",
+        reason: "tenant_mismatch",
+      });
+      throw new PrincipalUnavailableError(
+        "Trusted principal tenant must equal subject tenant",
+        decision,
+      );
     }
     if (!principal) {
       const decision = buildDecision({
@@ -326,7 +438,10 @@ export async function authorizeTrustedExecution(input: {
 
   let delegation: DelegationAuthorization | undefined;
   if (needsDelegation) {
-    if (!input.authorization?.delegationStore) {
+    const delegationStore = production
+      ? trustedServices?.delegationStore
+      : (trustedServices?.delegationStore ?? input.authorization?.delegationStore);
+    if (!delegationStore) {
       const decision = buildDecision({
         ...denyBase,
         actorUserId,
@@ -342,14 +457,15 @@ export async function authorizeTrustedExecution(input: {
       );
     }
     let active: DelegationAuthorization | null;
+    const delegationQuery = {
+      tenantId: request.tenantId,
+      actorUserId,
+      subject: caller,
+      scope: request.scope,
+      now,
+    };
     try {
-      active = await input.authorization.delegationStore.getActiveDelegation({
-        tenantId: request.tenantId,
-        actorUserId,
-        subject: caller,
-        scope: request.scope,
-        now,
-      });
+      active = await delegationStore.getActiveDelegation(delegationQuery);
     } catch (error) {
       const decision = buildDecision({
         ...denyBase,
@@ -380,15 +496,39 @@ export async function authorizeTrustedExecution(input: {
         decision,
       );
     }
+    const revalidation = revalidateDelegationRecord(active, delegationQuery);
+    if (revalidation) {
+      const decision = buildDecision({
+        ...denyBase,
+        actorUserId,
+        caller,
+        subject: jobSubject,
+        principalTokenId: principal?.tokenId,
+        decision: "deny",
+        reason: `delegation_${revalidation}`,
+      });
+      throw new DelegationDeniedError(
+        `Delegation store record failed independent re-validation (${revalidation})`,
+        decision,
+      );
+    }
     delegation = active;
   }
 
-  const bindingQuery =
-    input.bindingQuery ??
-    input.authorization?.bindingQuery ??
-    (input.metadataStore
-      ? createAuthoritativeBindingQueryFromMetadataStore(input.metadataStore)
-      : undefined);
+  const bindingQuery = production
+    ? (trustedServices?.bindingQuery ??
+      (trustedServices?.metadataStore
+        ? createAuthoritativeBindingQueryFromMetadataStore(trustedServices.metadataStore)
+        : undefined))
+    : (trustedServices?.bindingQuery ??
+      input.authorization?.bindingQuery ??
+      input.bindingQuery ??
+      (trustedServices?.metadataStore
+        ? createAuthoritativeBindingQueryFromMetadataStore(trustedServices.metadataStore)
+        : undefined) ??
+      (input.metadataStore
+        ? createAuthoritativeBindingQueryFromMetadataStore(input.metadataStore)
+        : undefined));
 
   if (!bindingQuery) {
     const decision = buildDecision({
@@ -411,7 +551,7 @@ export async function authorizeTrustedExecution(input: {
   let bindings: MemorySubjectBinding[];
   try {
     bindings = await bindingQuery.listLiveBindings({
-      tenantId: request.tenantId,
+      tenantId: principal?.tenantId ?? request.tenantId,
       dataPlaneId: request.dataPlaneId,
       scope: request.scope,
       scopeFingerprint: computeScopeFingerprint(request.scope),

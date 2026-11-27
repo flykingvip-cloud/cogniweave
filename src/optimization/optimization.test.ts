@@ -2,8 +2,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import type { TrustedAuthorizationAssembly } from "../auth/authorize.js";
 import { createMemoryDelegationAuthorizationStore } from "../auth/delegation.js";
-import type { TrustedPrincipal } from "../auth/principal.js";
+import { createDenyByDefaultPrincipalProvider, type TrustedPrincipal } from "../auth/principal.js";
 import {
   BindingStoreUnavailableError,
   DelegationDeniedError,
@@ -51,6 +52,22 @@ const SELF_PRINCIPAL: TrustedPrincipal = {
   subject: CALLER,
   tokenId: "tok_agent_main",
 };
+
+const TEST_TOKEN = "tok";
+
+function serviceJobAuth(
+  principal: TrustedPrincipal,
+  extras: Omit<Partial<TrustedAuthorizationAssembly>, "principalProvider"> = {},
+) {
+  return {
+    authorization: { environment: "service" as const, bearerToken: TEST_TOKEN },
+    trustedServices: {
+      principalProvider: createDenyByDefaultPrincipalProvider([{ token: TEST_TOKEN, principal }]),
+      ...extras,
+    },
+  };
+}
+
 
 function makeAtom(overrides: Partial<MemoryAtom> & { id: string }): MemoryAtom {
   return {
@@ -290,7 +307,7 @@ describe("Memory Optimization Engine (CW-04J)", () => {
             caller: CALLER,
             dataPlaneId: "dp_1",
           },
-          authorization: { environment: "service", principal: SELF_PRINCIPAL },
+          ...serviceJobAuth(SELF_PRINCIPAL, { metadataStore }),
           jobStore,
           metadataStore,
         }),
@@ -310,7 +327,7 @@ describe("Memory Optimization Engine (CW-04J)", () => {
           caller: CALLER,
           dataPlaneId: "dp_1",
         },
-        authorization: { environment: "service", principal: SELF_PRINCIPAL },
+        ...serviceJobAuth(SELF_PRINCIPAL, { metadataStore }),
         jobStore,
         metadataStore,
         graphStore: new InMemoryGraphStore(),
@@ -340,7 +357,7 @@ describe("Memory Optimization Engine (CW-04J)", () => {
             bindings: [binding],
             dataPlaneId: "dp_1",
           },
-          authorization: { environment: "service", principal: SELF_PRINCIPAL },
+          ...serviceJobAuth(SELF_PRINCIPAL, { metadataStore }),
           jobStore,
           metadataStore,
         }),
@@ -400,7 +417,7 @@ describe("CW-09-02 runOptimizationJob trusted identity (unit)", () => {
           delegatedActorFor: ["agent_main"],
           dataPlaneId: "dp_1",
         },
-        authorization: { environment: "service", principal: actorPrincipal },
+        ...serviceJobAuth(actorPrincipal, { metadataStore }),
         metadataStore,
       }),
     ).rejects.toBeInstanceOf(DelegationStoreUnavailableError);
@@ -441,7 +458,7 @@ describe("CW-09-02 runOptimizationJob trusted identity (unit)", () => {
         bindings: [],
         dataPlaneId: "dp_1",
       },
-      authorization: { environment: "service", principal: actorPrincipal, delegationStore },
+      ...serviceJobAuth(actorPrincipal, { metadataStore, delegationStore }),
       metadataStore,
       graphStore: new InMemoryGraphStore(),
       vectorStore: new InMemoryVectorStore(),
@@ -485,7 +502,7 @@ describe("CW-09-02 runOptimizationJob trusted identity (unit)", () => {
           bindings: [forged],
           dataPlaneId: "dp_1",
         },
-        authorization: { environment: "service", principal: SELF_PRINCIPAL },
+        ...serviceJobAuth(SELF_PRINCIPAL, { metadataStore }),
         metadataStore,
       }),
     ).rejects.toBeInstanceOf(DelegationDeniedError);
@@ -533,8 +550,74 @@ describe("CW-09-02 runOptimizationJob trusted identity (unit)", () => {
           ],
           dataPlaneId: "dp_1",
         },
-        authorization: { environment: "service", principal: SELF_PRINCIPAL },
+        ...serviceJobAuth(SELF_PRINCIPAL, { metadataStore: storeWithoutBindings }),
         metadataStore: storeWithoutBindings,
+      }),
+    ).rejects.toBeInstanceOf(BindingStoreUnavailableError);
+  });
+});
+
+describe("CW-09-02-R1 runOptimizationJob production injection (unit)", () => {
+  it("denies a self-declared principal and a forged Binding Query in service/cloud", async () => {
+    const a1 = makeAtom({ id: "atm_1", dedupKey: "k1" });
+    await expect(
+      runOptimizationJob({
+        tenantId: "__local__",
+        subjectId: "agent_main",
+        scope: SCOPE,
+        optimizationType: "consolidation",
+        atoms: [a1],
+        executionContext: {
+          actorUserId: "agent_main",
+          tenantId: "__local__",
+          scope: SCOPE,
+          caller: CALLER,
+          dataPlaneId: "dp_1",
+        },
+        authorization: {
+          environment: "service",
+          principal: SELF_PRINCIPAL,
+        },
+      }),
+    ).rejects.toBeInstanceOf(PrincipalUnavailableError);
+
+    const forgedStore = new InMemoryMetadataStore();
+    await forgedStore.saveMemorySubjectBinding(
+      createMemorySubjectBinding({
+        partition: PARTITION,
+        scope: SCOPE,
+        subject: CALLER,
+      }),
+    );
+    await expect(
+      runOptimizationJob({
+        tenantId: "__local__",
+        subjectId: "agent_main",
+        scope: SCOPE,
+        optimizationType: "consolidation",
+        atoms: [a1],
+        executionContext: {
+          actorUserId: "agent_main",
+          tenantId: "__local__",
+          scope: SCOPE,
+          caller: CALLER,
+          dataPlaneId: "dp_1",
+        },
+        authorization: {
+          environment: "cloud",
+          bearerToken: TEST_TOKEN,
+          bindingQuery: {
+            async listLiveBindings() {
+              return forgedStore.listMemorySubjectBindings!({ liveOnly: true });
+            },
+          },
+        },
+        trustedServices: {
+          principalProvider: createDenyByDefaultPrincipalProvider([
+            { token: TEST_TOKEN, principal: SELF_PRINCIPAL },
+          ]),
+        },
+        metadataStore: forgedStore,
       }),
     ).rejects.toBeInstanceOf(BindingStoreUnavailableError);
   });
