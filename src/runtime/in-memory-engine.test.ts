@@ -364,7 +364,7 @@ describe("InMemoryCogniWeaveEngine", () => {
     const journalBefore = await engine.getWriteJournal(writeResult.journalId, scope);
     expect(journalBefore.status).toBe("DERIVED_OUT_OF_SYNC");
 
-    const repair = await engine.repairIndexes({ journalId: writeResult.journalId });
+    const repair = await engine.repairIndexes({ journalId: writeResult.journalId, scope });
     expect(repair.status).toBe("SYNCED");
     expect(repair.repairedCount).toBe(1);
 

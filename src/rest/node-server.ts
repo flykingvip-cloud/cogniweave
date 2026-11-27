@@ -1,5 +1,14 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { CogniWeaveMemoryResourceAdapter } from "../resource/index.js";
+import {
+  authorizeCanonicalResource,
+  isRebuildObjectType,
+  type AuthoritativeBindingQuery,
+  type CanonicalResourceKind,
+  type CanonicalResourceScope,
+  type CanonicalResourceScopeResolver,
+} from "../auth/canonical-scope.js";
+import { ScopeViolationError, StoreUnavailableError } from "../errors.js";
+import type { CogniWeaveMemoryResourceAdapter, MemoryResourceDescriptor } from "../resource/index.js";
 import type {
   DistillRequest,
   FrameTaskRequest,
@@ -26,6 +35,13 @@ export interface CogniWeaveHttpServerOptions {
   authorizeTenantScope?: (principal: RestPrincipal, workspaceId: string) => Promise<boolean> | boolean;
   /** Optional Memory Resource Adapter to expose /v1/memory-resources/* HTTP routes. */
   resourceAdapter?: CogniWeaveMemoryResourceAdapter;
+  /** CW-09-01: required in service/cloud for Subject Binding intersection. Missing => 503. */
+  authoritativeBindingQuery?: AuthoritativeBindingQuery;
+  ensureDataPlaneId?: () => Promise<string>;
+  knowledgePolicyAllows?: (params: {
+    principal: RestPrincipal;
+    resolved: CanonicalResourceScope;
+  }) => Promise<boolean> | boolean;
 }
 
 export interface CogniWeaveRequestEnvelope {
@@ -34,6 +50,39 @@ export interface CogniWeaveRequestEnvelope {
   headers: RestHeaders;
   body?: string;
 }
+
+export const RESOURCE_ID_ROUTE_REGISTRY = [
+  { name: "atom.trace", method: "GET", pathTemplate: "/v1/atoms/:id/trace", kind: "atom" },
+  { name: "atom.evidence-refs", method: "GET", pathTemplate: "/v1/atoms/:id/evidence-refs", kind: "atom" },
+  { name: "package.trace", method: "GET", pathTemplate: "/v1/packages/:id/trace", kind: "package" },
+  {
+    name: "reasoning-session.trace",
+    method: "GET",
+    pathTemplate: "/v1/reasoning-sessions/:id/trace",
+    kind: "session",
+  },
+  { name: "journal.get", method: "GET", pathTemplate: "/v1/journals/:id", kind: "journal" },
+  {
+    name: "rebuild.from-truth",
+    method: "POST",
+    pathTemplate: "/v1/rebuild/from-truth",
+    kind: "rebuild",
+  },
+  {
+    name: "memory-resource.get",
+    method: "GET",
+    pathTemplate: "/v1/memory-resources/:id",
+    kind: "memory_resource",
+  },
+  {
+    name: "memory-resource.revoke",
+    method: "POST",
+    pathTemplate: "/v1/memory-resources/:id/revoke",
+    kind: "memory_resource",
+  },
+] as const;
+
+export type ResourceIdRouteName = (typeof RESOURCE_ID_ROUTE_REGISTRY)[number]["name"];
 
 const metrics = {
   requestsTotal: 0,
@@ -87,7 +136,38 @@ function stripBasePath(pathname: string, basePath: string): string | null {
   return next.startsWith("/") ? next : `/${next}`;
 }
 
-async function routeEnvelope(
+function mapAuthorizationThrownError(error: unknown): RestResponse<unknown> | null {
+  if (error instanceof ScopeViolationError) {
+    return responseBody(404, { error: "not_found" });
+  }
+  if (error instanceof StoreUnavailableError) {
+    return responseBody(503, { error: "store_unavailable" });
+  }
+  return null;
+}
+
+function toMemoryResourceScope(
+  id: string,
+  desc: MemoryResourceDescriptor | undefined,
+): CanonicalResourceScope {
+  if (!desc) {
+    return { found: false, kind: "memory_resource", id, unresolvedReason: "not_found" };
+  }
+  return {
+    found: true,
+    kind: "memory_resource",
+    id,
+    scope: desc.scope,
+    tenantId: desc.tenantId,
+    owner: { ownerType: desc.ownerType, ownerId: desc.ownerId },
+    privacyLevel: desc.privacyLevel,
+    lifecycleStatus: desc.lifecycleStatus,
+    subjectBindingId: desc.subjectBindingId,
+    retrievable: desc.lifecycleStatus === "active",
+  };
+}
+
+async function routeEnvelopeInner(
   service: CogniWeaveRestService,
   envelope: CogniWeaveRequestEnvelope,
   options?: CogniWeaveHttpServerOptions,
@@ -107,8 +187,9 @@ async function routeEnvelope(
     return responseBody(200, { ok: true, service: "cogniweave" });
   }
 
-  const env = (service as unknown as { engine?: { config?: { environment?: string } } }).engine?.config?.environment;
-  const requireAuth = options?.requireAuth ?? (env !== "local");
+  const env = (service as unknown as { engine?: { config?: { environment?: string } } }).engine?.config
+    ?.environment;
+  const requireAuth = options?.requireAuth ?? env !== "local";
 
   let principal: RestPrincipal | undefined;
   if (requireAuth) {
@@ -134,7 +215,9 @@ async function routeEnvelope(
   const context: RestContext = {
     headers: {
       ...envelope.headers,
-      ...(principal ? { "x-cogniweave-tenant-id": principal.tenantId, "x-cogniweave-user-id": principal.userId } : {}),
+      ...(principal
+        ? { "x-cogniweave-tenant-id": principal.tenantId, "x-cogniweave-user-id": principal.userId }
+        : {}),
     },
     ...(principal ? { principal } : {}),
   };
@@ -147,90 +230,110 @@ async function routeEnvelope(
     });
   }
 
-  // CW-08-01: Mandatory unified resource/workspace authorization.
-  // Never allows missing workspaceId, never compares workspaceId === tenantId, and never lets tenant_admin bypass.
-  const authorizeRequestResource = async (workspaceId?: string): Promise<RestResponse<unknown> | null> => {
+  const workspaceAllowed = async (workspaceId: string): Promise<boolean> => {
+    if (!principal) return false;
+    if (options?.authorizeTenantScope) {
+      return Boolean(await options.authorizeTenantScope(principal, workspaceId));
+    }
+    return Boolean(principal.allowedWorkspaceIds?.includes(workspaceId));
+  };
+
+  // CW-09-01: declared scope only. Never fall back to request headers.
+  const authorizeDeclaredWorkspace = async (
+    workspaceId?: string,
+  ): Promise<RestResponse<unknown> | null> => {
     if (!requireAuth) return null;
     if (!principal) {
       return responseBody(401, { error: "unauthorized" });
     }
-    const targetWs = (workspaceId ?? envelope.headers["x-cogniweave-workspace-id"] ?? "").trim();
+    const targetWs = (workspaceId ?? "").trim();
     if (!targetWs) {
       metrics.unauthorizedTotal += 1;
       return responseBody(403, { error: "missing_workspace_scope" });
     }
-    if (options?.authorizeTenantScope) {
-      const ok = await options.authorizeTenantScope(principal, targetWs);
-      if (!ok) {
-        metrics.unauthorizedTotal += 1;
-        return responseBody(403, { error: "scope_tenant_forbidden" });
-      }
-      return null;
+    if (!(await workspaceAllowed(targetWs))) {
+      metrics.unauthorizedTotal += 1;
+      return responseBody(403, { error: "scope_tenant_forbidden" });
     }
-    if (principal.allowedWorkspaceIds?.includes(targetWs)) {
-      return null;
-    }
-    metrics.unauthorizedTotal += 1;
-    return responseBody(403, { error: "scope_tenant_forbidden" });
+    return null;
   };
 
-  const resolveScopeWorkspaceForResource = async (
-    kind: "atom" | "package" | "session" | "journal",
+  const engineResolver: CanonicalResourceScopeResolver = {
+    resolve: (kind, id) => service.resolveCanonicalResourceScope(kind, id),
+  };
+
+  const memoryResourceResolver = (id: string): CanonicalResourceScopeResolver => ({
+    async resolve() {
+      if (!options?.resourceAdapter) {
+        return { found: false, kind: "memory_resource", id, unresolvedReason: "not_found" };
+      }
+      try {
+        const desc = await options.resourceAdapter.describeResource(id);
+        return toMemoryResourceScope(id, desc);
+      } catch {
+        return { found: false, kind: "memory_resource", id, unresolvedReason: "store_unavailable" };
+      }
+    },
+  });
+
+  const authorizeCanonical = async (
+    kind: CanonicalResourceKind,
     id: string,
-  ): Promise<{ found: boolean; workspaceId?: string }> => {
-    try {
-      if (kind === "atom") {
-        const t = await service.trace(id);
-        return { found: true, workspaceId: t.atom.scope.workspaceId };
-      }
-      if (kind === "package") {
-        const p = await service.tracePackage(id);
-        return { found: true, workspaceId: p.taskFrame?.scope.workspaceId };
-      }
-      if (kind === "session") {
-        const s = await service.traceReasoningSession(id);
-        return { found: true, workspaceId: s.taskFrame?.scope.workspaceId };
-      }
-      const j = await service.getWriteJournal(id);
-      return { found: true, workspaceId: j.objectIds ? envelope.headers["x-cogniweave-workspace-id"] : undefined };
-    } catch {
-      return { found: false };
+    mode: "read" | "manage" = "read",
+  ): Promise<RestResponse<unknown> | null> => {
+    if (!requireAuth) return null;
+    const decision = await authorizeCanonicalResource({
+      kind,
+      id,
+      principal,
+      mode,
+      resolver: kind === "memory_resource" ? memoryResourceResolver(id) : engineResolver,
+      authorizeWorkspace: workspaceAllowed,
+      bindingQuery: options?.authoritativeBindingQuery,
+      ensureDataPlaneId: options?.ensureDataPlaneId,
+      knowledgePolicyAllows: options?.knowledgePolicyAllows,
+    });
+    if (!decision.allowed) {
+      metrics.unauthorizedTotal += 1;
+      return responseBody(decision.httpStatus, { error: decision.error });
     }
+    context.authorizedScope = decision.scope;
+    return null;
   };
 
   if (method === "POST" && pathname === "/v1/tasks/frame") {
     const body = parseBody<FrameTaskRequest>(envelope.body);
-    const denied = await authorizeRequestResource(body.scope?.workspaceId);
+    const denied = await authorizeDeclaredWorkspace(body.scope?.workspaceId);
     if (denied) return denied;
     return service.handleFrameTask(body, context);
   }
   if (method === "POST" && pathname === "/v1/reason") {
     const body = parseBody<ReasonRequest>(envelope.body);
-    const denied = await authorizeRequestResource(body.taskFrame?.scope?.workspaceId);
+    const denied = await authorizeDeclaredWorkspace(body.taskFrame?.scope?.workspaceId);
     if (denied) return denied;
     return service.handleReason(body, context);
   }
   if (method === "POST" && pathname === "/v1/reason/debug") {
     const body = parseBody<ReasonRequest>(envelope.body);
-    const denied = await authorizeRequestResource(body.taskFrame?.scope?.workspaceId);
+    const denied = await authorizeDeclaredWorkspace(body.taskFrame?.scope?.workspaceId);
     if (denied) return denied;
     return service.handleReasonDebug(body, context);
   }
   if (method === "POST" && pathname === "/v1/ingest") {
     const body = parseBody<DistillRequest>(envelope.body);
-    const denied = await authorizeRequestResource(body.scope?.workspaceId);
+    const denied = await authorizeDeclaredWorkspace(body.scope?.workspaceId);
     if (denied) return denied;
     return service.handleIngest(body, context);
   }
   if (method === "POST" && pathname === "/v1/distill") {
     const body = parseBody<DistillRequest>(envelope.body);
-    const denied = await authorizeRequestResource(body.scope?.workspaceId);
+    const denied = await authorizeDeclaredWorkspace(body.scope?.workspaceId);
     if (denied) return denied;
     return service.handleDistill(body, context);
   }
   if (method === "POST" && pathname === "/v1/write-back") {
     const body = parseBody<WriteBackRequest>(envelope.body);
-    const denied = await authorizeRequestResource(body.scope?.workspaceId);
+    const denied = await authorizeDeclaredWorkspace(body.scope?.workspaceId);
     if (denied) return denied;
     return service.handleWriteBack(body, context);
   }
@@ -238,33 +341,38 @@ async function routeEnvelope(
   // CW-06 Memory Resource HTTP routes
   if (options?.resourceAdapter) {
     if (method === "GET" && pathname === "/v1/memory-resources") {
-      const denied = await authorizeRequestResource(envelope.headers["x-cogniweave-workspace-id"]);
+      const declaredWorkspace = (envelope.headers["x-cogniweave-workspace-id"] ?? "").trim();
+      const denied = await authorizeDeclaredWorkspace(declaredWorkspace);
       if (denied) return denied;
-      return responseBody(200, await options.resourceAdapter.listResources(principal?.tenantId));
+      const listed = await options.resourceAdapter.listResources(principal?.tenantId);
+      return responseBody(
+        200,
+        declaredWorkspace
+          ? listed.filter((desc) => desc.scope.workspaceId === declaredWorkspace)
+          : listed,
+      );
     }
     const resMatch = pathname.match(/^\/v1\/memory-resources\/([^/]+)$/);
     if (method === "GET" && resMatch) {
-      const desc = await options.resourceAdapter.describeResource(resMatch[1]);
-      if (!desc || (principal && desc.tenantId !== principal.tenantId)) {
-        return responseBody(404, { error: "resource_not_found" });
-      }
-      const denied = await authorizeRequestResource(desc.scope.workspaceId);
+      const denied = await authorizeCanonical("memory_resource", resMatch[1], "read");
       if (denied) return denied;
+      const desc = await options.resourceAdapter.describeResource(resMatch[1]);
+      if (!desc) return responseBody(404, { error: "not_found" });
       return responseBody(200, desc);
     }
     const revokeMatch = pathname.match(/^\/v1\/memory-resources\/([^/]+)\/revoke$/);
     if (method === "POST" && revokeMatch) {
-      const desc = await options.resourceAdapter.describeResource(revokeMatch[1]);
-      if (!desc || (principal && desc.tenantId !== principal.tenantId)) {
-        return responseBody(404, { error: "resource_not_found" });
-      }
-      const denied = await authorizeRequestResource(desc.scope.workspaceId);
+      const denied = await authorizeCanonical("memory_resource", revokeMatch[1], "manage");
       if (denied) return denied;
+      const desc = await options.resourceAdapter.describeResource(revokeMatch[1]);
+      if (!desc) return responseBody(404, { error: "not_found" });
       if (!principal) {
         return responseBody(401, { error: "unauthorized" });
       }
       if (!options.resourceAdapter.authorizeResourceManagement(desc, principal)) {
         metrics.unauthorizedTotal += 1;
+        // After authoritative lookup, management ACL denial still uses 403 (not enumeration of existence).
+        // Cross-tenant already mapped to 404 by the canonical gate.
         return responseBody(403, { error: "resource_management_forbidden" });
       }
       return responseBody(200, await options.resourceAdapter.revokeAccess(revokeMatch[1], principal));
@@ -273,83 +381,81 @@ async function routeEnvelope(
 
   const traceAtomMatch = pathname.match(/^\/v1\/atoms\/([^/]+)\/trace$/);
   if (method === "GET" && traceAtomMatch) {
-    if (requireAuth) {
-      const resolved = await resolveScopeWorkspaceForResource("atom", traceAtomMatch[1]);
-      if (!resolved.found) return responseBody(404, { error: "not_found" });
-      const denied = await authorizeRequestResource(resolved.workspaceId);
-      if (denied) return denied;
-    }
+    const denied = await authorizeCanonical("atom", traceAtomMatch[1]);
+    if (denied) return denied;
     return service.handleTraceAtom(traceAtomMatch[1], context);
   }
 
   const evidenceRefsMatch = pathname.match(/^\/v1\/atoms\/([^/]+)\/evidence-refs$/);
   if (method === "GET" && evidenceRefsMatch) {
-    if (requireAuth) {
-      const resolved = await resolveScopeWorkspaceForResource("atom", evidenceRefsMatch[1]);
-      if (!resolved.found) return responseBody(404, { error: "not_found" });
-      const denied = await authorizeRequestResource(resolved.workspaceId);
-      if (denied) return denied;
-    }
+    const denied = await authorizeCanonical("atom", evidenceRefsMatch[1]);
+    if (denied) return denied;
     return service.handleGetEvidenceRefs(evidenceRefsMatch[1], context);
   }
 
   const packageTraceMatch = pathname.match(/^\/v1\/packages\/([^/]+)\/trace$/);
   if (method === "GET" && packageTraceMatch) {
-    if (requireAuth) {
-      const resolved = await resolveScopeWorkspaceForResource("package", packageTraceMatch[1]);
-      if (!resolved.found) return responseBody(404, { error: "not_found" });
-      const denied = await authorizeRequestResource(resolved.workspaceId);
-      if (denied) return denied;
-    }
+    const denied = await authorizeCanonical("package", packageTraceMatch[1]);
+    if (denied) return denied;
     return service.handleTracePackage(packageTraceMatch[1], context);
   }
 
   const reasoningSessionTraceMatch = pathname.match(/^\/v1\/reasoning-sessions\/([^/]+)\/trace$/);
   if (method === "GET" && reasoningSessionTraceMatch) {
-    if (requireAuth) {
-      const resolved = await resolveScopeWorkspaceForResource("session", reasoningSessionTraceMatch[1]);
-      if (!resolved.found) return responseBody(404, { error: "not_found" });
-      const denied = await authorizeRequestResource(resolved.workspaceId);
-      if (denied) return denied;
-    }
+    const denied = await authorizeCanonical("session", reasoningSessionTraceMatch[1]);
+    if (denied) return denied;
     return service.handleTraceReasoningSession(reasoningSessionTraceMatch[1], context);
   }
 
   if (method === "POST" && pathname === "/v1/evidence/resolve") {
     const body = parseBody<ResolveEvidenceRequest>(envelope.body);
-    const denied = await authorizeRequestResource(body.scope?.workspaceId);
+    const denied = await authorizeDeclaredWorkspace(body.scope?.workspaceId);
     if (denied) return denied;
     return service.handleResolveEvidence(body, context);
   }
   if (method === "POST" && pathname === "/v1/repair/indexes") {
     const body = parseBody<RepairIndexesRequest>(envelope.body);
-    const denied = await authorizeRequestResource(body.scope?.workspaceId);
+    const denied = await authorizeDeclaredWorkspace(body.scope?.workspaceId);
     if (denied) return denied;
     return service.handleRepairIndexes(body, context);
   }
   if (method === "POST" && pathname === "/v1/rebuild/from-truth") {
     const body = parseBody<RebuildFromTruthRequest>(envelope.body);
-    const denied = await authorizeRequestResource(
-      body.objectType === "atom"
-        ? (await resolveScopeWorkspaceForResource("atom", body.objectId)).workspaceId
-        : undefined,
-    );
-    if (denied) return denied;
+    if (requireAuth && !isRebuildObjectType(body.objectType ?? "")) {
+      return responseBody(404, { error: "not_found" });
+    }
+    if (requireAuth) {
+      const denied = await authorizeCanonical(body.objectType as CanonicalResourceKind, body.objectId);
+      if (denied) return denied;
+    }
     return service.handleRebuildFromTruth(body, context);
   }
 
   const journalMatch = pathname.match(/^\/v1\/journals\/([^/]+)$/);
   if (method === "GET" && journalMatch) {
-    if (requireAuth) {
-      const resolved = await resolveScopeWorkspaceForResource("journal", journalMatch[1]);
-      if (!resolved.found) return responseBody(404, { error: "not_found" });
-      const denied = await authorizeRequestResource(resolved.workspaceId);
-      if (denied) return denied;
-    }
+    const denied = await authorizeCanonical("journal", journalMatch[1]);
+    if (denied) return denied;
     return service.handleGetWriteJournal(journalMatch[1], context);
   }
 
   return responseBody(404, { error: "not found" });
+}
+
+async function routeEnvelope(
+  service: CogniWeaveRestService,
+  envelope: CogniWeaveRequestEnvelope,
+  options?: CogniWeaveHttpServerOptions,
+): Promise<RestResponse<unknown>> {
+  try {
+    return await routeEnvelopeInner(service, envelope, options);
+  } catch (error) {
+    const mapped = mapAuthorizationThrownError(error);
+    if (mapped) {
+      metrics.unauthorizedTotal += 1;
+      return mapped;
+    }
+    throw error;
+  }
 }
 
 async function readBody(req: IncomingMessage): Promise<string> {
@@ -376,6 +482,12 @@ export async function handleCogniWeaveHttpRequest(
     const response = await routeEnvelope(service, envelope, options);
     writeJsonResponse(res, response);
   } catch (error) {
+    const mapped = mapAuthorizationThrownError(error);
+    if (mapped) {
+      metrics.unauthorizedTotal += 1;
+      writeJsonResponse(res, mapped);
+      return;
+    }
     metrics.errorsTotal += 1;
     writeJsonResponse(res, {
       status: 500,

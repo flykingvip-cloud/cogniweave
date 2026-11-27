@@ -18,3 +18,5 @@ export class DistillationError extends CogniWeaveError {}
 export class ReasoningError extends CogniWeaveError {}
 
 export class EvidenceAccessError extends CogniWeaveError {}
+
+export class StoreUnavailableError extends CogniWeaveError {}

@@ -109,6 +109,7 @@ export {
   ReasoningError,
   ScopeViolationError,
   StorageConsistencyError,
+  StoreUnavailableError,
   ValidationError,
 } from "./errors.js";
 
@@ -400,6 +401,26 @@ export { migrateLocalCanonicalToPostgres } from "./migration/local-to-postgres.j
 export { PlaceholderVectorStore } from "./adapters/vector.js";
 
 export type {
+  AuthoritativeBindingQuery,
+  CanonicalAuthorizationDecision,
+  CanonicalResourceKind,
+  CanonicalResourceScope,
+  CanonicalResourceScopeResolver,
+  ResourceCallerPrincipal,
+  RebuildObjectType,
+} from "./auth/canonical-scope.js";
+export {
+  authorizeCanonicalResource,
+  createDenyByDefaultBindingQuery,
+  deriveJournalScope,
+  isCompleteScope,
+  isRebuildObjectType,
+  journalObjectIdsForType,
+  resolveCanonicalResourceScope,
+  REBUILD_OBJECT_TYPES,
+} from "./auth/canonical-scope.js";
+
+export type {
   DistillRequest,
   FrameTaskRequest,
   ReasonDebugResponse,
@@ -410,13 +431,15 @@ export type {
   RestContext,
   RestHeaders,
   RestHttpSurface,
+  RestPrincipal,
   RestResponse,
   RestApiSurface,
   WriteBackRequest,
 } from "./rest/contracts.js";
 
 export { CogniWeaveRestService } from "./rest/service.js";
-export type { CogniWeaveHttpServerOptions, CogniWeaveRequestEnvelope } from "./rest/node-server.js";
+export type { CogniWeaveHttpServerOptions, CogniWeaveRequestEnvelope, ResourceIdRouteName } from "./rest/node-server.js";
+export { RESOURCE_ID_ROUTE_REGISTRY } from "./rest/node-server.js";
 export {
   createCogniWeaveHttpServer,
   handleCogniWeaveHttpRequest,

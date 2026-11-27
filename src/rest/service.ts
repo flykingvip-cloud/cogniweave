@@ -1,3 +1,4 @@
+import type { CanonicalResourceKind, CanonicalResourceScope } from "../auth/canonical-scope.js";
 import type { CogniWeaveEngine, IngestInput } from "../contracts.js";
 import type { IngestResult } from "../contracts.js";
 import type {
@@ -71,6 +72,13 @@ function parseScopeFromHeaders(headers?: Record<string, string | undefined>): Sc
     agentId: agentId ?? "",
     visibility: visibility === "shared" ? "shared" : "private",
   };
+}
+
+function resolveAuthorizedOrDeclaredScope(
+  declared?: Scope,
+  context?: RestContext,
+): Scope | undefined {
+  return context?.authorizedScope ?? declared;
 }
 
 function mapWriteBackStatus(result: WriteBackResult): number {
@@ -177,6 +185,13 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     return this.engine.getWriteJournal(journalId);
   }
 
+  async resolveCanonicalResourceScope(
+    kind: CanonicalResourceKind,
+    id: string,
+  ): Promise<CanonicalResourceScope> {
+    return this.engine.resolveCanonicalResourceScope(kind, id);
+  }
+
   async handleFrameTask(
     request: FrameTaskRequest,
     context?: RestContext,
@@ -231,7 +246,7 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     packageId: string,
     context?: RestContext,
   ): Promise<RestResponse<TracePackageResult>> {
-    const scope = parseScopeFromHeaders(context?.headers);
+    const scope = resolveAuthorizedOrDeclaredScope(undefined, context) ?? parseScopeFromHeaders(context?.headers);
     return response(
       200,
       await this.engine.tracePackage(packageId, { scope }),
@@ -240,7 +255,7 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
   }
 
   async handleTraceAtom(atomId: string, context?: RestContext): Promise<RestResponse<MemoryTrace>> {
-    const scope = parseScopeFromHeaders(context?.headers);
+    const scope = resolveAuthorizedOrDeclaredScope(undefined, context) ?? parseScopeFromHeaders(context?.headers);
     return response(
       200,
       await this.engine.trace(atomId, { scope }),
@@ -252,7 +267,7 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     sessionId: string,
     context?: RestContext,
   ): Promise<RestResponse<TraceReasoningSessionResult>> {
-    const scope = parseScopeFromHeaders(context?.headers);
+    const scope = resolveAuthorizedOrDeclaredScope(undefined, context) ?? parseScopeFromHeaders(context?.headers);
     return response(
       200,
       await this.engine.traceReasoningSession(sessionId, { scope }),
@@ -264,7 +279,7 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     atomId: string,
     context?: RestContext,
   ): Promise<RestResponse<string[]>> {
-    const scope = parseScopeFromHeaders(context?.headers);
+    const scope = resolveAuthorizedOrDeclaredScope(undefined, context) ?? parseScopeFromHeaders(context?.headers);
     return response(
       200,
       await this.engine.getEvidenceRefs(atomId, scope),
@@ -276,7 +291,7 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     request: ResolveEvidenceRequest,
     context?: RestContext,
   ): Promise<RestResponse<unknown>> {
-    const scope = request.scope ?? parseScopeFromHeaders(context?.headers);
+    const scope = resolveAuthorizedOrDeclaredScope(request.scope, context);
     return response(
       200,
       await this.engine.resolveEvidence({ ...request, scope }),
@@ -295,14 +310,19 @@ export class CogniWeaveRestService implements RestApiSurface, RestHttpSurface {
     request: RebuildFromTruthRequest,
     context?: RestContext,
   ): Promise<RestResponse<Record<string, unknown>>> {
-    return response(200, await this.rebuildFromTruth(request), normalizeHeaders(context?.headers));
+    const scope = resolveAuthorizedOrDeclaredScope(request.scope, context);
+    return response(
+      200,
+      await this.rebuildFromTruth({ ...request, scope }),
+      normalizeHeaders(context?.headers),
+    );
   }
 
   async handleGetWriteJournal(
     journalId: string,
     context?: RestContext,
   ): Promise<RestResponse<WriteJournal>> {
-    const scope = parseScopeFromHeaders(context?.headers);
+    const scope = resolveAuthorizedOrDeclaredScope(undefined, context) ?? parseScopeFromHeaders(context?.headers);
     return response(
       200,
       await this.engine.getWriteJournal(journalId, scope),
