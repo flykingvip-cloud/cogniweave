@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import type { CogniWeaveEngine } from "../contracts.js";
+import { computeScopeFingerprint } from "../keys.js";
 import type {
   CognitivePackage,
   MemoryAtom,
@@ -8,7 +11,8 @@ import type {
   Scope,
   TaskFrame,
 } from "../models.js";
-import { authorizeMemoryAccess } from "../subject/binding.js";
+import { validateScope } from "../scope.js";
+import { authorizeMemoryAccess, isLiveMemorySubjectBinding } from "../subject/binding.js";
 
 export type MemoryResourceType =
   | "agent_private_memory"
@@ -24,7 +28,7 @@ export interface MemoryResourceDescriptor {
   tenantId: string;
   ownerType: MemorySubject["ownerType"];
   ownerId: string;
-  subjectBindingId?: string;
+  subjectBindingId: string;
   scope: Scope;
   visibility: Scope["visibility"];
   privacyLevel: "private" | "shared" | "org" | "public";
@@ -76,25 +80,107 @@ export interface ResourceAccessDecision {
   denyReason?: string;
 }
 
+const EXPECTED_OWNER_TYPE: Partial<Record<MemoryResourceType, MemorySubject["ownerType"]>> = {
+  agent_private_memory: "agent",
+  user_memory: "user",
+  seat_memory: "seat",
+  team_memory: "team",
+  organization_memory: "organization",
+};
+
+type PersistedResourceState = {
+  resources: MemoryResourceDescriptor[];
+  outboxEvents: MemoryResourceDomainEvent[];
+};
+
 /**
  * CW-06 CogniWeaveMemoryResourceAdapter.
- * Exposes governed memory resources to Knowledge SDK without copying all MemoryAtoms.
- * Enforces fail-closed intersection across User, Agent, Tenant, Knowledge Policy,
- * Subject Binding, Privacy, and Lifecycle policies.
+ * - Validates descriptor consistency at registration (R-05)
+ * - Enforces strong subjectBindingId binding in checkAccess() (R-03)
+ * - Locks TaskFrame.scope to resource.scope in retrieveCognitivePackage() (R-02)
+ * - Verifies evidence belongs to authorized resource scope/atoms (R-04)
+ * - Supports durable persistence & explicit outbox acknowledgment (R-01, R-06)
+ * - Supports revocation callback propagation (R-07)
  */
 export class CogniWeaveMemoryResourceAdapter {
   private readonly resources = new Map<string, MemoryResourceDescriptor>();
   private readonly outboxEvents: MemoryResourceDomainEvent[] = [];
+  private loadPromise: Promise<void> | null = null;
+  private readonly storagePath?: string;
+  private readonly onRevoke?: (resource: MemoryResourceDescriptor) => Promise<void> | void;
 
-  constructor(private readonly engine: CogniWeaveEngine) {}
+  constructor(
+    private readonly engine: CogniWeaveEngine,
+    options?: {
+      storagePath?: string;
+      onRevoke?: (resource: MemoryResourceDescriptor) => Promise<void> | void;
+    },
+  ) {
+    this.storagePath = options?.storagePath;
+    this.onRevoke = options?.onRevoke;
+  }
 
-  registerResource(
+  private ensureLoaded(): Promise<void> {
+    if (!this.storagePath) return Promise.resolve();
+    if (!this.loadPromise) {
+      this.loadPromise = this.loadFromDisk();
+    }
+    return this.loadPromise;
+  }
+
+  private async loadFromDisk(): Promise<void> {
+    if (!this.storagePath) return;
+    try {
+      const raw = await readFile(this.storagePath, "utf8");
+      const parsed = JSON.parse(raw) as PersistedResourceState;
+      for (const r of parsed.resources ?? []) {
+        this.resources.set(r.resourceId, r);
+      }
+      this.outboxEvents.push(...(parsed.outboxEvents ?? []));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException | null)?.code === "ENOENT") return;
+      this.loadPromise = null;
+      throw err;
+    }
+  }
+
+  private async persist(): Promise<void> {
+    if (!this.storagePath) return;
+    await mkdir(dirname(this.storagePath), { recursive: true });
+    const tmp = `${this.storagePath}.tmp.${randomUUID().slice(0, 8)}`;
+    const payload: PersistedResourceState = {
+      resources: [...this.resources.values()],
+      outboxEvents: this.outboxEvents,
+    };
+    await writeFile(tmp, JSON.stringify(payload, null, 2), "utf8");
+    await rename(tmp, this.storagePath);
+  }
+
+  async registerResource(
     descriptor: Omit<MemoryResourceDescriptor, "version" | "updatedAt"> & {
       version?: number;
       updatedAt?: string;
     },
     ctx?: { correlationId?: string; traceId?: string; policyVersion?: string },
-  ): MemoryResourceDescriptor {
+  ): Promise<MemoryResourceDescriptor> {
+    await this.ensureLoaded();
+    validateScope(descriptor.scope);
+    if (!descriptor.subjectBindingId.trim()) {
+      throw new Error("registerResource requires a non-empty subjectBindingId");
+    }
+    const expectedOwner = EXPECTED_OWNER_TYPE[descriptor.resourceType];
+    if (expectedOwner && descriptor.ownerType !== expectedOwner) {
+      throw new Error(
+        `Resource type ${descriptor.resourceType} requires ownerType=${expectedOwner}, got ${descriptor.ownerType}`,
+      );
+    }
+    if (descriptor.visibility === "private" && descriptor.privacyLevel !== "private") {
+      throw new Error("Private visibility resource must use privacyLevel=private");
+    }
+    if (descriptor.privacyLevel === "private" && descriptor.visibility !== "private") {
+      throw new Error("Private privacyLevel resource must use visibility=private");
+    }
+
     const existing = this.resources.get(descriptor.resourceId);
     const version = existing ? existing.version + 1 : (descriptor.version ?? 1);
     const saved: MemoryResourceDescriptor = {
@@ -108,6 +194,7 @@ export class CogniWeaveMemoryResourceAdapter {
       saved,
       ctx,
     );
+    await this.persist();
     return saved;
   }
 
@@ -140,10 +227,7 @@ export class CogniWeaveMemoryResourceAdapter {
     if (ctx.knowledgePolicyAllows === false) {
       return { allowed: false, denyReason: "knowledge_policy_denied" };
     }
-    if (
-      ctx.allowedResourceTypes &&
-      !ctx.allowedResourceTypes.includes(resource.resourceType)
-    ) {
+    if (ctx.allowedResourceTypes && !ctx.allowedResourceTypes.includes(resource.resourceType)) {
       return { allowed: false, denyReason: "agent_scope_denied" };
     }
     if (resource.lifecycleStatus !== "active") {
@@ -155,6 +239,20 @@ export class CogniWeaveMemoryResourceAdapter {
       !(resource.ownerType === "agent" && resource.ownerId === ctx.agentId)
     ) {
       return { allowed: false, denyReason: "privacy_policy_denied" };
+    }
+
+    // R-03: Strong subjectBindingId validation against live bindings & resource scope.
+    const bound = ctx.bindings.find((b) => b.id === resource.subjectBindingId);
+    if (!bound || !isLiveMemorySubjectBinding(bound)) {
+      return { allowed: false, denyReason: "resource_binding_missing_or_unbound" };
+    }
+    if (
+      computeScopeFingerprint(bound.scope) !== computeScopeFingerprint(resource.scope) ||
+      bound.subject.tenantId !== resource.tenantId ||
+      bound.subject.ownerType !== resource.ownerType ||
+      bound.subject.ownerId !== resource.ownerId
+    ) {
+      return { allowed: false, denyReason: "resource_binding_mismatch" };
     }
 
     const acl = authorizeMemoryAccess(ctx.bindings, {
@@ -172,11 +270,22 @@ export class CogniWeaveMemoryResourceAdapter {
     taskFrame: TaskFrame,
     ctx: ResourceAccessContext,
   ): Promise<CognitivePackage> {
+    await this.ensureLoaded();
     const access = this.checkAccess(resourceId, ctx);
     if (!access.allowed) {
       throw new Error(`Memory resource access denied: ${access.denyReason}`);
     }
-    return this.engine.reason(taskFrame);
+    const resource = this.resources.get(resourceId)!;
+    // R-02: Lock TaskFrame.scope & requiredAtomTypes to the authorized resource boundaries.
+    const scopedFrame: TaskFrame = {
+      ...taskFrame,
+      scope: { ...resource.scope },
+      requiredAtomTypes:
+        resource.supportedAtomTypes.length > 0
+          ? taskFrame.requiredAtomTypes.filter((t) => resource.supportedAtomTypes.includes(t))
+          : taskFrame.requiredAtomTypes,
+    };
+    return this.engine.reason(scopedFrame);
   }
 
   async retrieveAtoms(
@@ -184,15 +293,23 @@ export class CogniWeaveMemoryResourceAdapter {
     ctx: ResourceAccessContext,
     atomTypes?: string[],
   ): Promise<MemoryAtom[]> {
+    await this.ensureLoaded();
     const access = this.checkAccess(resourceId, ctx);
     if (!access.allowed) {
       throw new Error(`Memory resource access denied: ${access.denyReason}`);
     }
     const resource = this.resources.get(resourceId)!;
+    const allowedTypes = atomTypes
+      ? atomTypes.filter(
+          (t) => resource.supportedAtomTypes.length === 0 || resource.supportedAtomTypes.includes(t),
+        )
+      : resource.supportedAtomTypes.length > 0
+        ? resource.supportedAtomTypes
+        : undefined;
     const hits = await this.engine.queryAtoms({
       scope: resource.scope,
       caller: ctx.callerSubject,
-      filter: atomTypes ? { atomTypes } : undefined,
+      filter: allowedTypes ? { atomTypes: allowedTypes } : undefined,
     });
     return hits.map((h) => h.atom);
   }
@@ -202,11 +319,18 @@ export class CogniWeaveMemoryResourceAdapter {
     evidenceId: string,
     ctx: ResourceAccessContext,
   ): Promise<unknown> {
+    await this.ensureLoaded();
     const access = this.checkAccess(resourceId, ctx);
     if (!access.allowed) {
       throw new Error(`Memory resource access denied: ${access.denyReason}`);
     }
     const resource = this.resources.get(resourceId)!;
+    // R-04: Verify evidenceId is referenced by at least one authorized atom in this resource.
+    const authorizedAtoms = await this.retrieveAtoms(resourceId, ctx);
+    const hasLink = authorizedAtoms.some((a) => a.provenance.evidenceRefs.includes(evidenceId));
+    if (!hasLink) {
+      throw new Error(`Evidence ${evidenceId} is not bound to authorized atoms in resource ${resourceId}`);
+    }
     return this.engine.resolveEvidence({
       evidenceId,
       includeContent: true,
@@ -218,10 +342,11 @@ export class CogniWeaveMemoryResourceAdapter {
     return this.resources.get(resourceId)?.lifecycleStatus ?? "not_found";
   }
 
-  revokeAccess(
+  async revokeAccess(
     resourceId: string,
     ctx?: { correlationId?: string; traceId?: string; policyVersion?: string },
-  ): MemoryResourceDescriptor {
+  ): Promise<MemoryResourceDescriptor> {
+    await this.ensureLoaded();
     const existing = this.resources.get(resourceId);
     if (!existing) {
       throw new Error(`Memory resource not found: ${resourceId}`);
@@ -233,12 +358,39 @@ export class CogniWeaveMemoryResourceAdapter {
       updatedAt: new Date().toISOString(),
     };
     this.resources.set(resourceId, updated);
+    if (this.onRevoke) {
+      await this.onRevoke(updated);
+    }
     this.emitEvent("memory.resource.access.revoked", updated, ctx);
+    await this.persist();
     return updated;
   }
 
-  drainDomainEvents(): MemoryResourceDomainEvent[] {
-    return this.outboxEvents.splice(0, this.outboxEvents.length);
+  async peekDomainEvents(): Promise<MemoryResourceDomainEvent[]> {
+    await this.ensureLoaded();
+    return [...this.outboxEvents];
+  }
+
+  async acknowledgeDomainEvents(eventIds: ReadonlyArray<string>): Promise<number> {
+    await this.ensureLoaded();
+    const ackSet = new Set(eventIds);
+    const before = this.outboxEvents.length;
+    const remaining = this.outboxEvents.filter((e) => !ackSet.has(e.eventId));
+    this.outboxEvents.splice(0, this.outboxEvents.length, ...remaining);
+    const removed = before - remaining.length;
+    if (removed > 0) {
+      await this.persist();
+    }
+    return removed;
+  }
+
+  async drainDomainEvents(): Promise<MemoryResourceDomainEvent[]> {
+    await this.ensureLoaded();
+    const drained = this.outboxEvents.splice(0, this.outboxEvents.length);
+    if (drained.length > 0) {
+      await this.persist();
+    }
+    return drained;
   }
 
   private emitEvent(

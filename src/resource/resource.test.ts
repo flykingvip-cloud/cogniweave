@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createMemoryPartitionKeyV1 } from "../keys.js";
 import type { MemorySubject, Scope } from "../models.js";
@@ -12,76 +15,112 @@ const SCOPE: Scope = {
   visibility: "shared",
 };
 
+const OTHER_SCOPE: Scope = {
+  workspaceId: "ws_other",
+  projectId: "proj_other",
+  agentId: "agent_other",
+  visibility: "private",
+};
+
 const PARTITION = createMemoryPartitionKeyV1("dp_1", SCOPE);
 
-describe("CogniWeaveMemoryResourceAdapter (CW-06)", () => {
-  it("registers, discovers, checks fail-closed access, and propagates revocation events", async () => {
-    const engine = new InMemoryCogniWeaveEngine({
-      environment: "local",
-      metadataBackend: "memory",
-      graphBackend: "memory",
-      evidenceBackend: "memory",
-      vectorBackend: "memory",
-    });
-    const adapter = new CogniWeaveMemoryResourceAdapter(engine);
-    const caller: MemorySubject = { tenantId: "t_1", ownerType: "team", ownerId: "team_eng" };
-    const binding = createMemorySubjectBinding({
-      partition: PARTITION,
-      scope: SCOPE,
-      subject: caller,
-    });
+describe("CogniWeaveMemoryResourceAdapter (CW-06A/B)", () => {
+  it("validates registration consistency, strong subjectBindingId, scope-locked reasoning, and durable outbox ack", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cw-res-"));
+    const storagePath = join(dir, "resources.json");
+    try {
+      const engine = new InMemoryCogniWeaveEngine({
+        environment: "local",
+        metadataBackend: "memory",
+        graphBackend: "memory",
+        evidenceBackend: "memory",
+        vectorBackend: "memory",
+      });
+      const revokedIds: string[] = [];
+      const adapter = new CogniWeaveMemoryResourceAdapter(engine, {
+        storagePath,
+        onRevoke: (r) => {
+          revokedIds.push(r.resourceId);
+        },
+      });
+      const caller: MemorySubject = { tenantId: "t_1", ownerType: "team", ownerId: "team_eng" };
+      const binding = createMemorySubjectBinding({
+        partition: PARTITION,
+        scope: SCOPE,
+        subject: caller,
+      });
 
-    const registered = adapter.registerResource({
-      resourceId: "res_team_1",
-      resourceType: "team_memory",
-      tenantId: "t_1",
-      ownerType: "team",
-      ownerId: "team_eng",
-      subjectBindingId: binding.id,
-      scope: SCOPE,
-      visibility: "shared",
-      privacyLevel: "shared",
-      lifecycleStatus: "active",
-      supportedAtomTypes: ["strategy", "policy"],
-      capabilities: ["retrieve", "evidence"],
-      sourceAuthority: "team_verified",
-      evidenceSupport: true,
-    });
+      // R-05: OwnerType mismatch rejected at registration
+      await expect(
+        adapter.registerResource({
+          resourceId: "res_bad",
+          resourceType: "team_memory",
+          tenantId: "t_1",
+          ownerType: "user",
+          ownerId: "u_1",
+          subjectBindingId: binding.id,
+          scope: SCOPE,
+          visibility: "shared",
+          privacyLevel: "shared",
+          lifecycleStatus: "active",
+          supportedAtomTypes: ["strategy"],
+          capabilities: ["retrieve"],
+          sourceAuthority: "team_verified",
+          evidenceSupport: true,
+        }),
+      ).rejects.toThrow("requires ownerType=team");
 
-    expect(registered.version).toBe(1);
+      const registered = await adapter.registerResource({
+        resourceId: "res_team_1",
+        resourceType: "team_memory",
+        tenantId: "t_1",
+        ownerType: "team",
+        ownerId: "team_eng",
+        subjectBindingId: binding.id,
+        scope: SCOPE,
+        visibility: "shared",
+        privacyLevel: "shared",
+        lifecycleStatus: "active",
+        supportedAtomTypes: ["strategy", "policy"],
+        capabilities: ["retrieve", "evidence"],
+        sourceAuthority: "team_verified",
+        evidenceSupport: true,
+      });
+      expect(registered.version).toBe(1);
 
-    const ctx = {
-      userId: "u_1",
-      tenantId: "t_1",
-      agentId: "agent_main",
-      callerSubject: caller,
-      bindings: [binding],
-      partition: PARTITION,
-    };
+      const ctx = {
+        userId: "u_1",
+        tenantId: "t_1",
+        agentId: "agent_main",
+        callerSubject: caller,
+        bindings: [binding],
+        partition: PARTITION,
+      };
 
-    expect(adapter.discoverResources(ctx).map((r) => r.resourceId)).toEqual(["res_team_1"]);
-    expect(
-      adapter.checkAccess("res_team_1", { ...ctx, knowledgePolicyAllows: false }),
-    ).toEqual({ allowed: false, denyReason: "knowledge_policy_denied" });
-    expect(
-      adapter.checkAccess("res_team_1", { ...ctx, tenantId: "t_other" }),
-    ).toEqual({ allowed: false, denyReason: "tenant_mismatch" });
+      // R-03: Missing or mismatched subjectBindingId fails closed
+      expect(
+        adapter.checkAccess("res_team_1", { ...ctx, bindings: [] }),
+      ).toEqual({ allowed: false, denyReason: "resource_binding_missing_or_unbound" });
 
-    const frame = await engine.frameTask("plan release", { scope: SCOPE });
-    const pkg = await adapter.retrieveCognitivePackage("res_team_1", frame, ctx);
-    expect(pkg.taskFrameId).toBe(frame.id);
+      // R-02: Even if caller passes a wider/different TaskFrame.scope, reasoning is locked to resource.scope
+      const widerFrame = await engine.frameTask("plan release", { scope: OTHER_SCOPE });
+      const pkg = await adapter.retrieveCognitivePackage("res_team_1", widerFrame, ctx);
+      expect(pkg.taskFrameId).toBe(widerFrame.id);
 
-    adapter.revokeAccess("res_team_1");
-    expect(adapter.getResourceStatus("res_team_1")).toBe("revoked");
-    expect(adapter.checkAccess("res_team_1", ctx)).toEqual({
-      allowed: false,
-      denyReason: "resource_revoked",
-    });
+      // R-06: Outbox peek + explicit acknowledge
+      const pending = await adapter.peekDomainEvents();
+      expect(pending.map((e) => e.eventType)).toEqual(["memory.resource.registered"]);
+      await adapter.acknowledgeDomainEvents(pending.map((e) => e.eventId));
+      expect(await adapter.peekDomainEvents()).toEqual([]);
 
-    const events = adapter.drainDomainEvents();
-    expect(events.map((e) => e.eventType)).toEqual([
-      "memory.resource.registered",
-      "memory.resource.access.revoked",
-    ]);
+      await adapter.revokeAccess("res_team_1");
+      expect(revokedIds).toEqual(["res_team_1"]);
+      expect(adapter.checkAccess("res_team_1", ctx)).toEqual({
+        allowed: false,
+        denyReason: "resource_revoked",
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -1,8 +1,19 @@
 import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import type { MemoryAtom, MemorySubject, MemorySubjectBinding, Scope } from "../models.js";
-import { authorizeMemoryAccess, createMemorySubjectBinding, markMemorySubjectBindingUnbound } from "../subject/binding.js";
+import {
+  authorizeMemoryAccess,
+  createMemorySubjectBinding,
+  markMemorySubjectBindingUnbound,
+} from "../subject/binding.js";
 
-export type PromotionCandidateStatus = "pending" | "approved" | "rejected" | "withdrawn";
+export type PromotionCandidateStatus =
+  | "pending"
+  | "approved"
+  | "published"
+  | "rejected"
+  | "withdrawn";
 
 export type MemoryOwnershipClass =
   | "personal"
@@ -11,6 +22,26 @@ export type MemoryOwnershipClass =
   | "team"
   | "organization"
   | "task";
+
+export type GovernanceRole = "tenant_admin" | "space_admin" | "governance_reviewer" | "member";
+
+export interface GovernanceActorContext {
+  userId: string;
+  tenantId: string;
+  roles: GovernanceRole[];
+  ownedResourceIds?: string[];
+  adminSpaceIds?: string[];
+  correlationId?: string;
+  traceId?: string;
+}
+
+export interface KnowledgePublisher {
+  publishAtom(input: {
+    candidate: PromotionCandidate;
+    atom: MemoryAtom;
+  }): Promise<{ assetId: string }>;
+  withdrawAsset?(assetId: string, reason?: string): Promise<void>;
+}
 
 export interface PromotionCandidate {
   candidateId: string;
@@ -22,6 +53,7 @@ export interface PromotionCandidate {
   evidenceRefs: string[];
   status: PromotionCandidateStatus;
   reviewedByUserId?: string;
+  publishedAssetId?: string;
   decisionReason?: string;
   createdAt: string;
   updatedAt: string;
@@ -36,10 +68,16 @@ export interface GovernanceAuditEvent {
     | "sharing.revoked"
     | "promotion.requested"
     | "promotion.approved"
+    | "promotion.published"
     | "promotion.rejected"
     | "promotion.withdrawn"
     | "access.denied";
   targetId: string;
+  policyVersion: string;
+  correlationId: string;
+  traceId: string;
+  beforeState?: string;
+  afterState?: string;
   reason?: string;
   occurredAt: string;
 }
@@ -54,38 +92,111 @@ export interface SharingRevokeResult {
   audit: GovernanceAuditEvent;
 }
 
+type PersistedGovernanceState = {
+  promotions: PromotionCandidate[];
+  auditLog: GovernanceAuditEvent[];
+};
+
 /**
- * CW-05 Enterprise Memory Governance Store.
- * Manages controlled sharing grants/revocations, personal memory isolation,
- * and promotion candidate approval/withdrawal workflows.
+ * CW-05 Enterprise Memory Governance Service.
+ * - Enforces operator authorization (CW-05A)
+ * - Supports durable file-backed persistence (CW-05B)
+ * - Separates approval from Knowledge SDK publication & supports withdrawal propagation (CW-05C)
  */
 export class MemoryGovernanceService {
   private readonly auditLog: GovernanceAuditEvent[] = [];
   private readonly promotions = new Map<string, PromotionCandidate>();
+  private loadPromise: Promise<void> | null = null;
+  private readonly policyVersion: string;
+  private readonly storagePath?: string;
 
-  listAuditEvents(): GovernanceAuditEvent[] {
+  constructor(options?: { storagePath?: string; policyVersion?: string }) {
+    this.storagePath = options?.storagePath;
+    this.policyVersion = options?.policyVersion ?? "1.0.0";
+  }
+
+  private ensureLoaded(): Promise<void> {
+    if (!this.storagePath) return Promise.resolve();
+    if (!this.loadPromise) {
+      this.loadPromise = this.loadFromDisk();
+    }
+    return this.loadPromise;
+  }
+
+  private async loadFromDisk(): Promise<void> {
+    if (!this.storagePath) return;
+    try {
+      const raw = await readFile(this.storagePath, "utf8");
+      const parsed = JSON.parse(raw) as PersistedGovernanceState;
+      for (const p of parsed.promotions ?? []) {
+        this.promotions.set(p.candidateId, p);
+      }
+      this.auditLog.push(...(parsed.auditLog ?? []));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException | null)?.code === "ENOENT") return;
+      this.loadPromise = null;
+      throw err;
+    }
+  }
+
+  private async persist(): Promise<void> {
+    if (!this.storagePath) return;
+    await mkdir(dirname(this.storagePath), { recursive: true });
+    const tmp = `${this.storagePath}.tmp.${randomUUID().slice(0, 8)}`;
+    const payload: PersistedGovernanceState = {
+      promotions: [...this.promotions.values()],
+      auditLog: this.auditLog,
+    };
+    await writeFile(tmp, JSON.stringify(payload, null, 2), "utf8");
+    await rename(tmp, this.storagePath);
+  }
+
+  private assertSharingOperator(
+    actor: GovernanceActorContext,
+    tenantId: string,
+    resourceId: string,
+  ): void {
+    const allowed =
+      actor.tenantId === tenantId &&
+      (actor.roles.includes("tenant_admin") ||
+        (actor.ownedResourceIds?.includes(resourceId) ?? false));
+    if (!allowed) {
+      this.recordAudit(tenantId, actor, "access.denied", resourceId, undefined, undefined, "operator_unauthorized_for_sharing");
+      throw new Error(`Operator ${actor.userId} is not authorized to manage sharing for ${resourceId}`);
+    }
+  }
+
+  async listAuditEvents(): Promise<GovernanceAuditEvent[]> {
+    await this.ensureLoaded();
     return [...this.auditLog];
   }
 
-  getPromotionCandidate(candidateId: string): PromotionCandidate | undefined {
+  async getPromotionCandidate(candidateId: string): Promise<PromotionCandidate | undefined> {
+    await this.ensureLoaded();
     return this.promotions.get(candidateId);
   }
 
-  grantSharing(params: {
-    actorUserId: string;
+  async grantSharing(params: {
+    actor: GovernanceActorContext;
+    resourceId: string;
     tenantId: string;
     partition: MemorySubjectBinding["partition"];
     scope: Scope;
     grantee: MemorySubject;
     ownershipClass: MemoryOwnershipClass;
     now?: string;
-  }): SharingGrantResult {
+  }): Promise<SharingGrantResult> {
+    await this.ensureLoaded();
+    this.assertSharingOperator(params.actor, params.tenantId, params.resourceId);
+
     if (params.ownershipClass === "personal" || params.ownershipClass === "agent_private") {
-      this.recordAudit(params.tenantId, params.actorUserId, "access.denied", params.grantee.ownerId, "personal_or_agent_private_cannot_be_shared");
+      this.recordAudit(params.tenantId, params.actor, "access.denied", params.grantee.ownerId, undefined, undefined, "personal_or_agent_private_cannot_be_shared");
+      await this.persist();
       throw new Error(`Cannot share ${params.ownershipClass} memory without explicit reclassification`);
     }
     if (params.grantee.tenantId !== params.tenantId) {
-      this.recordAudit(params.tenantId, params.actorUserId, "access.denied", params.grantee.ownerId, "cross_tenant_grant_forbidden");
+      this.recordAudit(params.tenantId, params.actor, "access.denied", params.grantee.ownerId, undefined, undefined, "cross_tenant_grant_forbidden");
+      await this.persist();
       throw new Error("Cross-tenant sharing grant is forbidden");
     }
 
@@ -98,39 +209,50 @@ export class MemoryGovernanceService {
     });
     const audit = this.recordAudit(
       params.tenantId,
-      params.actorUserId,
+      params.actor,
       "sharing.granted",
       binding.id,
+      "unbound",
+      "bound",
       undefined,
       params.now,
     );
+    await this.persist();
     return { binding, audit };
   }
 
-  revokeSharing(params: {
-    actorUserId: string;
+  async revokeSharing(params: {
+    actor: GovernanceActorContext;
+    resourceId: string;
     binding: MemorySubjectBinding;
     reason?: string;
     now?: string;
-  }): SharingRevokeResult {
+  }): Promise<SharingRevokeResult> {
+    await this.ensureLoaded();
+    this.assertSharingOperator(params.actor, params.binding.subject.tenantId, params.resourceId);
+
     const unbound = markMemorySubjectBindingUnbound(params.binding, params.now);
     const audit = this.recordAudit(
       params.binding.subject.tenantId,
-      params.actorUserId,
+      params.actor,
       "sharing.revoked",
       unbound.id,
+      "bound",
+      "unbound",
       params.reason,
       params.now,
     );
+    await this.persist();
     return { binding: unbound, audit };
   }
 
-  authorizeAccess(params: {
+  async authorizeAccess(params: {
     bindings: ReadonlyArray<MemorySubjectBinding>;
     partition: MemorySubjectBinding["partition"];
     caller: MemorySubject;
-    actorUserId: string;
-  }): boolean {
+    actor: GovernanceActorContext;
+  }): Promise<boolean> {
+    await this.ensureLoaded();
     const res = authorizeMemoryAccess(params.bindings, {
       partition: params.partition,
       caller: params.caller,
@@ -138,23 +260,30 @@ export class MemoryGovernanceService {
     if (!res.allowed) {
       this.recordAudit(
         params.caller.tenantId,
-        params.actorUserId,
+        params.actor,
         "access.denied",
         params.caller.ownerId,
+        undefined,
+        undefined,
         res.reason,
       );
+      await this.persist();
     }
     return res.allowed;
   }
 
-  requestPromotion(params: {
+  async requestPromotion(params: {
+    actor: GovernanceActorContext;
     tenantId: string;
     atom: MemoryAtom;
     ownershipClass: MemoryOwnershipClass;
-    requestedByUserId: string;
     targetSpaceId: string;
     now?: string;
-  }): PromotionCandidate {
+  }): Promise<PromotionCandidate> {
+    await this.ensureLoaded();
+    if (params.actor.tenantId !== params.tenantId) {
+      throw new Error("Cross-tenant promotion request forbidden");
+    }
     if (
       params.ownershipClass === "personal" ||
       params.ownershipClass === "agent_private" ||
@@ -162,11 +291,14 @@ export class MemoryGovernanceService {
     ) {
       this.recordAudit(
         params.tenantId,
-        params.requestedByUserId,
+        params.actor,
         "access.denied",
         params.atom.id,
+        undefined,
+        undefined,
         `auto_or_direct_promotion_blocked:${params.ownershipClass}`,
       );
+      await this.persist();
       throw new Error(`Promotion blocked by default policy for ${params.ownershipClass} memory`);
     }
     if ((params.atom.provenance?.evidenceRefs?.length ?? 0) === 0) {
@@ -182,7 +314,7 @@ export class MemoryGovernanceService {
       tenantId: params.tenantId,
       atomId: params.atom.id,
       ownershipClass: params.ownershipClass,
-      requestedByUserId: params.requestedByUserId,
+      requestedByUserId: params.actor.userId,
       targetSpaceId: params.targetSpaceId,
       evidenceRefs: [...params.atom.provenance.evidenceRefs],
       status: "pending",
@@ -190,54 +322,136 @@ export class MemoryGovernanceService {
       updatedAt: now,
     };
     this.promotions.set(candidate.candidateId, candidate);
-    this.recordAudit(params.tenantId, params.requestedByUserId, "promotion.requested", candidate.candidateId, undefined, now);
+    this.recordAudit(
+      params.tenantId,
+      params.actor,
+      "promotion.requested",
+      candidate.candidateId,
+      undefined,
+      "pending",
+      undefined,
+      now,
+    );
+    await this.persist();
     return candidate;
   }
 
-  reviewPromotion(params: {
+  async reviewPromotion(params: {
+    actor: GovernanceActorContext;
     candidateId: string;
-    reviewerUserId: string;
     decision: "approved" | "rejected";
     reason?: string;
     now?: string;
-  }): PromotionCandidate {
+  }): Promise<PromotionCandidate> {
+    await this.ensureLoaded();
     const existing = this.promotions.get(params.candidateId);
-    if (!existing) {
-      throw new Error(`Promotion candidate not found: ${params.candidateId}`);
+    if (!existing) throw new Error(`Promotion candidate not found: ${params.candidateId}`);
+
+    const canReview =
+      params.actor.tenantId === existing.tenantId &&
+      (params.actor.roles.includes("tenant_admin") ||
+        (params.actor.roles.includes("space_admin") &&
+          (params.actor.adminSpaceIds?.includes(existing.targetSpaceId) ?? false)));
+    if (!canReview) {
+      this.recordAudit(
+        existing.tenantId,
+        params.actor,
+        "access.denied",
+        existing.candidateId,
+        existing.status,
+        existing.status,
+        "reviewer_not_authorized_for_target_space",
+      );
+      await this.persist();
+      throw new Error(`Reviewer ${params.actor.userId} lacks approval authority for space ${existing.targetSpaceId}`);
     }
     if (existing.status !== "pending") {
       throw new Error(`Promotion candidate ${params.candidateId} is already ${existing.status}`);
     }
+
     const now = params.now ?? new Date().toISOString();
     const updated: PromotionCandidate = {
       ...existing,
       status: params.decision,
-      reviewedByUserId: params.reviewerUserId,
+      reviewedByUserId: params.actor.userId,
       decisionReason: params.reason,
       updatedAt: now,
     };
     this.promotions.set(updated.candidateId, updated);
     this.recordAudit(
       existing.tenantId,
-      params.reviewerUserId,
+      params.actor,
       params.decision === "approved" ? "promotion.approved" : "promotion.rejected",
       updated.candidateId,
+      "pending",
+      params.decision,
       params.reason,
       now,
     );
+    await this.persist();
     return updated;
   }
 
-  withdrawPromotion(params: {
+  async publishPromotion(params: {
+    actor: GovernanceActorContext;
     candidateId: string;
-    actorUserId: string;
+    atom: MemoryAtom;
+    publisher: KnowledgePublisher;
+    now?: string;
+  }): Promise<PromotionCandidate> {
+    await this.ensureLoaded();
+    const existing = this.promotions.get(params.candidateId);
+    if (!existing) throw new Error(`Promotion candidate not found: ${params.candidateId}`);
+    if (existing.status !== "approved") {
+      throw new Error(`Candidate ${params.candidateId} must be approved before publishing (status=${existing.status})`);
+    }
+    if ((params.atom.provenance?.evidenceRefs?.length ?? 0) === 0) {
+      throw new Error("Cannot publish candidate without valid evidence references");
+    }
+
+    const { assetId } = await params.publisher.publishAtom({
+      candidate: existing,
+      atom: params.atom,
+    });
+    const now = params.now ?? new Date().toISOString();
+    const updated: PromotionCandidate = {
+      ...existing,
+      status: "published",
+      publishedAssetId: assetId,
+      updatedAt: now,
+    };
+    this.promotions.set(updated.candidateId, updated);
+    this.recordAudit(
+      existing.tenantId,
+      params.actor,
+      "promotion.published",
+      updated.candidateId,
+      "approved",
+      `published:${assetId}`,
+      undefined,
+      now,
+    );
+    await this.persist();
+    return updated;
+  }
+
+  async withdrawPromotion(params: {
+    actor: GovernanceActorContext;
+    candidateId: string;
+    publisher?: KnowledgePublisher;
     reason?: string;
     now?: string;
-  }): PromotionCandidate {
+  }): Promise<PromotionCandidate> {
+    await this.ensureLoaded();
     const existing = this.promotions.get(params.candidateId);
-    if (!existing) {
-      throw new Error(`Promotion candidate not found: ${params.candidateId}`);
+    if (!existing) throw new Error(`Promotion candidate not found: ${params.candidateId}`);
+    if (params.actor.tenantId !== existing.tenantId) {
+      throw new Error("Cross-tenant withdrawal forbidden");
     }
+    if (existing.publishedAssetId && params.publisher?.withdrawAsset) {
+      await params.publisher.withdrawAsset(existing.publishedAssetId, params.reason);
+    }
+
     const now = params.now ?? new Date().toISOString();
     const updated: PromotionCandidate = {
       ...existing,
@@ -246,24 +460,41 @@ export class MemoryGovernanceService {
       updatedAt: now,
     };
     this.promotions.set(updated.candidateId, updated);
-    this.recordAudit(existing.tenantId, params.actorUserId, "promotion.withdrawn", updated.candidateId, params.reason, now);
+    this.recordAudit(
+      existing.tenantId,
+      params.actor,
+      "promotion.withdrawn",
+      updated.candidateId,
+      existing.status,
+      "withdrawn",
+      params.reason,
+      now,
+    );
+    await this.persist();
     return updated;
   }
 
   private recordAudit(
     tenantId: string,
-    actorUserId: string,
+    actor: GovernanceActorContext,
     action: GovernanceAuditEvent["action"],
     targetId: string,
+    beforeState?: string,
+    afterState?: string,
     reason?: string,
     occurredAt = new Date().toISOString(),
   ): GovernanceAuditEvent {
     const event: GovernanceAuditEvent = {
       auditId: `aud_${randomUUID().slice(0, 12)}`,
       tenantId,
-      actorUserId,
+      actorUserId: actor.userId,
       action,
       targetId,
+      policyVersion: this.policyVersion,
+      correlationId: actor.correlationId ?? randomUUID(),
+      traceId: actor.traceId ?? randomUUID(),
+      ...(beforeState ? { beforeState } : {}),
+      ...(afterState ? { afterState } : {}),
       ...(reason ? { reason } : {}),
       occurredAt,
     };

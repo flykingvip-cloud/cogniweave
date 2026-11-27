@@ -128,20 +128,82 @@ describe("CogniWeave HTTP server", () => {
       },
     } as unknown as CogniWeaveRestServiceClass;
 
-    const traceResponse = await routeCogniWeaveHttpRequest(service, {
-      method: "GET",
-      url: "/v1/atoms/atm_1/trace",
-      headers: {},
-    });
-    const evidenceRefsResponse = await routeCogniWeaveHttpRequest(service, {
-      method: "GET",
-      url: "/v1/atoms/atm_1/evidence-refs",
-      headers: {},
-    });
+    const traceResponse = await routeCogniWeaveHttpRequest(
+      service,
+      {
+        method: "GET",
+        url: "/v1/atoms/atm_1/trace",
+        headers: {},
+      },
+      { requireAuth: false },
+    );
+    const evidenceRefsResponse = await routeCogniWeaveHttpRequest(
+      service,
+      {
+        method: "GET",
+        url: "/v1/atoms/atm_1/evidence-refs",
+        headers: {},
+      },
+      { requireAuth: false },
+    );
 
     expect(traceResponse.status).toBe(200);
     expect(traceResponse.body).toEqual({ atomId: "atm_1" });
     expect(evidenceRefsResponse.status).toBe(200);
     expect(evidenceRefsResponse.body).toEqual(["atm_1"]);
+  });
+
+  it("enforces fail-closed auth, tenant matching, and protects /v1/metrics in service mode (CW-07A)", async () => {
+    const engine = new InMemoryCogniWeaveEngine({
+      environment: "service",
+      metadataBackend: "memory",
+      graphBackend: "memory",
+      evidenceBackend: "memory",
+      vectorBackend: "memory",
+    });
+    const service = new CogniWeaveRestService(engine);
+    const opts = {
+      validateToken: async (token: string) =>
+        token === "valid_tok" ? { tenantId: "t_1", userId: "u_1" } : null,
+    };
+
+    const health = await routeCogniWeaveHttpRequest(
+      service,
+      { method: "GET", url: "/healthz", headers: {} },
+      opts,
+    );
+    expect(health.status).toBe(200);
+
+    const unauthMetrics = await routeCogniWeaveHttpRequest(
+      service,
+      { method: "GET", url: "/v1/metrics", headers: {} },
+      opts,
+    );
+    expect(unauthMetrics.status).toBe(401);
+
+    const missingTenant = await routeCogniWeaveHttpRequest(
+      service,
+      {
+        method: "GET",
+        url: "/v1/metrics",
+        headers: { authorization: "Bearer valid_tok" },
+      },
+      opts,
+    );
+    expect(missingTenant.status).toBe(403);
+
+    const authedMetrics = await routeCogniWeaveHttpRequest(
+      service,
+      {
+        method: "GET",
+        url: "/v1/metrics",
+        headers: {
+          authorization: "Bearer valid_tok",
+          "x-cogniweave-tenant-id": "t_1",
+        },
+      },
+      opts,
+    );
+    expect(authedMetrics.status).toBe(200);
   });
 });

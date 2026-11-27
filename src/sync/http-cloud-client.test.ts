@@ -72,5 +72,22 @@ describe("HttpCloudIntelligenceClient (CW-07)", () => {
     expect(calls[0]?.headers.authorization).toBe("Bearer tok_1");
     expect(calls[0]?.headers["x-cogniweave-tenant-id"]).toBe("t_1");
     expect(calls[0]?.headers["Idempotency-Key"]).toBe("k1");
+
+    // Non-OK HTTP status must throw instead of masquerading as success.
+    const errClient = new HttpCloudIntelligenceClient({
+      baseUrl: "https://cloud.cogniweave.test/",
+      maxRetries: 0,
+      fetchFn: (async () =>
+        new Response(JSON.stringify({ ok: false, error: "internal" }), {
+          status: 500,
+          statusText: "Internal Server Error",
+        })) as typeof fetch,
+    });
+    await expect(
+      errClient.push(
+        { idempotencyKey: "k2", envelope: VALID_ENVELOPE, nonce: "n2", timestampMs: 2000 },
+        { tenantId: "t_1", deviceId: "dev_1", credential: "tok_1" },
+      ),
+    ).rejects.toThrow("Cloud HTTP 500");
   });
 });

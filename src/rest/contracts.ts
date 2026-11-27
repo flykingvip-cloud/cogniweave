@@ -17,8 +17,15 @@ export interface RestHeaders {
   [name: string]: string | undefined;
 }
 
+export interface RestPrincipal {
+  tenantId: string;
+  userId: string;
+  roles?: string[];
+}
+
 export interface RestContext {
   headers?: RestHeaders;
+  principal?: RestPrincipal;
 }
 
 export interface RestResponse<T> {
