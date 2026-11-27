@@ -53,19 +53,31 @@ describe("FileDurableJobStore (CW-07B)", () => {
         store1.checkpoint(j1.jobId, "stale_cp", 50, { workerId: "worker_1", fencingToken: 1 }),
       ).rejects.toThrow("Stale worker lease");
 
-      // J-04: Exponential backoff on retry -> dead_letter on maxAttempts
-      const retrying = await store1.fail(j1.jobId, "transient_err", 10_000, {
-        workerId: "worker_2",
-        fencingToken: 2,
-      });
+      // J-04 & CW-08-03: Exponential backoff on retry -> dead_letter on maxAttempts; mandatory lease
+      const retrying = await store1.fail(
+        j1.jobId,
+        "transient_err",
+        { workerId: "worker_2", fencingToken: 2 },
+        10_000,
+      );
       expect(retrying.status).toBe("retrying");
       expect(retrying.nextAttemptAt).toBe(new Date(11_000).toISOString());
 
-      const dlq = await store1.fail(j1.jobId, "fatal_err", 12_000);
+      const reclaimed2 = await store1.claimJob(j1.jobId, "worker_2", 5000, 11_500);
+      expect(reclaimed2?.fencingToken).toBe(3);
+
+      const dlq = await store1.fail(
+        j1.jobId,
+        "fatal_err",
+        { workerId: "worker_2", fencingToken: 3 },
+        12_000,
+      );
       expect(dlq.status).toBe("dead_letter");
 
       // J-07: State machine prevents completing or cancelling terminal DLQ job
-      await expect(store1.complete(j1.jobId, {})).rejects.toThrow("terminal job");
+      await expect(
+        store1.complete(j1.jobId, {}, { workerId: "worker_2", fencingToken: 3 }),
+      ).rejects.toThrow("terminal job");
       await expect(store1.cancel(j1.jobId)).rejects.toThrow("terminal job");
 
       // J-02: Corrupted JSON throws instead of silently overwriting

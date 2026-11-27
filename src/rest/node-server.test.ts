@@ -164,7 +164,9 @@ describe("CogniWeave HTTP server", () => {
     const service = new CogniWeaveRestService(engine);
     const opts = {
       validateToken: async (token: string) =>
-        token === "valid_tok" ? { tenantId: "t_1", userId: "u_1" } : null,
+        token === "valid_tok"
+          ? { tenantId: "t_1", userId: "u_1", allowedWorkspaceIds: ["ws_1"] }
+          : null,
     };
 
     const health = await routeCogniWeaveHttpRequest(
@@ -206,7 +208,35 @@ describe("CogniWeave HTTP server", () => {
     );
     expect(authedMetrics.status).toBe(200);
 
-    // CW-07A-R1: Cross-workspace body.scope without tenant_admin fails with 403 even without custom hook
+    // CW-08-01: Missing workspace scope on /v1/reason is rejected (403)
+    const missingWs = await routeCogniWeaveHttpRequest(
+      service,
+      {
+        method: "POST",
+        url: "/v1/reason",
+        headers: {
+          authorization: "Bearer valid_tok",
+          "x-cogniweave-tenant-id": "t_1",
+        },
+        body: JSON.stringify({
+          taskFrame: {
+            id: "tf_1",
+            scope: { workspaceId: "", projectId: "p1", agentId: "a1", visibility: "private" },
+            taskType: "operations",
+            goals: [],
+            problems: [],
+            scenarioTags: [],
+            constraints: [],
+            entities: [],
+            requiredAtomTypes: [],
+          },
+        }),
+      },
+      opts,
+    );
+    expect(missingWs.status).toBe(403);
+
+    // CW-08-01: Cross-workspace body.scope fails with 403
     const crossScopeReason = await routeCogniWeaveHttpRequest(
       service,
       {

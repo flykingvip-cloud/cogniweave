@@ -28,10 +28,13 @@ export interface ConsolidationPlan {
   preservedConflictCount: number;
 }
 
+export type CanonicalCommitStatus = "COMMITTED" | "PARTIAL_COMMIT" | "RECOVERY_REQUIRED";
+
 export interface AppliedConsolidationResult {
   plan: ConsolidationPlan;
   journalId: string;
   canonicalCommitted: boolean;
+  canonicalCommitStatus: CanonicalCommitStatus;
   derivedIndexesSynced: boolean;
   derivedSyncError?: string;
   updatedCanonicalIds: string[];
@@ -258,10 +261,13 @@ export async function applyConsolidation(params: {
     }
   };
 
+  let canonicalCommitStatus: CanonicalCommitStatus = "PARTIAL_COMMIT";
   if (params.metadataStore.withTransaction) {
     await params.metadataStore.withTransaction(runCanonicalWrites);
+    canonicalCommitStatus = "COMMITTED";
   } else {
     await runCanonicalWrites();
+    canonicalCommitStatus = updatedCanonicalIds.length === 0 ? "COMMITTED" : "PARTIAL_COMMIT";
   }
 
   let derivedIndexesSynced = false;
@@ -287,8 +293,14 @@ export async function applyConsolidation(params: {
   }
 
   await params.metadataStore.updateJournal(journalId, {
-    status: derivedIndexesSynced ? "COMPLETED" : "DERIVED_OUT_OF_SYNC",
-    phase: derivedIndexesSynced ? "COMPLETED" : "METADATA_COMMITTED",
+    status:
+      canonicalCommitStatus === "COMMITTED" && derivedIndexesSynced
+        ? "COMPLETED"
+        : "DERIVED_OUT_OF_SYNC",
+    phase:
+      canonicalCommitStatus === "COMMITTED" && derivedIndexesSynced
+        ? "COMPLETED"
+        : "METADATA_COMMITTED",
     objectIds: {
       ...journal.objectIds,
       atomIds: [...updatedCanonicalIds, ...deprecatedSourceIds],
@@ -300,7 +312,8 @@ export async function applyConsolidation(params: {
   return {
     plan: params.plan,
     journalId,
-    canonicalCommitted: true,
+    canonicalCommitted: canonicalCommitStatus === "COMMITTED",
+    canonicalCommitStatus,
     derivedIndexesSynced,
     ...(derivedSyncError ? { derivedSyncError } : {}),
     updatedCanonicalIds,

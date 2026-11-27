@@ -387,13 +387,41 @@ export class CogniWeaveMemoryResourceAdapter {
       version: existing.version + 1,
       updatedAt: new Date().toISOString(),
     };
+    // CW-08-06: Persist canonical revoked state + outbox event BEFORE external propagation.
     this.resources.set(resourceId, updated);
-    if (this.onRevoke) {
-      await this.onRevoke(updated);
-    }
     this.emitEvent("memory.resource.access.revoked", updated, ctx);
     await this.persist();
     return updated;
+  }
+
+  /**
+   * CW-08-06: Transactional Outbox consumer dispatcher.
+   * Only acknowledges events after the external consumer succeeds; failed events remain in outbox for retry.
+   */
+  async dispatchOutboxEvents(
+    consumer: (event: MemoryResourceDomainEvent) => Promise<void> | void,
+  ): Promise<{ delivered: number; failed: number }> {
+    const pending = await this.peekDomainEvents();
+    let delivered = 0;
+    let failed = 0;
+    const acked: string[] = [];
+    for (const event of pending) {
+      try {
+        if (event.eventType === "memory.resource.access.revoked" && this.onRevoke) {
+          const res = this.resources.get(event.resourceId);
+          if (res) await this.onRevoke(res);
+        }
+        await consumer(event);
+        acked.push(event.eventId);
+        delivered += 1;
+      } catch {
+        failed += 1;
+      }
+    }
+    if (acked.length > 0) {
+      await this.acknowledgeDomainEvents(acked);
+    }
+    return { delivered, failed };
   }
 
   async peekDomainEvents(): Promise<MemoryResourceDomainEvent[]> {

@@ -189,6 +189,7 @@ describe("Memory Optimization Engine (CW-04J)", () => {
       vectorStore: vectorWithoutDelete,
     });
     expect(res.canonicalCommitted).toBe(true);
+    expect(res.canonicalCommitStatus).toBe("COMMITTED");
     expect(res.derivedIndexesSynced).toBe(false);
     expect(res.derivedSyncError).toBe("derived_store_delete_unsupported");
     expect((await store.getJournal(res.journalId))?.status).toBe("DERIVED_OUT_OF_SYNC");
@@ -204,9 +205,43 @@ describe("Memory Optimization Engine (CW-04J)", () => {
       graphStore: new InMemoryGraphStore(),
       vectorStore: new InMemoryVectorStore(),
     });
-    expect(lifeRes.canonicalCommitted).toBe(true);
+    expect(lifeRes.canonicalCommitStatus).toBe("COMMITTED");
     expect(lifeRes.derivedIndexesSynced).toBe(true);
     expect((await store.getJournal(lifeRes.journalId))?.status).toBe("COMPLETED");
+
+    // CW-08-05: MetadataStore without withTransaction must report PARTIAL_COMMIT
+    const noTxStore = Object.assign(
+      Object.create(Object.getPrototypeOf(store)),
+      store,
+      { withTransaction: undefined },
+    ) as typeof store;
+    const b1 = makeAtom({ id: "atm_b1", dedupKey: "k_notx" });
+    const b2 = makeAtom({ id: "atm_b2", dedupKey: "k_notx" });
+    await noTxStore.saveAtom(b1);
+    await noTxStore.saveAtom(b2);
+    const noTxConsRes = await applyConsolidation({
+      plan: consolidateAtoms([b1, b2]),
+      metadataStore: noTxStore,
+      graphStore: new InMemoryGraphStore(),
+      vectorStore: new InMemoryVectorStore(),
+    });
+    expect(noTxConsRes.canonicalCommitted).toBe(false);
+    expect(noTxConsRes.canonicalCommitStatus).toBe("PARTIAL_COMMIT");
+    expect((await noTxStore.getJournal(noTxConsRes.journalId))?.status).toBe("DERIVED_OUT_OF_SYNC");
+
+    const tombNoTx = makeAtom({
+      id: "atm_tomb_notx",
+      lifecycle: { tombstonedAt: "2026-11-26T00:00:00Z" },
+    });
+    await noTxStore.saveAtom(tombNoTx);
+    const noTxLifeRes = await applyLifecycleDecisions({
+      evaluations: [evaluateLifecycle(tombNoTx, { nowMs: Date.parse("2026-11-27T00:00:00Z") })],
+      metadataStore: noTxStore,
+      graphStore: new InMemoryGraphStore(),
+      vectorStore: new InMemoryVectorStore(),
+    });
+    expect(noTxLifeRes.canonicalCommitStatus).toBe("PARTIAL_COMMIT");
+    expect((await noTxStore.getJournal(noTxLifeRes.journalId))?.status).toBe("DERIVED_OUT_OF_SYNC");
   });
 
   it("CW-04J-01 & CW-04J-05: requires authorized executionContext, rejects explicit idempotencyKey payload conflicts, and reports estimatedCanonicalClaimTokenDelta", async () => {
@@ -224,12 +259,13 @@ describe("Memory Optimization Engine (CW-04J)", () => {
         scope: SCOPE,
         subject: CALLER,
       });
+      await metadataStore.saveMemorySubjectBinding(binding);
 
-      // Unbound / forged caller rejected fail-closed before job enqueue.
+      // CW-08-02: Forged actorUserId without delegation rejected fail-closed
       await expect(
         runOptimizationJob({
           tenantId: "__local__",
-          subjectId: "subj_1",
+          subjectId: "agent_main",
           scope: SCOPE,
           optimizationType: "consolidation",
           atoms: [a1, a2],
@@ -237,28 +273,26 @@ describe("Memory Optimization Engine (CW-04J)", () => {
             actorUserId: "u_forged",
             tenantId: "__local__",
             scope: SCOPE,
-            caller: { tenantId: "__local__", ownerType: "agent", ownerId: "forged_agent" },
-            bindings: [binding],
+            caller: CALLER,
             dataPlaneId: "dp_1",
           },
           jobStore,
           metadataStore,
         }),
-      ).rejects.toThrow("unauthorized");
+      ).rejects.toThrow("not authorized to act for subject");
 
       const job = await runOptimizationJob({
         idempotencyKey: "explicit_key_1",
         tenantId: "__local__",
-        subjectId: "subj_1",
+        subjectId: "agent_main",
         scope: SCOPE,
         optimizationType: "consolidation",
         atoms: [a1, a2],
         executionContext: {
-          actorUserId: "u_1",
+          actorUserId: "agent_main",
           tenantId: "__local__",
           scope: SCOPE,
           caller: CALLER,
-          bindings: [binding],
           dataPlaneId: "dp_1",
         },
         jobStore,
@@ -274,12 +308,12 @@ describe("Memory Optimization Engine (CW-04J)", () => {
         runOptimizationJob({
           idempotencyKey: "explicit_key_1",
           tenantId: "__local__",
-          subjectId: "subj_1",
+          subjectId: "agent_main",
           scope: SCOPE,
           optimizationType: "consolidation",
           atoms: [a1, { ...a2, versioning: { version: 2 } }],
           executionContext: {
-            actorUserId: "u_1",
+            actorUserId: "agent_main",
             tenantId: "__local__",
             scope: SCOPE,
             caller: CALLER,

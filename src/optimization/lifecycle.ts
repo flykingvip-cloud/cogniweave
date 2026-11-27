@@ -40,9 +40,12 @@ export interface LifecycleEvaluation {
   reason: string;
 }
 
+export type LifecycleCanonicalCommitStatus = "COMMITTED" | "PARTIAL_COMMIT" | "RECOVERY_REQUIRED";
+
 export interface AppliedLifecycleResult {
   journalId: string;
   canonicalCommitted: boolean;
+  canonicalCommitStatus: LifecycleCanonicalCommitStatus;
   archivedIds: string[];
   deprecatedIds: string[];
   tombstonedIds: string[];
@@ -336,10 +339,15 @@ export async function applyLifecycleDecisions(params: {
     }
   };
 
+  let canonicalCommitStatus: LifecycleCanonicalCommitStatus = "PARTIAL_COMMIT";
   if (params.metadataStore.withTransaction) {
     await params.metadataStore.withTransaction(runBatch);
+    canonicalCommitStatus = "COMMITTED";
   } else {
     await runBatch();
+    canonicalCommitStatus = removeFromDerivedIds.length === 0 && revalidatedIds.length === 0 && deprioritizedIds.length === 0
+      ? "COMMITTED"
+      : "PARTIAL_COMMIT";
   }
 
   let derivedIndexesSynced = false;
@@ -364,8 +372,14 @@ export async function applyLifecycleDecisions(params: {
   }
 
   await params.metadataStore.updateJournal(journalId, {
-    status: derivedIndexesSynced ? "COMPLETED" : "DERIVED_OUT_OF_SYNC",
-    phase: derivedIndexesSynced ? "COMPLETED" : "METADATA_COMMITTED",
+    status:
+      canonicalCommitStatus === "COMMITTED" && derivedIndexesSynced
+        ? "COMPLETED"
+        : "DERIVED_OUT_OF_SYNC",
+    phase:
+      canonicalCommitStatus === "COMMITTED" && derivedIndexesSynced
+        ? "COMPLETED"
+        : "METADATA_COMMITTED",
     objectIds: {
       ...journal.objectIds,
       atomIds: [
@@ -383,7 +397,8 @@ export async function applyLifecycleDecisions(params: {
 
   return {
     journalId,
-    canonicalCommitted: true,
+    canonicalCommitted: canonicalCommitStatus === "COMMITTED",
+    canonicalCommitStatus,
     archivedIds,
     deprecatedIds,
     tombstonedIds,

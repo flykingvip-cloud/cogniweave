@@ -131,6 +131,16 @@ describe("MemoryGovernanceService (CW-05A/B/C)", () => {
         }),
       ).rejects.toThrow("Atom version mismatch");
 
+      // Evidence fingerprint mismatch rejected at publish time (CW-08-04)
+      await expect(
+        gov1.publishPromotion({
+          actor: SPACE_ADMIN,
+          candidateId: candidate.candidateId,
+          atom: { ...ATOM, provenance: { sourceEventIds: ["evt_1"], evidenceRefs: ["evd_tampered"] } },
+          publisher,
+        }),
+      ).rejects.toThrow("Evidence fingerprint changed");
+
       const published = await gov1.publishPromotion({
         actor: SPACE_ADMIN,
         candidateId: candidate.candidateId,

@@ -123,7 +123,16 @@ describe("CogniWeaveMemoryResourceAdapter (CW-06A/B)", () => {
         tenantId: "t_1",
         roles: ["tenant_admin"],
       });
+      // CW-08-06: Outbox consumer runs after persistence; failed consumer keeps event in outbox
+      const failOnce = await adapter.dispatchOutboxEvents(async () => {
+        throw new Error("downstream_unavailable");
+      });
+      expect(failOnce.failed).toBe(1);
       expect(revokedIds).toEqual(["res_team_1"]);
+
+      const delivered = await adapter.dispatchOutboxEvents(async () => {});
+      expect(delivered.delivered).toBe(1);
+      expect(await adapter.peekDomainEvents()).toEqual([]);
       expect(await adapter.checkAccess("res_team_1", ctx)).toEqual({
         allowed: false,
         denyReason: "resource_revoked",

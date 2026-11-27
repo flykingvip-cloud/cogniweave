@@ -21,6 +21,7 @@ export interface RestPrincipal {
   tenantId: string;
   userId: string;
   roles?: string[];
+  allowedWorkspaceIds?: string[];
 }
 
 export interface RestContext {

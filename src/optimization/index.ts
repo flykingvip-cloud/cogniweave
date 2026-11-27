@@ -9,6 +9,7 @@ export {
   applyConsolidation,
   consolidateAtoms,
   type AppliedConsolidationResult,
+  type CanonicalCommitStatus,
   type ConsolidationCluster,
   type ConsolidationPlan,
   type ConsolidationRelation,
@@ -20,6 +21,7 @@ export {
   evaluateLifecycle,
   type AppliedLifecycleResult,
   type LifecycleAction,
+  type LifecycleCanonicalCommitStatus,
   type LifecycleEvaluation,
   type LifecyclePolicy,
 } from "./lifecycle.js";

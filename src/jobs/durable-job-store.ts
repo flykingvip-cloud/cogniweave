@@ -61,19 +61,20 @@ export interface DurableJobStore {
     jobId: string,
     checkpoint: string,
     progress: number,
-    lease?: { workerId: string; fencingToken: number },
+    lease: { workerId: string; fencingToken: number },
   ): Promise<DurableJobRecord>;
   complete<Result>(
     jobId: string,
     result: Result,
-    lease?: { workerId: string; fencingToken: number },
+    lease: { workerId: string; fencingToken: number },
   ): Promise<DurableJobRecord<unknown, Result>>;
   fail(
     jobId: string,
     error: string,
+    lease: { workerId: string; fencingToken: number },
     nowMs?: number,
-    lease?: { workerId: string; fencingToken: number },
   ): Promise<DurableJobRecord>;
+  adminForceCancel(jobId: string, adminActorId: string): Promise<DurableJobRecord>;
   cancel(jobId: string): Promise<DurableJobRecord>;
   listDeadLetters(tenantId?: string): Promise<DurableJobRecord[]>;
 }
@@ -266,9 +267,11 @@ export class FileDurableJobStore implements DurableJobStore {
 
   private assertLease(
     existing: DurableJobRecord,
-    lease?: { workerId: string; fencingToken: number },
+    lease: { workerId: string; fencingToken: number },
   ): void {
-    if (!lease) return;
+    if (!lease || !lease.workerId.trim() || typeof lease.fencingToken !== "number") {
+      throw new Error(`Worker lease (workerId + fencingToken) is required for job ${existing.jobId}`);
+    }
     if (
       existing.claimedByWorkerId !== lease.workerId ||
       existing.fencingToken !== lease.fencingToken
@@ -283,7 +286,7 @@ export class FileDurableJobStore implements DurableJobStore {
     jobId: string,
     checkpoint: string,
     progress: number,
-    lease?: { workerId: string; fencingToken: number },
+    lease: { workerId: string; fencingToken: number },
   ): Promise<DurableJobRecord> {
     await this.ensureLoaded();
     const existing = this.jobs.get(jobId);
@@ -307,7 +310,7 @@ export class FileDurableJobStore implements DurableJobStore {
   async complete<Result>(
     jobId: string,
     result: Result,
-    lease?: { workerId: string; fencingToken: number },
+    lease: { workerId: string; fencingToken: number },
   ): Promise<DurableJobRecord<unknown, Result>> {
     await this.ensureLoaded();
     const existing = this.jobs.get(jobId);
@@ -335,8 +338,8 @@ export class FileDurableJobStore implements DurableJobStore {
   async fail(
     jobId: string,
     error: string,
+    lease: { workerId: string; fencingToken: number },
     nowMs = Date.now(),
-    lease?: { workerId: string; fencingToken: number },
   ): Promise<DurableJobRecord> {
     await this.ensureLoaded();
     const existing = this.jobs.get(jobId);
@@ -362,6 +365,11 @@ export class FileDurableJobStore implements DurableJobStore {
     this.jobs.set(jobId, updated);
     await this.persist();
     return updated;
+  }
+
+  async adminForceCancel(jobId: string, adminActorId: string): Promise<DurableJobRecord> {
+    if (!adminActorId.trim()) throw new Error("adminActorId is required");
+    return this.cancel(jobId);
   }
 
   async cancel(jobId: string): Promise<DurableJobRecord> {

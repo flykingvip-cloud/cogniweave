@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { MemoryAtom, MemorySubject, MemorySubjectBinding, Scope } from "../models.js";
@@ -342,6 +342,7 @@ export class MemoryGovernanceService {
     actor: GovernanceActorContext;
     candidateId: string;
     decision: "approved" | "rejected";
+    approvedAtom?: MemoryAtom;
     approvedAtomVersion?: number;
     reason?: string;
     now?: string;
@@ -372,13 +373,23 @@ export class MemoryGovernanceService {
       throw new Error(`Promotion candidate ${params.candidateId} is already ${existing.status}`);
     }
 
+    const approvedVersion = params.approvedAtom?.versioning.version ?? params.approvedAtomVersion;
+    if (params.decision === "approved" && approvedVersion === undefined) {
+      throw new Error("Approving a promotion requires approvedAtom or approvedAtomVersion");
+    }
+    const evidenceForDigest = params.approvedAtom?.provenance.evidenceRefs ?? existing.evidenceRefs;
+    const approvedEvidenceDigest = createHash("sha256")
+      .update(JSON.stringify([...evidenceForDigest].toSorted()))
+      .digest("hex")
+      .slice(0, 32);
+
     const now = params.now ?? new Date().toISOString();
     const updated: PromotionCandidate = {
       ...existing,
       status: params.decision,
       reviewedByUserId: params.actor.userId,
-      ...(params.decision === "approved" && params.approvedAtomVersion !== undefined
-        ? { approvedAtomVersion: params.approvedAtomVersion }
+      ...(params.decision === "approved"
+        ? { approvedAtomVersion: approvedVersion, approvedEvidenceDigest }
         : {}),
       decisionReason: params.reason,
       updatedAt: now,
@@ -433,16 +444,23 @@ export class MemoryGovernanceService {
     if (params.atom.id !== existing.atomId) {
       throw new Error(`Atom mismatch: expected ${existing.atomId}, got ${params.atom.id}`);
     }
-    if (
-      existing.approvedAtomVersion !== undefined &&
-      params.atom.versioning.version !== existing.approvedAtomVersion
-    ) {
+    if (existing.approvedAtomVersion === undefined || !existing.approvedEvidenceDigest) {
+      throw new Error("Promotion candidate is missing mandatory approval version/evidence fingerprint");
+    }
+    if (params.atom.versioning.version !== existing.approvedAtomVersion) {
       throw new Error(
         `Atom version mismatch: approved version ${existing.approvedAtomVersion}, got ${params.atom.versioning.version}`,
       );
     }
-    if ((params.atom.provenance?.evidenceRefs?.length ?? 0) === 0) {
-      throw new Error("Cannot publish candidate without valid evidence references");
+    const currentEvidenceDigest = createHash("sha256")
+      .update(JSON.stringify([...(params.atom.provenance?.evidenceRefs ?? [])].toSorted()))
+      .digest("hex")
+      .slice(0, 32);
+    if (currentEvidenceDigest !== existing.approvedEvidenceDigest) {
+      throw new Error("Evidence fingerprint changed since approval; re-approval required");
+    }
+    if (params.atom.state.status !== "active") {
+      throw new Error(`Cannot publish non-active atom (status=${params.atom.state.status})`);
     }
 
     const { assetId } = await params.publisher.publishAtom({

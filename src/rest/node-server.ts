@@ -147,14 +147,19 @@ async function routeEnvelope(
     });
   }
 
-  // CW-07A-R1: Unified mandatory resource/tenant authorization across ALL business routes.
+  // CW-08-01: Mandatory unified resource/workspace authorization.
+  // Never allows missing workspaceId, never compares workspaceId === tenantId, and never lets tenant_admin bypass.
   const authorizeRequestResource = async (workspaceId?: string): Promise<RestResponse<unknown> | null> => {
     if (!requireAuth) return null;
     if (!principal) {
       return responseBody(401, { error: "unauthorized" });
     }
+    const targetWs = (workspaceId ?? envelope.headers["x-cogniweave-workspace-id"] ?? "").trim();
+    if (!targetWs) {
+      metrics.unauthorizedTotal += 1;
+      return responseBody(403, { error: "missing_workspace_scope" });
+    }
     if (options?.authorizeTenantScope) {
-      const targetWs = workspaceId ?? envelope.headers["x-cogniweave-workspace-id"] ?? "";
       const ok = await options.authorizeTenantScope(principal, targetWs);
       if (!ok) {
         metrics.unauthorizedTotal += 1;
@@ -162,17 +167,35 @@ async function routeEnvelope(
       }
       return null;
     }
-    // Fail-closed fallback when no custom authorizeTenantScope hook is provided:
-    // require tenant_admin role OR workspaceId === principal.tenantId (when workspaceId is specified).
-    if (
-      workspaceId &&
-      workspaceId !== principal.tenantId &&
-      !(principal.roles ?? []).includes("tenant_admin")
-    ) {
-      metrics.unauthorizedTotal += 1;
-      return responseBody(403, { error: "scope_tenant_forbidden" });
+    if (principal.allowedWorkspaceIds?.includes(targetWs)) {
+      return null;
     }
-    return null;
+    metrics.unauthorizedTotal += 1;
+    return responseBody(403, { error: "scope_tenant_forbidden" });
+  };
+
+  const resolveScopeWorkspaceForResource = async (
+    kind: "atom" | "package" | "session" | "journal",
+    id: string,
+  ): Promise<{ found: boolean; workspaceId?: string }> => {
+    try {
+      if (kind === "atom") {
+        const t = await service.trace(id);
+        return { found: true, workspaceId: t.atom.scope.workspaceId };
+      }
+      if (kind === "package") {
+        const p = await service.tracePackage(id);
+        return { found: true, workspaceId: p.taskFrame?.scope.workspaceId };
+      }
+      if (kind === "session") {
+        const s = await service.traceReasoningSession(id);
+        return { found: true, workspaceId: s.taskFrame?.scope.workspaceId };
+      }
+      const j = await service.getWriteJournal(id);
+      return { found: true, workspaceId: j.objectIds ? envelope.headers["x-cogniweave-workspace-id"] : undefined };
+    } catch {
+      return { found: false };
+    }
   };
 
   if (method === "POST" && pathname === "/v1/tasks/frame") {
@@ -215,28 +238,28 @@ async function routeEnvelope(
   // CW-06 Memory Resource HTTP routes
   if (options?.resourceAdapter) {
     if (method === "GET" && pathname === "/v1/memory-resources") {
-      const denied = await authorizeRequestResource();
+      const denied = await authorizeRequestResource(envelope.headers["x-cogniweave-workspace-id"]);
       if (denied) return denied;
       return responseBody(200, await options.resourceAdapter.listResources(principal?.tenantId));
     }
     const resMatch = pathname.match(/^\/v1\/memory-resources\/([^/]+)$/);
     if (method === "GET" && resMatch) {
-      const denied = await authorizeRequestResource();
-      if (denied) return denied;
       const desc = await options.resourceAdapter.describeResource(resMatch[1]);
       if (!desc || (principal && desc.tenantId !== principal.tenantId)) {
         return responseBody(404, { error: "resource_not_found" });
       }
+      const denied = await authorizeRequestResource(desc.scope.workspaceId);
+      if (denied) return denied;
       return responseBody(200, desc);
     }
     const revokeMatch = pathname.match(/^\/v1\/memory-resources\/([^/]+)\/revoke$/);
     if (method === "POST" && revokeMatch) {
-      const denied = await authorizeRequestResource();
-      if (denied) return denied;
       const desc = await options.resourceAdapter.describeResource(revokeMatch[1]);
       if (!desc || (principal && desc.tenantId !== principal.tenantId)) {
         return responseBody(404, { error: "resource_not_found" });
       }
+      const denied = await authorizeRequestResource(desc.scope.workspaceId);
+      if (denied) return denied;
       if (!principal) {
         return responseBody(401, { error: "unauthorized" });
       }
@@ -250,29 +273,45 @@ async function routeEnvelope(
 
   const traceAtomMatch = pathname.match(/^\/v1\/atoms\/([^/]+)\/trace$/);
   if (method === "GET" && traceAtomMatch) {
-    const denied = await authorizeRequestResource();
-    if (denied) return denied;
+    if (requireAuth) {
+      const resolved = await resolveScopeWorkspaceForResource("atom", traceAtomMatch[1]);
+      if (!resolved.found) return responseBody(404, { error: "not_found" });
+      const denied = await authorizeRequestResource(resolved.workspaceId);
+      if (denied) return denied;
+    }
     return service.handleTraceAtom(traceAtomMatch[1], context);
   }
 
   const evidenceRefsMatch = pathname.match(/^\/v1\/atoms\/([^/]+)\/evidence-refs$/);
   if (method === "GET" && evidenceRefsMatch) {
-    const denied = await authorizeRequestResource();
-    if (denied) return denied;
+    if (requireAuth) {
+      const resolved = await resolveScopeWorkspaceForResource("atom", evidenceRefsMatch[1]);
+      if (!resolved.found) return responseBody(404, { error: "not_found" });
+      const denied = await authorizeRequestResource(resolved.workspaceId);
+      if (denied) return denied;
+    }
     return service.handleGetEvidenceRefs(evidenceRefsMatch[1], context);
   }
 
   const packageTraceMatch = pathname.match(/^\/v1\/packages\/([^/]+)\/trace$/);
   if (method === "GET" && packageTraceMatch) {
-    const denied = await authorizeRequestResource();
-    if (denied) return denied;
+    if (requireAuth) {
+      const resolved = await resolveScopeWorkspaceForResource("package", packageTraceMatch[1]);
+      if (!resolved.found) return responseBody(404, { error: "not_found" });
+      const denied = await authorizeRequestResource(resolved.workspaceId);
+      if (denied) return denied;
+    }
     return service.handleTracePackage(packageTraceMatch[1], context);
   }
 
   const reasoningSessionTraceMatch = pathname.match(/^\/v1\/reasoning-sessions\/([^/]+)\/trace$/);
   if (method === "GET" && reasoningSessionTraceMatch) {
-    const denied = await authorizeRequestResource();
-    if (denied) return denied;
+    if (requireAuth) {
+      const resolved = await resolveScopeWorkspaceForResource("session", reasoningSessionTraceMatch[1]);
+      if (!resolved.found) return responseBody(404, { error: "not_found" });
+      const denied = await authorizeRequestResource(resolved.workspaceId);
+      if (denied) return denied;
+    }
     return service.handleTraceReasoningSession(reasoningSessionTraceMatch[1], context);
   }
 
@@ -289,18 +328,24 @@ async function routeEnvelope(
     return service.handleRepairIndexes(body, context);
   }
   if (method === "POST" && pathname === "/v1/rebuild/from-truth") {
-    const denied = await authorizeRequestResource();
-    if (denied) return denied;
-    return service.handleRebuildFromTruth(
-      parseBody<RebuildFromTruthRequest>(envelope.body),
-      context,
+    const body = parseBody<RebuildFromTruthRequest>(envelope.body);
+    const denied = await authorizeRequestResource(
+      body.objectType === "atom"
+        ? (await resolveScopeWorkspaceForResource("atom", body.objectId)).workspaceId
+        : undefined,
     );
+    if (denied) return denied;
+    return service.handleRebuildFromTruth(body, context);
   }
 
   const journalMatch = pathname.match(/^\/v1\/journals\/([^/]+)$/);
   if (method === "GET" && journalMatch) {
-    const denied = await authorizeRequestResource();
-    if (denied) return denied;
+    if (requireAuth) {
+      const resolved = await resolveScopeWorkspaceForResource("journal", journalMatch[1]);
+      if (!resolved.found) return responseBody(404, { error: "not_found" });
+      const denied = await authorizeRequestResource(resolved.workspaceId);
+      if (denied) return denied;
+    }
     return service.handleGetWriteJournal(journalMatch[1], context);
   }
 

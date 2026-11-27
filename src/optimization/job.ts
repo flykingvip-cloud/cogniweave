@@ -33,8 +33,12 @@ export interface OptimizationExecutionContext {
   tenantId: string;
   scope: Scope;
   caller: MemorySubject;
-  bindings: ReadonlyArray<MemorySubjectBinding>;
+  /** Authoritative fallback bindings when metadataStore.listMemorySubjectBindings is unavailable. */
+  bindings?: ReadonlyArray<MemorySubjectBinding>;
+  /** Explicit delegation list if actorUserId acts on behalf of another caller ownerId. */
+  delegatedActorFor?: ReadonlyArray<string>;
   dataPlaneId: string;
+  workerId?: string;
   allowLifecycleMutations?: boolean;
 }
 
@@ -146,9 +150,32 @@ export async function runOptimizationJob(params: {
   if (computeScopeFingerprint(ctx.scope) !== expectedScopeFp) {
     throw new Error("OptimizationExecutionContext scope mismatch");
   }
+  // CW-08-02: Bind actorUserId -> caller.ownerId and subjectId -> caller.ownerId
+  if (params.subjectId !== ctx.caller.ownerId) {
+    throw new Error(
+      `Optimization subjectId (${params.subjectId}) does not match caller (${ctx.caller.ownerId})`,
+    );
+  }
+  const actorAuthorizedForCaller =
+    ctx.actorUserId === ctx.caller.ownerId ||
+    (ctx.delegatedActorFor ?? []).includes(ctx.caller.ownerId);
+  if (!actorAuthorizedForCaller) {
+    throw new Error(
+      `Actor ${ctx.actorUserId} is not authorized to act for subject ${ctx.caller.ownerId}`,
+    );
+  }
+
+  // Prefer authoritative bindings from MetadataStore when available.
+  const authoritativeBindings = params.metadataStore?.listMemorySubjectBindings
+    ? await params.metadataStore.listMemorySubjectBindings({
+        tenantId: params.tenantId,
+        dataPlaneId: ctx.dataPlaneId,
+        liveOnly: true,
+      })
+    : (ctx.bindings ?? []);
 
   const targetPartition = createMemoryPartitionKeyV1(ctx.dataPlaneId, params.scope);
-  const scopeAcl = authorizeMemoryAccess(ctx.bindings, {
+  const scopeAcl = authorizeMemoryAccess(authoritativeBindings, {
     partition: targetPartition,
     caller: ctx.caller,
   });
@@ -163,7 +190,7 @@ export async function runOptimizationJob(params: {
       );
     }
     const atomPartition = createMemoryPartitionKeyV1(ctx.dataPlaneId, atom.scope);
-    const atomAcl = authorizeMemoryAccess(ctx.bindings, {
+    const atomAcl = authorizeMemoryAccess(authoritativeBindings, {
       partition: atomPartition,
       caller: ctx.caller,
     });
@@ -189,6 +216,7 @@ export async function runOptimizationJob(params: {
 
   let jobId = `opt_${idempotencyKey.slice(0, 12)}`;
   let createdAt = new Date(params.nowMs ?? Date.now()).toISOString();
+  let lease: { workerId: string; fencingToken: number } | undefined;
 
   if (params.jobStore) {
     const record = await params.jobStore.enqueue({
@@ -224,6 +252,12 @@ export async function runOptimizationJob(params: {
         completedAt: record.completedAt,
       };
     }
+    const workerId = ctx.workerId ?? `opt_worker_${ctx.actorUserId}`;
+    const claimed = await params.jobStore.claimJob(jobId, workerId, 60_000, params.nowMs);
+    if (!claimed) {
+      throw new Error(`Unable to claim optimization job ${jobId} for worker ${workerId}`);
+    }
+    lease = { workerId, fencingToken: claimed.fencingToken };
   }
 
   try {
@@ -240,16 +274,16 @@ export async function runOptimizationJob(params: {
       params.optimizationType === "full" || params.optimizationType === "consolidation"
         ? consolidateAtoms(params.atoms)
         : undefined;
-    if (params.jobStore) {
-      await params.jobStore.checkpoint(jobId, "consolidation_planned", 35);
+    if (params.jobStore && lease) {
+      await params.jobStore.checkpoint(jobId, "consolidation_planned", 35, lease);
     }
 
     const abstraction =
       params.optimizationType === "full" || params.optimizationType === "abstraction"
         ? abstractFromAtoms({ atoms: params.atoms })
         : undefined;
-    if (params.jobStore) {
-      await params.jobStore.checkpoint(jobId, "abstraction_evaluated", 60);
+    if (params.jobStore && lease) {
+      await params.jobStore.checkpoint(jobId, "abstraction_evaluated", 60, lease);
     }
 
     const lifecycleEvaluations =
@@ -345,8 +379,8 @@ export async function runOptimizationJob(params: {
     };
 
     const completedAt = new Date(params.nowMs ?? Date.now()).toISOString();
-    if (params.jobStore) {
-      await params.jobStore.complete(jobId, report);
+    if (params.jobStore && lease) {
+      await params.jobStore.complete(jobId, report, lease);
     }
 
     return {
@@ -367,8 +401,8 @@ export async function runOptimizationJob(params: {
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    if (params.jobStore) {
-      await params.jobStore.fail(jobId, message);
+    if (params.jobStore && lease) {
+      await params.jobStore.fail(jobId, message, lease, params.nowMs);
     }
     return {
       jobId,
