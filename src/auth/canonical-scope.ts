@@ -98,9 +98,10 @@ export type CanonicalAuthorizationSuccess = {
 
 export type CanonicalAuthorizationFailure = {
   allowed: false;
-  httpStatus: 401 | 404 | 503;
+  httpStatus: 401 | 403 | 404 | 503;
   error:
     | "unauthorized"
+    | "tenant_mismatch"
     | "not_found"
     | "store_unavailable"
     | "binding_store_unavailable"
@@ -271,6 +272,151 @@ function deny(
   return { allowed: false, httpStatus, error };
 }
 
+export function isPrincipalTenantConsistent(
+  principal: Pick<ResourceCallerPrincipal, "tenantId" | "subject">,
+): boolean {
+  return Boolean(principal.subject && principal.tenantId === principal.subject.tenantId);
+}
+
+export type DeclaredScopeAuthorizationSuccess = {
+  allowed: true;
+  scope: Scope;
+  bindingId: string;
+};
+
+export type DeclaredScopeAuthorizationFailure = {
+  allowed: false;
+  httpStatus: 401 | 403 | 503;
+  error:
+    | "unauthorized"
+    | "tenant_mismatch"
+    | "missing_workspace_scope"
+    | "missing_declared_scope"
+    | "scope_tenant_forbidden"
+    | "subject_binding_denied"
+    | "binding_store_unavailable"
+    | "principal_unavailable";
+};
+
+export type DeclaredScopeAuthorizationDecision =
+  | DeclaredScopeAuthorizationSuccess
+  | DeclaredScopeAuthorizationFailure;
+
+function declaredDeny(
+  httpStatus: DeclaredScopeAuthorizationFailure["httpStatus"],
+  error: DeclaredScopeAuthorizationFailure["error"],
+): DeclaredScopeAuthorizationFailure {
+  return { allowed: false, httpStatus, error };
+}
+
+/**
+ * CW-09-01-R1: authorize a caller-declared Scope (create/write/list filters)
+ * with the same Subject Binding strictness as Canonical Resource ID authorization.
+ * Workspace access alone is not sufficient.
+ */
+export async function authorizeDeclaredScope(input: {
+  principal?: ResourceCallerPrincipal;
+  scope?: Scope | null;
+  authorizeWorkspace: (workspaceId: string) => Promise<boolean>;
+  bindingQuery?: AuthoritativeBindingQuery;
+  ensureDataPlaneId?: () => Promise<string>;
+}): Promise<DeclaredScopeAuthorizationDecision> {
+  if (!input.principal) {
+    return declaredDeny(401, "unauthorized");
+  }
+  const principal = input.principal;
+  const workspaceId = input.scope?.workspaceId?.trim() ?? "";
+  if (!workspaceId) {
+    return declaredDeny(403, "missing_workspace_scope");
+  }
+  if (!isCompleteScope(input.scope)) {
+    return declaredDeny(403, "missing_declared_scope");
+  }
+  const scope = input.scope;
+
+  const workspaceOk = await input.authorizeWorkspace(scope.workspaceId);
+  if (!workspaceOk) {
+    return declaredDeny(403, "scope_tenant_forbidden");
+  }
+
+  if (!principal.subject) {
+    return declaredDeny(503, "principal_unavailable");
+  }
+  if (principal.tenantId !== principal.subject.tenantId) {
+    return declaredDeny(403, "tenant_mismatch");
+  }
+  const verifiedTenantId = principal.tenantId;
+  const callerSubject = principal.subject;
+
+  if (!input.bindingQuery) {
+    return declaredDeny(503, "binding_store_unavailable");
+  }
+  let dataPlaneId: string;
+  try {
+    dataPlaneId = (await input.ensureDataPlaneId?.())?.trim() ?? "";
+  } catch {
+    return declaredDeny(503, "binding_store_unavailable");
+  }
+  if (!dataPlaneId) {
+    return declaredDeny(503, "binding_store_unavailable");
+  }
+
+  let bindings: MemorySubjectBinding[];
+  try {
+    bindings = await input.bindingQuery.listLiveBindings({
+      tenantId: verifiedTenantId,
+      dataPlaneId,
+      scope,
+    });
+  } catch {
+    return declaredDeny(503, "binding_store_unavailable");
+  }
+
+  const partition = createMemoryPartitionKeyV1(dataPlaneId, scope);
+  const acl = authorizeMemoryAccess(bindings, {
+    partition,
+    caller: callerSubject,
+  });
+  if (!acl.allowed) {
+    return declaredDeny(403, "subject_binding_denied");
+  }
+
+  return { allowed: true, scope, bindingId: acl.bindingId };
+}
+
+/**
+ * List-filter for Memory Resource descriptors after declared-scope authorization.
+ * A live binding for the Scope is not enough to reveal another Subject's descriptor.
+ */
+export function isAuthorizedMemoryResourceDescriptor(input: {
+  principal: ResourceCallerPrincipal;
+  descriptor: {
+    tenantId?: string;
+    ownerType?: MemorySubject["ownerType"];
+    ownerId?: string;
+    subjectBindingId?: string;
+    lifecycleStatus?: string;
+  };
+  bindingId: string;
+}): boolean {
+  const principal = input.principal;
+  if (!principal.subject || principal.tenantId !== principal.subject.tenantId) {
+    return false;
+  }
+  if (!input.bindingId.trim()) return false;
+  const desc = input.descriptor;
+  if (desc.tenantId && desc.tenantId !== principal.tenantId) return false;
+  if (desc.lifecycleStatus && desc.lifecycleStatus !== "active") return false;
+  if (desc.subjectBindingId && desc.subjectBindingId !== input.bindingId) return false;
+  if (desc.ownerType && desc.ownerId) {
+    const ownerMatches =
+      (desc.ownerType === principal.subject.ownerType && desc.ownerId === principal.subject.ownerId) ||
+      (desc.ownerType === "user" && desc.ownerId === principal.userId);
+    if (!ownerMatches) return false;
+  }
+  return Boolean(desc.subjectBindingId || (desc.ownerType && desc.ownerId));
+}
+
 export async function authorizeCanonicalResource(input: {
   kind: CanonicalResourceKind;
   id: string;
@@ -289,6 +435,14 @@ export async function authorizeCanonicalResource(input: {
     return deny(401, "unauthorized");
   }
   const principal = input.principal;
+  if (!principal.subject) {
+    return deny(503, "principal_unavailable");
+  }
+  if (principal.tenantId !== principal.subject.tenantId) {
+    return deny(403, "tenant_mismatch");
+  }
+  const verifiedTenantId = principal.tenantId;
+  const callerSubject = principal.subject;
   const mode = input.mode ?? "read";
 
   let resolved: CanonicalResourceScope;
@@ -308,7 +462,7 @@ export async function authorizeCanonicalResource(input: {
     return deny(404, "not_found");
   }
 
-  if (resolved.tenantId && resolved.tenantId !== principal.tenantId) {
+  if (resolved.tenantId && resolved.tenantId !== verifiedTenantId) {
     return deny(404, "not_found");
   }
 
@@ -320,9 +474,6 @@ export async function authorizeCanonicalResource(input: {
   if (mode === "read") {
     if (!input.bindingQuery) {
       return deny(503, "binding_store_unavailable");
-    }
-    if (!principal.subject) {
-      return deny(503, "principal_unavailable");
     }
     let dataPlaneId: string;
     try {
@@ -336,7 +487,7 @@ export async function authorizeCanonicalResource(input: {
     let bindings: MemorySubjectBinding[];
     try {
       bindings = await input.bindingQuery.listLiveBindings({
-        tenantId: principal.subject.tenantId,
+        tenantId: verifiedTenantId,
         dataPlaneId,
         scope: resolved.scope,
       });
@@ -346,7 +497,7 @@ export async function authorizeCanonicalResource(input: {
     const partition = createMemoryPartitionKeyV1(dataPlaneId, resolved.scope);
     const acl = authorizeMemoryAccess(bindings, {
       partition,
-      caller: principal.subject,
+      caller: callerSubject,
     });
     if (!acl.allowed) {
       return deny(404, "not_found");
