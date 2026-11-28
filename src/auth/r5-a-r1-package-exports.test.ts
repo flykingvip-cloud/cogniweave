@@ -140,11 +140,12 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
   let packedFiles: string[] = [];
 
   beforeAll(() => {
+    execFileSync("pnpm", ["build"], {
+      cwd: packageRoot,
+      stdio: "pipe",
+    });
     if (!publishedLayoutIsBundled()) {
-      execFileSync("pnpm", ["build"], {
-        cwd: packageRoot,
-        stdio: "pipe",
-      });
+      throw new Error("pnpm build did not produce the bundled public SDK layout");
     }
     tempRoot = mkdtempSync(join(tmpdir(), "cogniweave-r5-a-r1-"));
     const packDir = join(tempRoot, "pack");
@@ -580,6 +581,321 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
       repaired: string;
     };
     expect(payload).toMatchObject({ ok: true, rebuilt: "REBUILT", repaired: "SYNCED" });
+    expect(payload.sourceIds).toEqual(["sb_same_backfill"]);
+  });
+
+  it("does not leak Engine stores or unguarded internals to a packed JavaScript consumer", () => {
+    const result = runNode(
+      `
+        const sdk = await import("@cogniweave/sdk");
+        const NOW = "2026-11-28T00:00:00.000Z";
+        const scope = { workspaceId: "ws_1", projectId: "proj_1", agentId: "agent_main", visibility: "private" };
+        const foreign = { workspaceId: "ws_other", projectId: "proj_1", agentId: "agent_main", visibility: "private" };
+        const store = new sdk.InMemoryMetadataStore();
+        const evidence = {
+          id: "ev_shared",
+          type: "document",
+          uri: "msrc://shared_src",
+          snippet: "shared",
+          trustScore: 0.9,
+          scope,
+          locator: { messageIds: [], toolCallIds: [] },
+        };
+        const atom = {
+          id: "atm_probe",
+          atomType: "strategy",
+          scope,
+          claim: { type: "procedural", statement: "original-claim" },
+          trigger: { conditions: [], contextTags: [] },
+          applicability: { include: [], exclude: [] },
+          provenance: { sourceEventIds: [], evidenceRefs: [evidence.id] },
+          versioning: { version: 1 },
+          state: { status: "active", conflictsWith: [] },
+          metrics: { confidence: 0.8, reuseCount: 0 },
+          dedupKey: "atm_probe",
+        };
+        await store.saveEvidence(evidence);
+        await store.saveAtom(atom);
+        await store.saveSourceBinding({
+          id: "sb_same_backfill",
+          sourceIdentityId: "shared_src",
+          sourceLocator: "msrc://shared_src",
+          status: "active",
+          scope,
+          createdAt: NOW,
+          updatedAt: NOW,
+        });
+        await store.saveSourceBinding({
+          id: "sb_foreign_backfill",
+          sourceIdentityId: "shared_src",
+          sourceLocator: "msrc://shared_src#foreign",
+          status: "active",
+          scope: foreign,
+          createdAt: NOW,
+          updatedAt: NOW,
+        });
+
+        const engine = new sdk.InMemoryCogniWeaveEngine({
+          environment: "local",
+          metadataBackend: "memory",
+          graphBackend: "memory",
+          evidenceBackend: "memory",
+          vectorBackend: "memory",
+        }, { metadataStore: store });
+
+        const STORE_KEYS = [
+          "metadataStore",
+          "graphStore",
+          "vectorStore",
+          "_metadataStore",
+          "_graphStore",
+          "_vectorStore",
+          "stores",
+          "#metadataStore",
+          "#graphStore",
+          "#vectorStore",
+        ];
+        const METHOD_NAMES = [
+          "initializeTrustedRuntime",
+          "assertEngineAuthorized",
+          "ensureSourceLifecycleHydrated",
+          "hydrateSourceLifecycleFromStore",
+          "persistSourceBinding",
+          "persistSourceObjectLink",
+          "makeSourceObjectLinkId",
+          "liveSourceObjectLinks",
+          "ensureEvidenceLinksForBinding",
+          "ensureAtomLinksForBinding",
+          "evidenceRefsBelongToBinding",
+          "ensureDerivedObjectLink",
+          "backfillSiblingDerivedLinks",
+          "ensureEventLinksForBinding",
+          "ensureRelationLinksForBinding",
+          "ensureProvenanceObjectLinksForBinding",
+          "recomputeProvenanceObjectAfterSourceChange",
+          "recomputeRelationAfterSourceChange",
+          "objectStillSupportedByLiveEvidence",
+          "purgeOrphanObjectsForBinding",
+          "removeObjectLinkRows",
+          "recomputeAtomAfterSourceChange",
+          "persistSourceLifecycleReceipt",
+          "loadSourceLifecycleReceipt",
+          "runMetadataTransaction",
+          "resolveWriteOperationKey",
+          "persistWriteOperation",
+          "authorizeQueryAccess",
+          "resolveJournalCanonicalScope",
+          "journalsMatchingResolvedScope",
+          "isAuthorizedLiveSourceBinding",
+          "evidenceMatchesBinding",
+          "findSourceBinding",
+          "ensureSourceBinding",
+          "applySourceLifecycle",
+          "canonicalResolver",
+          "canonicalLookup",
+          "resolveCanonicalResourceScopeForAuthorization",
+          "isEvidenceRetrievable",
+        ];
+
+        function collectKeys(value) {
+          const names = [];
+          const seen = new Set();
+          let current = value;
+          while (current && current !== Object.prototype && !seen.has(current)) {
+            seen.add(current);
+            for (const key of Reflect.ownKeys(current)) {
+              names.push(typeof key === "symbol" ? String(key) : String(key));
+            }
+            current = Object.getPrototypeOf(current);
+          }
+          return names;
+        }
+
+        const visible = collectKeys(engine);
+        const leakedNames = [...STORE_KEYS, ...METHOD_NAMES].filter((name) => visible.includes(name));
+        if (leakedNames.length > 0) {
+          throw new Error("internal names visible on instance or prototype: " + leakedNames.join(","));
+        }
+
+        const usableStores = [];
+        const storeMutations = [];
+        const access = {
+          dotMetadataStore: engine.metadataStore,
+          bracketMetadataStore: engine["metadataStore"],
+          bracketGraphStore: engine["graphStore"],
+          bracketVectorStore: engine["vectorStore"],
+        };
+        for (const key of STORE_KEYS) {
+          if (key in engine) {
+            throw new Error(key + " is visible via the in operator");
+          }
+          const value = engine[key];
+          const looksLikeStore = Boolean(
+            value &&
+              typeof value === "object" &&
+              (typeof value.saveAtom === "function" ||
+                typeof value.deleteAtom === "function" ||
+                typeof value.saveEntity === "function" ||
+                typeof value.deleteEntity === "function"),
+          );
+          if (looksLikeStore) {
+            usableStores.push(key);
+            try { await value.deleteAtom?.("atm_probe"); } catch {}
+            try { await value.saveAtom?.({ ...atom, id: "atm_injected", claim: { type: "procedural", statement: "injected" }, dedupKey: "atm_injected" }); } catch {}
+            try { await value.deleteEntity?.("ent_x"); } catch {}
+            try { await value.saveEntity?.({ id: "ent_injected" }); } catch {}
+            const after = await store.getAtom("atm_probe");
+            const injected = await store.getAtom("atm_injected");
+            if (!after || after.claim.statement !== "original-claim" || injected) {
+              storeMutations.push(key);
+            }
+          }
+        }
+        if (usableStores.length > 0 || storeMutations.length > 0) {
+          throw new Error(
+            "usable store leaked or mutated Canonical data via " +
+              [...new Set([...usableStores, ...storeMutations])].join(","),
+          );
+        }
+        if (Object.values(access).some((value) => value != null)) {
+          throw new Error("store fields were reachable as ordinary properties");
+        }
+
+        const callable = [];
+        const methodMutations = [];
+        const forgedBinding = {
+          id: "sb_injected",
+          sourceIdentityId: "sid_injected",
+          sourceLocator: "msrc://injected",
+          status: "active",
+          scope,
+          createdAt: NOW,
+          updatedAt: NOW,
+        };
+        const proto = Object.getPrototypeOf(engine);
+        const ctorProto = sdk.InMemoryCogniWeaveEngine.prototype;
+        for (const name of METHOD_NAMES) {
+          const targets = [engine[name], proto?.[name], ctorProto?.[name]];
+          for (const fn of targets) {
+            if (typeof fn === "function") {
+              callable.push(name);
+              try { await fn.call(engine, forgedBinding, "atom", "atm_probe", "purge"); } catch {}
+              try { fn.call(engine, forgedBinding, "atom", "atm_probe"); } catch {}
+            }
+          }
+        }
+        const listedBindings = typeof store.listSourceBindings === "function" ? await store.listSourceBindings() : [];
+        if (listedBindings.some((row) => row.id === "sb_injected")) {
+          methodMutations.push("sb_injected");
+        }
+        const afterMethods = await store.getAtom("atm_probe");
+        if (!afterMethods || afterMethods.claim.statement !== "original-claim") {
+          methodMutations.push("atm_probe");
+        }
+        if (callable.length > 0) {
+          throw new Error("ungated internals were callable: " + [...new Set(callable)].join(","));
+        }
+        if (methodMutations.length > 0) {
+          throw new Error("direct internal invocation mutated Canonical data");
+        }
+
+        const history = await engine.getVersionHistory("atm_probe");
+        if (!history.some((row) => row.id === "atm_probe" && row.claim.statement === "original-claim")) {
+          throw new Error("authorized getVersionHistory failed");
+        }
+        const sources = await engine.listLiveSourcesForAtom("atm_probe");
+        const sourceDump = JSON.stringify(sources);
+        if (sources.some((row) => row.sourceBindingId === "sb_foreign_backfill")) {
+          throw new Error("foreign binding disclosed");
+        }
+        if (sourceDump.includes("sb_foreign_backfill") || sourceDump.includes("ws_other") || sourceDump.includes("msrc://shared_src#foreign")) {
+          throw new Error("foreign binding fields disclosed");
+        }
+        if (!sources.some((row) => row.sourceBindingId === "sb_same_backfill")) {
+          throw new Error("same-scope backfill missing");
+        }
+        const archived = await engine.archiveSource({
+          operationId: "op-archive-probe",
+          selector: { mode: "identity", sourceIdentityId: "sid_archive_probe" },
+          subject: { scope },
+          reasonCode: "TEST_ARCHIVE",
+        });
+        if (archived.currentStatus !== "archived" || archived.sourceIdentityId !== "sid_archive_probe") {
+          throw new Error("authorized archiveSource failed: " + JSON.stringify(archived));
+        }
+        const bindings = await store.listSourceBindings();
+        const archivedBinding = bindings.find((row) => row.sourceIdentityId === "sid_archive_probe");
+        if (!archivedBinding || archivedBinding.status !== "archived") {
+          throw new Error("authorized archiveSource did not persist binding status");
+        }
+        const sameBinding = bindings.find((row) => row.id === "sb_same_backfill");
+        if (!sameBinding || sameBinding.status !== "active") {
+          throw new Error("authorized archive mutated the listLiveSourcesForAtom fixture binding");
+        }
+        const foreignBinding = bindings.find((row) => row.id === "sb_foreign_backfill");
+        if (!foreignBinding || foreignBinding.status !== "active") {
+          throw new Error("authorized archive mutated a foreign binding");
+        }
+
+        const runtime = sdk.createTrustedRuntime({ environment: "service" });
+        const service = new sdk.InMemoryCogniWeaveEngine({
+          environment: "service",
+          metadataBackend: "memory",
+          graphBackend: "memory",
+          evidenceBackend: "memory",
+          vectorBackend: "memory",
+        }, { runtime });
+        let denied = false;
+        try {
+          await service.listLiveSourcesForAtom("atm_probe");
+        } catch (error) {
+          denied = error instanceof sdk.PrincipalUnavailableError;
+        }
+        if (!denied) {
+          throw new Error("service listLiveSourcesForAtom did not fail closed");
+        }
+        denied = false;
+        try {
+          await service.archiveSource({
+            operationId: "op-archive-service",
+            selector: { mode: "identity", sourceIdentityId: "shared_src" },
+            subject: { scope },
+            reasonCode: "TEST_ARCHIVE",
+          });
+        } catch (error) {
+          denied = error instanceof sdk.PrincipalUnavailableError;
+        }
+        if (!denied) {
+          throw new Error("service archiveSource did not fail closed");
+        }
+
+        console.log(JSON.stringify({
+          ok: true,
+          visibleInternalNames: leakedNames,
+          usableStores,
+          callableInternals: callable,
+          sourceIds: sources.map((row) => row.sourceBindingId),
+          archived: archived.currentStatus,
+        }));
+      `,
+      installDir,
+    );
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    const payload = JSON.parse(result.stdout.trim()) as {
+      ok: boolean;
+      visibleInternalNames: string[];
+      usableStores: string[];
+      callableInternals: string[];
+      sourceIds: string[];
+      archived: string;
+    };
+    expect(payload).toMatchObject({
+      ok: true,
+      visibleInternalNames: [],
+      usableStores: [],
+      callableInternals: [],
+      archived: "archived",
+    });
     expect(payload.sourceIds).toEqual(["sb_same_backfill"]);
   });
 });
