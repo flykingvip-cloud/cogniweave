@@ -150,9 +150,16 @@ function bundleTypings() {
       typings.includes("resolveTrustedRuntimeAssembly") ||
       typings.includes("SealedTrustedRuntimeAssembly") ||
       typings.includes("bindEngineTrustedRuntime") ||
-      typings.includes("resolveEngineTrustedRuntime")
+      typings.includes("resolveEngineTrustedRuntime") ||
+      typings.includes("createSealedProductionRuntime") ||
+      typings.includes("issueProductionRuntimePermit") ||
+      typings.includes("createProductionEngine") ||
+      typings.includes("createOfficialProductionAdapterBundle") ||
+      typings.includes("runWithSimulatedProductionProcess") ||
+      typings.includes("installSimulatedProcessTrustForTests") ||
+      typings.includes("clearSimulatedProductionRuntimeSlot")
     ) {
-      throw new Error(`${item.outfile} re-exposes a Trusted Runtime unpack helper or assembly typings`);
+      throw new Error(`${item.outfile} re-exposes a Trusted Runtime unpack helper, production issuance permit, or test-only process trust hook`);
     }
     if (/(?:^|[^#\w])trustedRuntime\b/.test(typings) || typings.includes("getTrustedRuntime")) {
       throw new Error(`${item.outfile} re-exposes a public Trusted Runtime handle property or getter`);

@@ -1,30 +1,55 @@
 # CW-09-02-R5 Trusted Runtime Boundary
 
 Implementation evidence, not acceptance. This document describes the runtime
-bootstrap and public authorization entry points after R5.
+bootstrap and public authorization entry points after R5-A and R5-B.
 
 ## Runtime bootstrap and call chain
 
-1. The integration layer (OpenBot or a test bootstrap) calls
-   `createTrustedRuntime()` with an explicit `environment` and the production
-   Principal Provider, Authoritative Binding Query, and Delegation Store.
-2. `createTrustedRuntime()` freezes a public handle (`environment`,
-   `requireAuth`) and stores the sealed assembly in a module-private WeakMap.
-   A same-shaped ordinary object cannot resolve that assembly.
-3. `createCogniWeaveRuntime()` / `new InMemoryCogniWeaveEngine()` receive the
-   handle. The Engine stores it as an ECMAScript `#private` field and in a
+Production and non-production assembly are unmixable.
+
+### Non-production (local and test)
+
+1. `createTrustedRuntime()` may assemble a **non-production** runtime. Even when
+   `environment` is `"service"` or `"cloud"`, the assembly `trustClass` is
+   `non_production`. This API is not production authorization proof.
+2. The function freezes a public handle (`environment`, `requireAuth`) and
+   stores the sealed assembly in a module-private WeakMap. A same-shaped
+   ordinary object cannot resolve that assembly.
+3. `createCogniWeaveRuntime()` / `new InMemoryCogniWeaveEngine()` may receive
+   the handle. The Engine stores it as an ECMAScript `#private` field and in a
    module-private WeakMap; it is not a public instance property. service/cloud
    always force `requireAuth: true`. local may only be selected at bootstrap;
    a job or HTTP request cannot downgrade it.
-4. Authorization functions (`authorizeTrustedExecution`,
-   `authorizeEngineDirectInvocation`, REST routing) call the same-bundle
-   internal `resolveTrustedRuntimeAssembly(handle)` and snapshot environment,
-   requireAuth, and services once. That unpack helper is not a public SDK
-   root export. Request objects may carry a bearer token and business data
-   only.
-5. `metadataStore` remains a data-plane store. It is never auto-promoted to a
-   Binding Query on a production request path. A local or production bootstrap
-   may pass an already-built Binding Query into `createTrustedRuntime()`.
+
+### Production (R5-B)
+
+1. Production identity is determined only by a sealed process-start snapshot
+   (`COGNIWEAVE_RUNTIME_MODE=production` plus a bootstrap authority id and
+   engine environment). Request parameters, ordinary config objects,
+   caller-declared fields, and later `process.env` mutations cannot change it.
+2. Ordinary callers must not create or replace a production Trusted Runtime.
+   `createTrustedRuntime()`, `createImplicitLocalRuntime()`,
+   `createCogniWeaveRuntime()`, and `new InMemoryCogniWeaveEngine()` are
+   refused in a production process.
+3. The official zero-argument `bootstrapProductionTrustedRuntime()` is the only
+   production path. It creates Principal Provider, Authoritative Binding Query,
+   Delegation Store, and Canonical Stores internally, runs the assembly guard,
+   and fail-closes if any required dependency is missing or unverifiable.
+   Caller-injected services or stores are rejected.
+4. The official API returns a handle, Engine, REST service, HTTP server, and a
+   redacted audit record. It does not return store or trusted-service
+   references. Public `createAdapterBundle()` is also refused in a production
+   process so ordinary callers cannot obtain a second live production store.
+
+Authorization functions (`authorizeTrustedExecution`,
+`authorizeEngineDirectInvocation`, REST routing) still call the same-bundle
+internal `resolveTrustedRuntimeAssembly(handle)` and snapshot environment,
+requireAuth, and services once. That unpack helper is not a public SDK root
+export. Request objects may carry a bearer token and business data only.
+
+`metadataStore` remains a data-plane store. It is never auto-promoted to a
+Binding Query on a request path, and production startup does not accept a
+caller-supplied Binding Query or store as a substitute.
 
 ## Public identity and authorization entry points
 

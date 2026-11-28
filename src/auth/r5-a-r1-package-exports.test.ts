@@ -14,6 +14,8 @@ const FORBIDDEN_SPECIFIERS = [
   "@cogniweave/sdk/runtime/in-memory-engine",
   "@cogniweave/sdk/runtime/canonical-resolver-registry",
   "@cogniweave/sdk/auth/trusted-runtime",
+  "@cogniweave/sdk/auth/production-bootstrap",
+  "@cogniweave/sdk/auth/process-trust",
   "@cogniweave/sdk/src/journal/repair",
   "@cogniweave/sdk/dist/journal/repair",
 ];
@@ -930,6 +932,13 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
           "bindEngineTrustedRuntime",
           "resolveEngineTrustedRuntime",
           "getTrustedRuntime",
+          "createSealedProductionRuntime",
+          "issueProductionRuntimePermit",
+          "createProductionEngine",
+          "createOfficialProductionAdapterBundle",
+          "runWithSimulatedProductionProcess",
+          "installSimulatedProcessTrustForTests",
+          "clearSimulatedProductionRuntimeSlot",
         ].filter((name) => typings.includes(name));
         if (leakedTypings.length > 0) {
           throw new Error("unpack helpers leaked in public typings: " + leakedTypings.join(","));
@@ -944,6 +953,13 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
           "resolveEngineTrustedRuntime",
           "SealedTrustedRuntimeAssembly",
           "getTrustedRuntime",
+          "createSealedProductionRuntime",
+          "issueProductionRuntimePermit",
+          "createProductionEngine",
+          "createOfficialProductionAdapterBundle",
+          "runWithSimulatedProductionProcess",
+          "installSimulatedProcessTrustForTests",
+          "clearSimulatedProductionRuntimeSlot",
         ].filter((name) => name in sdk);
         if (leakedExports.length > 0) {
           throw new Error("unpack helpers leaked on the package root: " + leakedExports.join(","));
@@ -1393,4 +1409,116 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
     }
     expect(payload.journalId).toBeTruthy();
   });
+
+  it("refuses packed-consumer production bootstrap and does not unpack trusted services", async () => {
+    const result = runNode(
+      `
+        const sdk = await import("@cogniweave/sdk");
+        const leakedHooks = [
+          "runWithSimulatedProductionProcess",
+          "installSimulatedProcessTrustForTests",
+          "createSealedProductionRuntime",
+          "issueProductionRuntimePermit",
+          "createProductionEngine",
+          "createOfficialProductionAdapterBundle",
+        ].filter((name) => name in sdk);
+        if (leakedHooks.length > 0) {
+          throw new Error("test-only or issuance helpers leaked: " + leakedHooks.join(","));
+        }
+        if (typeof sdk.bootstrapProductionTrustedRuntime !== "function") {
+          throw new Error("bootstrapProductionTrustedRuntime should be a public official entry");
+        }
+        if (typeof sdk.createTrustedRuntime !== "function") {
+          throw new Error("createTrustedRuntime should remain public and non-production");
+        }
+
+        let bootstrapReason = null;
+        let bootstrapUsed = false;
+        try {
+          const created = await sdk.bootstrapProductionTrustedRuntime();
+          bootstrapUsed = Boolean(created?.audit?.verificationResult === "passed");
+        } catch (error) {
+          bootstrapReason = error?.reason ?? error?.name ?? "error";
+        }
+        if (bootstrapUsed) {
+          throw new Error("packed consumer created a production assembly from a non-production process");
+        }
+        if (bootstrapReason !== "process_not_production") {
+          throw new Error("expected process_not_production, got " + bootstrapReason);
+        }
+
+        process.env.COGNIWEAVE_RUNTIME_MODE = "production";
+        process.env.COGNIWEAVE_BOOTSTRAP_AUTHORITY_ID = "forged";
+        process.env.COGNIWEAVE_ENGINE_ENVIRONMENT = "service";
+        let forgedReason = null;
+        try {
+          await sdk.bootstrapProductionTrustedRuntime();
+        } catch (error) {
+          forgedReason = error?.reason ?? error?.name ?? "error";
+        }
+        if (forgedReason !== "process_not_production") {
+          throw new Error("forged production env after seal expected process_not_production, got " + forgedReason);
+        }
+
+        let injectReason = null;
+        try {
+          await sdk.bootstrapProductionTrustedRuntime({
+            principalProvider: sdk.createDenyByDefaultPrincipalProvider([]),
+            environment: "service",
+          });
+        } catch (error) {
+          injectReason = error?.reason ?? error?.name ?? "error";
+        }
+        if (injectReason !== "caller_injection_rejected") {
+          throw new Error("expected caller_injection_rejected, got " + injectReason);
+        }
+
+        const runtime = sdk.createTrustedRuntime({ environment: "service" });
+        if (sdk.getProductionAssemblyAudit?.(runtime)) {
+          throw new Error("createTrustedRuntime unexpectedly produced a production audit");
+        }
+        if (sdk.submitProductionAssemblyAudit?.({ verificationResult: "passed", trustClass: "production" }) !== false) {
+          throw new Error("submitted audit was accepted as trust evidence");
+        }
+        const engine = new sdk.InMemoryCogniWeaveEngine({
+          environment: "service",
+          metadataBackend: "memory",
+          graphBackend: "memory",
+          evidenceBackend: "memory",
+          vectorBackend: "memory",
+        }, { runtime });
+        if (sdk.getEngineProductionAssemblyAudit?.(engine)) {
+          throw new Error("ordinary engine unexpectedly has a production audit");
+        }
+
+        console.log(JSON.stringify({
+          ok: true,
+          leakedHooks,
+          bootstrapReason,
+          forgedReason,
+          injectReason,
+          processMode: sdk.getSealedProcessTrustMode?.() ?? null,
+        }));
+      `,
+      installedPkgRoot,
+    );
+    expect(result.status, result.stderr + result.stdout).toBe(0);
+    const payload = JSON.parse(result.stdout.trim().split("\n").at(-1) ?? "{}") as {
+      ok: boolean;
+      leakedHooks: string[];
+      bootstrapReason: string;
+      forgedReason: string;
+      injectReason: string;
+      processMode: string | null;
+    };
+    expect(payload).toMatchObject({
+      ok: true,
+      leakedHooks: [],
+      bootstrapReason: "process_not_production",
+      forgedReason: "process_not_production",
+      injectReason: "caller_injection_rejected",
+    });
+    expect(payload.processMode === "non_production" || payload.processMode === null).toBe(true);
+  });
+
 });

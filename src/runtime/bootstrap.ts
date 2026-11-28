@@ -1,5 +1,7 @@
 import { createAdapterBundle } from "../adapters/factory.js";
+import { getProcessTrustSnapshot, isProductionProcess } from "../auth/process-trust.js";
 import { resolveEngineTrustedRuntime, type TrustedRuntime } from "../auth/trusted-runtime.js";
+import { ProductionBootstrapError } from "../errors.js";
 import type { EngineConfig } from "../models.js";
 import {
   createCogniWeaveHttpServer,
@@ -25,6 +27,25 @@ export function createCogniWeaveRuntime(
   config: EngineConfig,
   options?: CreateCogniWeaveRuntimeOptions,
 ): CogniWeaveRuntime {
+  if (isProductionProcess()) {
+    const trust = getProcessTrustSnapshot();
+    throw new ProductionBootstrapError(
+      "createCogniWeaveRuntime() is not production authorization proof; use bootstrapProductionTrustedRuntime()",
+      "public_api_not_production_authority",
+      Object.freeze({
+        assemblyId: "unissued",
+        trustClass: "none",
+        runtimeEnvironment: trust.engineEnvironment,
+        processTrustMode: trust.mode,
+        bootstrapAuthorityId: trust.authorityId,
+        createdAt: new Date().toISOString(),
+        verificationResult: "failed",
+        failureReason: "public_api_not_production_authority",
+        services: {},
+        canonicalStoreBindingQueryAssociation: "missing",
+      }),
+    );
+  }
   const bundle = createAdapterBundle(config);
   const engine = new InMemoryCogniWeaveEngine(config, {
     metadataStore: bundle.metadataStore,

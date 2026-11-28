@@ -1,8 +1,14 @@
-import { SecurityOverrideRejectedError, UntrustedRuntimeError } from "../errors.js";
+import { randomUUID } from "node:crypto";
+import {
+  ProductionBootstrapError,
+  SecurityOverrideRejectedError,
+  UntrustedRuntimeError,
+} from "../errors.js";
 import type { EngineEnvironment } from "../models.js";
 import type { AuthoritativeBindingQuery } from "./canonical-scope.js";
 import type { DelegationAuthorizationStore } from "./delegation.js";
 import { isUsableTrustedPrincipal, type TrustedPrincipal, type TrustedPrincipalProvider } from "./principal.js";
+import { getProcessTrustSnapshot } from "./process-trust.js";
 
 /**
  * CW-09-02-R5: unforgeable runtime capability.
@@ -21,10 +27,14 @@ export type TrustedRuntime = {
   readonly requireAuth: boolean;
 };
 
+export type TrustedRuntimeTrustClass = "non_production" | "production" | "simulated_production";
+
 export type SealedTrustedRuntimeAssembly = {
   readonly environment: EngineEnvironment;
   readonly requireAuth: boolean;
   readonly allowLocalInjection: boolean;
+  readonly trustClass: TrustedRuntimeTrustClass;
+  readonly assemblyId: string;
   readonly injectedPrincipal?: TrustedPrincipal;
   readonly principalProvider?: TrustedPrincipalProvider;
   readonly bindingQuery?: AuthoritativeBindingQuery;
@@ -82,7 +92,42 @@ export function findCallerSecurityOverrides(value: unknown): RequestSecurityOver
   return REQUEST_SECURITY_OVERRIDE_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(record, key));
 }
 
+function publicRuntimeDeniedAudit(reason: "mixed_test_and_production_configuration" | "public_api_not_production_authority" | "assembly_already_sealed" | "process_not_production") {
+  const trust = getProcessTrustSnapshot();
+  return Object.freeze({
+    assemblyId: "unissued",
+    trustClass: "none",
+    runtimeEnvironment: trust.engineEnvironment,
+    processTrustMode: trust.mode,
+    bootstrapAuthorityId: trust.authorityId,
+    createdAt: new Date().toISOString(),
+    verificationResult: "failed",
+    failureReason: reason,
+    services: {},
+    canonicalStoreBindingQueryAssociation: "missing",
+  });
+}
+
+function assertPublicRuntimeCreationAllowed(): void {
+  const trust = getProcessTrustSnapshot();
+  if (trust.mixedConfiguration) {
+    throw new ProductionBootstrapError(
+      "Process trust snapshot mixes test harness markers with production mode; public createTrustedRuntime() is refused",
+      "mixed_test_and_production_configuration",
+      publicRuntimeDeniedAudit("mixed_test_and_production_configuration"),
+    );
+  }
+  if (trust.mode === "production") {
+    throw new ProductionBootstrapError(
+      "createTrustedRuntime() is not production authorization proof and cannot create or replace a production Trusted Runtime",
+      "public_api_not_production_authority",
+      publicRuntimeDeniedAudit("public_api_not_production_authority"),
+    );
+  }
+}
+
 export function createTrustedRuntime(input: CreateTrustedRuntimeInput): TrustedRuntime {
+  assertPublicRuntimeCreationAllowed();
   const environment = input.environment;
   if (environment !== "local" && environment !== "service" && environment !== "cloud") {
     throw new UntrustedRuntimeError(`Invalid trusted runtime environment: ${String(environment)}`, {
@@ -107,6 +152,8 @@ export function createTrustedRuntime(input: CreateTrustedRuntimeInput): TrustedR
     environment,
     requireAuth,
     allowLocalInjection,
+    trustClass: "non_production",
+    assemblyId: `nonprod_${randomUUID()}`,
     ...(injectedPrincipal ? { injectedPrincipal } : {}),
     ...(input.principalProvider ? { principalProvider: input.principalProvider } : {}),
     ...(input.bindingQuery ? { bindingQuery: input.bindingQuery } : {}),
@@ -198,4 +245,128 @@ export function assertNoProductionSecurityOverrides(input: {
     `Production execution rejects caller security overrides: ${[...new Set(keys)].join(", ")}`,
     { decision: "deny", reason: "security_override_rejected", keys: [...new Set(keys)] },
   );
+}
+
+const productionIssuancePermits = new WeakSet<object>();
+let productionRuntimeSlot: TrustedRuntime | undefined;
+const issuedProductionHandles = new Set<object>();
+
+/**
+ * Same-bundle helper used only by the official production bootstrap after the
+ * assembly guard has passed. Not a public SDK export.
+ */
+export function issueProductionRuntimePermit(): object {
+  const trust = getProcessTrustSnapshot();
+  if (trust.mixedConfiguration) {
+    throw new ProductionBootstrapError(
+      "Process trust snapshot mixes test harness markers with production mode",
+      "mixed_test_and_production_configuration",
+      publicRuntimeDeniedAudit("mixed_test_and_production_configuration"),
+    );
+  }
+  if (trust.mode !== "production") {
+    throw new ProductionBootstrapError(
+      "Production runtime issuance requires a sealed production process trust snapshot",
+      "process_not_production",
+      publicRuntimeDeniedAudit("public_api_not_production_authority"),
+    );
+  }
+  const permit = Object.freeze({ brand: "cw-production-runtime-permit" });
+  productionIssuancePermits.add(permit);
+  return permit;
+}
+
+export type ProductionRuntimeAssemblyInput = {
+  environment: "service" | "cloud";
+  principalProvider: TrustedPrincipalProvider;
+  bindingQuery: AuthoritativeBindingQuery;
+  delegationStore: DelegationAuthorizationStore;
+  ensureDataPlaneId?: () => Promise<string>;
+};
+
+/**
+ * Same-bundle helper. Creates a sealed production or simulated-production
+ * assembly. Requires a single-use permit from issueProductionRuntimePermit().
+ * Not a public SDK export. Write-once per process slot.
+ */
+export function createSealedProductionRuntime(
+  permit: object,
+  input: ProductionRuntimeAssemblyInput,
+): TrustedRuntime {
+  if (!productionIssuancePermits.has(permit)) {
+    throw new ProductionBootstrapError(
+      "Production runtime creation requires a permit issued by the official production bootstrap",
+      "public_api_not_production_authority",
+      publicRuntimeDeniedAudit("public_api_not_production_authority"),
+    );
+  }
+  productionIssuancePermits.delete(permit);
+  const trust = getProcessTrustSnapshot();
+  if (trust.mode !== "production" || trust.mixedConfiguration) {
+    throw new ProductionBootstrapError(
+      "Production runtime creation is refused outside a sealed production process",
+      trust.mixedConfiguration ? "mixed_test_and_production_configuration" : "process_not_production",
+      publicRuntimeDeniedAudit(
+        trust.mixedConfiguration
+          ? "mixed_test_and_production_configuration"
+          : "public_api_not_production_authority",
+      ),
+    );
+  }
+  if (productionRuntimeSlot) {
+    throw new ProductionBootstrapError(
+      "A production Trusted Runtime assembly is already sealed and cannot be replaced or re-bound",
+      "assembly_already_sealed",
+      publicRuntimeDeniedAudit("assembly_already_sealed"),
+    );
+  }
+  const handle: TrustedRuntime = Object.freeze({
+    environment: input.environment,
+    requireAuth: true,
+  });
+  const assembly: SealedTrustedRuntimeAssembly = Object.freeze({
+    environment: input.environment,
+    requireAuth: true,
+    allowLocalInjection: false,
+    trustClass: trust.simulated ? "simulated_production" : "production",
+    assemblyId: `prod_${randomUUID()}`,
+    principalProvider: input.principalProvider,
+    bindingQuery: input.bindingQuery,
+    delegationStore: input.delegationStore,
+    ...(input.ensureDataPlaneId ? { ensureDataPlaneId: input.ensureDataPlaneId } : {}),
+  });
+  sealedAssemblies.set(handle, assembly);
+  issuedProductionHandles.add(handle);
+  productionRuntimeSlot = handle;
+  return handle;
+}
+
+export function getSealedProductionRuntimeSlot(): TrustedRuntime | undefined {
+  return productionRuntimeSlot;
+}
+
+/**
+ * Same-bundle test cleanup. Invalidates simulated production handles only.
+ * Refuses to clear a real production slot.
+ */
+export function clearSimulatedProductionRuntimeSlot(): void {
+  const trust = getProcessTrustSnapshot();
+  if (trust.mode === "production" && !trust.simulated) {
+    throw new ProductionBootstrapError(
+      "A real production runtime slot cannot be cleared",
+      "public_api_not_production_authority",
+      publicRuntimeDeniedAudit("public_api_not_production_authority"),
+    );
+  }
+  for (const handle of issuedProductionHandles) {
+    sealedAssemblies.delete(handle);
+  }
+  issuedProductionHandles.clear();
+  productionRuntimeSlot = undefined;
+}
+
+export function isProductionTrustClass(
+  trustClass: TrustedRuntimeTrustClass | undefined,
+): boolean {
+  return trustClass === "production" || trustClass === "simulated_production";
 }

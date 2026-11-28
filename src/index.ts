@@ -118,10 +118,11 @@ export {
   ScopeViolationError,
   StorageConsistencyError,
   StoreUnavailableError,
+  ProductionBootstrapError,
   UntrustedRuntimeError,
   ValidationError,
 } from "./errors.js";
-export type { ExecutionAuthorizationErrorCode } from "./errors.js";
+export type { ExecutionAuthorizationErrorCode, ProductionBootstrapFailureReason } from "./errors.js";
 
 export {
   OPERATION_KEY_VERSION,
@@ -474,6 +475,17 @@ export {
   findCallerSecurityOverrides,
   isVerifiableTrustedRuntime,
 } from "./auth/trusted-runtime.js";
+
+export type { ProductionAssemblyAuditRecord, ProductionBootstrapResult } from "./auth/production-bootstrap.js";
+export {
+  bootstrapProductionTrustedRuntime,
+  getEngineProductionAssemblyAudit,
+  getProductionAssemblyAudit,
+  getSealedProcessTrustMode,
+  isProductionProcess,
+  listFailedProductionBootstrapAudits,
+  submitProductionAssemblyAudit,
+} from "./auth/production-bootstrap.js";
 
 export { ENGINE_DIRECT_AUTH_ENTRYPOINTS } from "./auth/engine-invocation.js";
 export type { EngineDirectAuthMethod } from "./auth/engine-invocation.js";

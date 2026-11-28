@@ -1,4 +1,6 @@
+import { ProductionBootstrapError } from "../errors.js";
 import type { EngineConfig } from "../models.js";
+import { getProcessTrustSnapshot, isProductionProcess } from "../auth/process-trust.js";
 import {
   InMemoryGraphStore,
   InMemoryMetadataStore,
@@ -19,6 +21,44 @@ export interface AdapterBundle {
   graphStore: GraphStore;
   vectorStore: VectorStore;
   resolutions: AdapterResolution[];
+}
+
+const officialProductionBundleGate = { open: false };
+
+function denyPublicProductionAdapterBundle(): never {
+  const trust = getProcessTrustSnapshot();
+  throw new ProductionBootstrapError(
+    "createAdapterBundle() cannot be used to obtain or replace production Canonical Stores; use the official production bootstrap",
+    "production_factory_denied",
+    Object.freeze({
+      assemblyId: "unissued",
+      trustClass: "none",
+      runtimeEnvironment: trust.engineEnvironment,
+      processTrustMode: trust.mode,
+      bootstrapAuthorityId: trust.authorityId,
+      createdAt: new Date().toISOString(),
+      verificationResult: "failed",
+      failureReason: "production_factory_denied",
+      services: {},
+      canonicalStoreBindingQueryAssociation: "missing",
+    }),
+  );
+}
+
+/**
+ * Same-bundle official production store factory. Not a public SDK export.
+ * Ordinary createAdapterBundle() is refused in a production process.
+ */
+export function createOfficialProductionAdapterBundle(config: EngineConfig): AdapterBundle {
+  if (!isProductionProcess()) {
+    denyPublicProductionAdapterBundle();
+  }
+  officialProductionBundleGate.open = true;
+  try {
+    return createAdapterBundle(config);
+  } finally {
+    officialProductionBundleGate.open = false;
+  }
 }
 
 function createMetadataStore(config: EngineConfig): MetadataStore {
@@ -52,6 +92,9 @@ function createMetadataStore(config: EngineConfig): MetadataStore {
 }
 
 export function createAdapterBundle(config: EngineConfig): AdapterBundle {
+  if (isProductionProcess() && !officialProductionBundleGate.open) {
+    denyPublicProductionAdapterBundle();
+  }
   const metadataStore = createMetadataStore(config);
 
   const graphStore =

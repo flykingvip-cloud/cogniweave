@@ -2,6 +2,8 @@ import { readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import type { AdapterBundle } from "./adapters/factory.js";
 import { createAdapterBundle } from "./adapters/factory.js";
+import { bootstrapProductionTrustedRuntime } from "./auth/production-bootstrap.js";
+import { getProcessTrustSnapshot, isProductionProcess } from "./auth/process-trust.js";
 import type { EngineConfig, EngineEnvironment, ScopeInput, ScopeVisibility } from "./models.js";
 import {
   createCogniWeaveHttpServer,
@@ -652,6 +654,16 @@ function printHelp(): string {
   ].join("\n");
 }
 
+
+function explicitCliEnvironment(argv: string[]): string | undefined {
+  const index = argv.indexOf("--environment");
+  if (index === -1 || index === argv.length - 1) {
+    return undefined;
+  }
+  const value = argv[index + 1];
+  return value && !value.startsWith("-") ? value : undefined;
+}
+
 function createEngineFromPlan(plan: CogniWeaveServePlan): InMemoryCogniWeaveEngine {
   return new InMemoryCogniWeaveEngine(plan.config, {
     metadataStore: plan.bundle.metadataStore,
@@ -844,6 +856,66 @@ export async function runCogniWeaveCli(
 
     if (options.helpRequested || options.command === "help") {
       io.log(printHelp());
+      return 0;
+    }
+
+    if (isProductionProcess()) {
+      const trust = getProcessTrustSnapshot();
+      const requestedEnvironment = explicitCliEnvironment(argv);
+      if (requestedEnvironment && requestedEnvironment !== trust.engineEnvironment) {
+        await emitFailure(
+          currentAction,
+          "INVALID_ARGUMENT",
+          `Production process refuses CLI environment override '${requestedEnvironment}'; sealed engine environment is ${trust.engineEnvironment ?? "unset"}`,
+        );
+        return 1;
+      }
+      if (options.command !== "serve") {
+        await emitFailure(
+          currentAction,
+          "INVALID_ARGUMENT",
+          "Production process refuses CLI commands that would obtain raw Canonical Store references; only serve through the official production bootstrap is allowed",
+        );
+        return 1;
+      }
+      const bootstrapped = await bootstrapProductionTrustedRuntime();
+      if (options.dryRun) {
+        const url = formatServerUrl(options.host, options.port, options.basePath);
+        await emitSuccess(
+          "dry-run",
+          { status: "DRY_RUN_OK", url, assemblyId: bootstrapped.audit.assemblyId, verificationResult: bootstrapped.audit.verificationResult },
+          `Dry run ok: ${url}`,
+        );
+        return 0;
+      }
+      const server = bootstrapped.server;
+      try {
+        await listen(server, options.host, options.port);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await emitFailure(currentAction, "LISTEN_FAILED", message);
+        return 1;
+      }
+      const url = formatServerUrl(options.host, options.port, options.basePath);
+      await emitSuccess(
+        "serve-started",
+        {
+          status: "SERVE_LISTENING",
+          url,
+          assemblyId: bootstrapped.audit.assemblyId,
+          verificationResult: bootstrapped.audit.verificationResult,
+        },
+        `CogniWeave listening on ${url}`,
+      );
+      const shutdown = async (): Promise<void> => {
+        await closeServer(server);
+      };
+      process.once("SIGINT", () => {
+        void shutdown();
+      });
+      process.once("SIGTERM", () => {
+        void shutdown();
+      });
       return 0;
     }
 

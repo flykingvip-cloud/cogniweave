@@ -80,3 +80,37 @@ export class SecurityOverrideRejectedError<TDecision = unknown> extends Executio
     super("security_override_rejected", message, decision);
   }
 }
+
+export type ProductionBootstrapFailureReason =
+  | "process_not_production"
+  | "mixed_test_and_production_configuration"
+  | "missing_bootstrap_authority"
+  | "invalid_engine_environment"
+  | "caller_injection_rejected"
+  | "required_service_missing"
+  | "untrusted_service_implementation"
+  | "canonical_store_binding_query_mismatch"
+  | "assembly_already_sealed"
+  | "public_api_not_production_authority"
+  | "engine_construction_rejected"
+  | "untrusted_store_replacement"
+  | "production_factory_denied";
+
+/**
+ * Fail-closed production bootstrap failure. The attached audit record is not a
+ * runtime capability and cannot be submitted to prove assembly trust.
+ */
+export class ProductionBootstrapError extends CogniWeaveError {
+  readonly reason: ProductionBootstrapFailureReason;
+  readonly audit: Readonly<Record<string, unknown>>;
+
+  constructor(
+    message: string,
+    reason: ProductionBootstrapFailureReason,
+    audit: Readonly<Record<string, unknown>>,
+  ) {
+    super(message);
+    this.reason = reason;
+    this.audit = audit;
+  }
+}

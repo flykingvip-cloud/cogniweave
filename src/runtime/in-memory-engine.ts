@@ -37,14 +37,16 @@ import {
   type EngineDirectAuthorizationResult,
 } from "../auth/engine-invocation.js";
 import { sameMemorySubject } from "../auth/delegation.js";
+import { getProcessTrustSnapshot, isProductionProcess } from "../auth/process-trust.js";
 import {
   bindEngineTrustedRuntime,
   createImplicitLocalRuntime,
   createTrustedRuntime,
+  isProductionTrustClass,
   resolveTrustedRuntimeAssembly,
   type TrustedRuntime,
 } from "../auth/trusted-runtime.js";
-import { IdempotencyConflictError, ScopeViolationError, StoreUnavailableError, UntrustedRuntimeError, ValidationError } from "../errors.js";
+import { IdempotencyConflictError, ProductionBootstrapError, ScopeViolationError, StoreUnavailableError, UntrustedRuntimeError, ValidationError } from "../errors.js";
 import {
   repairDerivedIndexes as repairJournalDerivedIndexes,
   rebuildFromTruth as rebuildDerivedFromTruth,
@@ -688,6 +690,58 @@ function assertCanonicalScopeHierarchy(distillation: DistillationResult): void {
   }
 }
 
+export type InMemoryEngineConstructionStores = {
+  metadataStore?: MetadataStore;
+  graphStore?: GraphStore;
+  vectorStore?: VectorStore;
+  taskFramingStrategy?: TaskFramingStrategy;
+  distillationStrategy?: DistillationStrategy;
+  templateRegistry?: TemplateRegistry;
+  runtime?: TrustedRuntime;
+};
+
+const productionConstructionGate = { open: false };
+
+function productionEngineDeniedAudit() {
+  const trust = getProcessTrustSnapshot();
+  return Object.freeze({
+    assemblyId: "unissued",
+    trustClass: "none",
+    runtimeEnvironment: trust.engineEnvironment,
+    processTrustMode: trust.mode,
+    bootstrapAuthorityId: trust.authorityId,
+    createdAt: new Date().toISOString(),
+    verificationResult: "failed",
+    failureReason: "engine_construction_rejected",
+    services: {},
+    canonicalStoreBindingQueryAssociation: "missing",
+  });
+}
+
+/**
+ * Same-bundle official production Engine constructor. Not a public SDK export.
+ * The public `new InMemoryCogniWeaveEngine()` path is refused in a production process.
+ */
+export function createProductionEngine(
+  config: EngineConfig,
+  stores: Required<Pick<InMemoryEngineConstructionStores, "metadataStore" | "graphStore" | "vectorStore" | "runtime">> &
+    InMemoryEngineConstructionStores,
+): InMemoryCogniWeaveEngine {
+  if (!isProductionProcess()) {
+    throw new ProductionBootstrapError(
+      "createProductionEngine() requires a sealed production process trust snapshot",
+      "process_not_production",
+      productionEngineDeniedAudit(),
+    );
+  }
+  productionConstructionGate.open = true;
+  try {
+    return new InMemoryCogniWeaveEngine(config, stores);
+  } finally {
+    productionConstructionGate.open = false;
+  }
+}
+
 export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   readonly config: EngineConfig;
 
@@ -712,25 +766,25 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
 
   constructor(
     config: EngineConfig,
-    stores?: {
-      metadataStore?: MetadataStore;
-      graphStore?: GraphStore;
-      vectorStore?: VectorStore;
-      taskFramingStrategy?: TaskFramingStrategy;
-      distillationStrategy?: DistillationStrategy;
-      templateRegistry?: TemplateRegistry;
-      runtime?: TrustedRuntime;
-    },
+    stores?: InMemoryEngineConstructionStores,
   ) {
+    if (isProductionProcess() && !productionConstructionGate.open) {
+      throw new ProductionBootstrapError(
+        "Ordinary callers cannot construct a production Engine; use the official production bootstrap",
+        "engine_construction_rejected",
+        productionEngineDeniedAudit(),
+      );
+    }
     this.config = config;
     this.#trustedRuntime = this.#initializeTrustedRuntime(stores?.runtime);
     bindEngineTrustedRuntime(this, this.#trustedRuntime);
-    const defaults = createAdapterBundle(config);
+    const hasAllStores = Boolean(stores?.metadataStore && stores.graphStore && stores.vectorStore);
+    const defaults = hasAllStores ? undefined : createAdapterBundle(config);
     const llmTaskFramingProvider = createHttpTaskFramingProvider(config);
     const llmDistillationProvider = createHttpDistillationProvider(config);
-    this.#metadataStore = stores?.metadataStore ?? defaults.metadataStore;
-    this.#graphStore = stores?.graphStore ?? defaults.graphStore;
-    this.#vectorStore = stores?.vectorStore ?? defaults.vectorStore;
+    this.#metadataStore = stores?.metadataStore ?? defaults!.metadataStore;
+    this.#graphStore = stores?.graphStore ?? defaults!.graphStore;
+    this.#vectorStore = stores?.vectorStore ?? defaults!.vectorStore;
     this.#taskFramingStrategy =
       stores?.taskFramingStrategy ??
       createDefaultTaskFramingStrategy({
@@ -756,7 +810,38 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
           { decision: "deny", reason: "untrusted_runtime" },
         );
       }
+      if (isProductionProcess()) {
+        const trust = getProcessTrustSnapshot();
+        if (!isProductionTrustClass(assembly.trustClass)) {
+          throw new ProductionBootstrapError(
+            "A production Engine can only be bound to a production Trusted Runtime assembly",
+            "engine_construction_rejected",
+            productionEngineDeniedAudit(),
+          );
+        }
+        if (assembly.trustClass === "simulated_production" && !trust.simulated) {
+          throw new ProductionBootstrapError(
+            "A simulated production assembly cannot be mixed into a real production process",
+            "mixed_test_and_production_configuration",
+            productionEngineDeniedAudit(),
+          );
+        }
+        if (assembly.trustClass === "production" && trust.simulated) {
+          throw new ProductionBootstrapError(
+            "A real production assembly cannot be mixed into a simulated production process",
+            "mixed_test_and_production_configuration",
+            productionEngineDeniedAudit(),
+          );
+        }
+      }
       return runtime;
+    }
+    if (isProductionProcess()) {
+      throw new ProductionBootstrapError(
+        "A production Engine requires the official production Trusted Runtime; implicit construction is refused",
+        "engine_construction_rejected",
+        productionEngineDeniedAudit(),
+      );
     }
     if (this.config.environment === "local") {
       return createImplicitLocalRuntime();
