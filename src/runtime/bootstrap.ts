@@ -1,5 +1,5 @@
 import { createAdapterBundle } from "../adapters/factory.js";
-import { getProcessTrustSnapshot, isProductionProcess } from "../auth/process-trust.js";
+import { getProcessTrustSnapshot, isProductionTrustBoundaryActive } from "../auth/process-trust.js";
 import { resolveEngineTrustedRuntime, type TrustedRuntime } from "../auth/trusted-runtime.js";
 import { ProductionBootstrapError } from "../errors.js";
 import type { EngineConfig } from "../models.js";
@@ -27,7 +27,7 @@ export function createCogniWeaveRuntime(
   config: EngineConfig,
   options?: CreateCogniWeaveRuntimeOptions,
 ): CogniWeaveRuntime {
-  if (isProductionProcess()) {
+  if (isProductionTrustBoundaryActive()) {
     const trust = getProcessTrustSnapshot();
     throw new ProductionBootstrapError(
       "createCogniWeaveRuntime() is not production authorization proof; use bootstrapProductionTrustedRuntime()",

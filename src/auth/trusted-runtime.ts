@@ -8,14 +8,17 @@ import type { EngineEnvironment } from "../models.js";
 import type { AuthoritativeBindingQuery } from "./canonical-scope.js";
 import type { DelegationAuthorizationStore } from "./delegation.js";
 import { isUsableTrustedPrincipal, type TrustedPrincipal, type TrustedPrincipalProvider } from "./principal.js";
-import { getProcessTrustSnapshot } from "./process-trust.js";
+import { getProcessTrustSnapshot, isProductionTrustBoundaryActive } from "./process-trust.js";
 
 /**
  * CW-09-02-R5: unforgeable runtime capability.
  *
- * Trust is established only by `createTrustedRuntime()`, which stores the
- * sealed assembly in a module-private WeakMap. A same-shaped ordinary object
- * constructed by a business caller cannot resolve to that assembly.
+ * Non-production assemblies are created only by `createTrustedRuntime()`,
+ * which stores the sealed assembly in a module-private WeakMap. A same-shaped
+ * ordinary object constructed by a business caller cannot resolve to that
+ * assembly. Production assemblies are created only by the official
+ * process-start bootstrap; `createTrustedRuntime()` cannot establish or
+ * replace production identity.
  *
  * TypeScript interfaces, type assertions, and field names are not trust.
  */
@@ -117,9 +120,9 @@ function assertPublicRuntimeCreationAllowed(): void {
       publicRuntimeDeniedAudit("mixed_test_and_production_configuration"),
     );
   }
-  if (trust.mode === "production") {
+  if (isProductionTrustBoundaryActive()) {
     throw new ProductionBootstrapError(
-      "createTrustedRuntime() is not production authorization proof and cannot create or replace a production Trusted Runtime",
+      "createTrustedRuntime() is not production authorization proof and cannot create, reset, or replace a production Trusted Runtime",
       "public_api_not_production_authority",
       publicRuntimeDeniedAudit("public_api_not_production_authority"),
     );
@@ -264,9 +267,9 @@ export function issueProductionRuntimePermit(): object {
       publicRuntimeDeniedAudit("mixed_test_and_production_configuration"),
     );
   }
-  if (trust.mode !== "production") {
+  if (trust.mode !== "production" || !trust.productionTrustEstablished) {
     throw new ProductionBootstrapError(
-      "Production runtime issuance requires a sealed production process trust snapshot",
+      "Production runtime issuance requires official production process trust establishment",
       "process_not_production",
       publicRuntimeDeniedAudit("public_api_not_production_authority"),
     );
@@ -302,9 +305,9 @@ export function createSealedProductionRuntime(
   }
   productionIssuancePermits.delete(permit);
   const trust = getProcessTrustSnapshot();
-  if (trust.mode !== "production" || trust.mixedConfiguration) {
+  if (trust.mode !== "production" || !trust.productionTrustEstablished || trust.mixedConfiguration) {
     throw new ProductionBootstrapError(
-      "Production runtime creation is refused outside a sealed production process",
+      "Production runtime creation is refused outside official production process trust establishment",
       trust.mixedConfiguration ? "mixed_test_and_production_configuration" : "process_not_production",
       publicRuntimeDeniedAudit(
         trust.mixedConfiguration

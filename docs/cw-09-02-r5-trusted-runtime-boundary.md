@@ -23,16 +23,22 @@ Production and non-production assembly are unmixable.
 
 ### Production (R5-B)
 
-1. Production identity is determined only by a sealed process-start snapshot
-   (`COGNIWEAVE_RUNTIME_MODE=production` plus a bootstrap authority id and
-   engine environment). Request parameters, ordinary config objects,
-   caller-declared fields, and later `process.env` mutations cannot change it.
+1. Environment variables are not an unforgeable production-identity root. The
+   SDK freezes a process-environment *claim* at module evaluation so later
+   `process.env` mutations (including those before the first trust API call)
+   cannot downgrade or forge identity. Production identity itself is
+   established only by the official process-start path
+   `bootstrapProductionTrustedRuntime()`. Request parameters, ordinary config
+   objects, caller-declared fields, and public SDK APIs cannot establish,
+   reset, or replace it.
 2. Ordinary callers must not create or replace a production Trusted Runtime.
    `createTrustedRuntime()`, `createImplicitLocalRuntime()`,
    `createCogniWeaveRuntime()`, and `new InMemoryCogniWeaveEngine()` are
-   refused in a production process.
+   refused when a production request was frozen or official production
+   identity has been established.
 3. The official zero-argument `bootstrapProductionTrustedRuntime()` is the only
-   production path. It creates Principal Provider, Authoritative Binding Query,
+   production path. It establishes production identity from the frozen claim,
+   creates Principal Provider, Authoritative Binding Query,
    Delegation Store, and Canonical Stores internally, runs the assembly guard,
    and fail-closes if any required dependency is missing or unverifiable.
    Caller-injected services or stores are rejected.

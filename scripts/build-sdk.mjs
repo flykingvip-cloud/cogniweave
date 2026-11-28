@@ -157,7 +157,11 @@ function bundleTypings() {
       typings.includes("createOfficialProductionAdapterBundle") ||
       typings.includes("runWithSimulatedProductionProcess") ||
       typings.includes("installSimulatedProcessTrustForTests") ||
-      typings.includes("clearSimulatedProductionRuntimeSlot")
+      typings.includes("clearSimulatedProductionRuntimeSlot") ||
+      typings.includes("applyOfficialProductionTrustEstablishment") ||
+      typings.includes("markOfficialProductionTrustFailedClosed") ||
+      typings.includes("isProductionTrustBoundaryActive") ||
+      typings.includes("isMixedOrInvalidProcessConfiguration")
     ) {
       throw new Error(`${item.outfile} re-exposes a Trusted Runtime unpack helper, production issuance permit, or test-only process trust hook`);
     }

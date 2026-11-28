@@ -3,7 +3,7 @@ import { pathToFileURL } from "node:url";
 import type { AdapterBundle } from "./adapters/factory.js";
 import { createAdapterBundle } from "./adapters/factory.js";
 import { bootstrapProductionTrustedRuntime } from "./auth/production-bootstrap.js";
-import { getProcessTrustSnapshot, isProductionProcess } from "./auth/process-trust.js";
+import { getProcessTrustSnapshot, isProductionTrustBoundaryActive } from "./auth/process-trust.js";
 import type { EngineConfig, EngineEnvironment, ScopeInput, ScopeVisibility } from "./models.js";
 import {
   createCogniWeaveHttpServer,
@@ -859,7 +859,7 @@ export async function runCogniWeaveCli(
       return 0;
     }
 
-    if (isProductionProcess()) {
+    if (isProductionTrustBoundaryActive()) {
       const trust = getProcessTrustSnapshot();
       const requestedEnvironment = explicitCliEnvironment(argv);
       if (requestedEnvironment && requestedEnvironment !== trust.engineEnvironment) {

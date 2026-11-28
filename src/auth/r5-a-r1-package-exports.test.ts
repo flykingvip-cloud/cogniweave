@@ -938,6 +938,10 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
           "createOfficialProductionAdapterBundle",
           "runWithSimulatedProductionProcess",
           "installSimulatedProcessTrustForTests",
+          "applyOfficialProductionTrustEstablishment",
+          "markOfficialProductionTrustFailedClosed",
+          "isProductionTrustBoundaryActive",
+          "isMixedOrInvalidProcessConfiguration",
           "clearSimulatedProductionRuntimeSlot",
         ].filter((name) => typings.includes(name));
         if (leakedTypings.length > 0) {
@@ -959,6 +963,10 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
           "createOfficialProductionAdapterBundle",
           "runWithSimulatedProductionProcess",
           "installSimulatedProcessTrustForTests",
+          "applyOfficialProductionTrustEstablishment",
+          "markOfficialProductionTrustFailedClosed",
+          "isProductionTrustBoundaryActive",
+          "isMixedOrInvalidProcessConfiguration",
           "clearSimulatedProductionRuntimeSlot",
         ].filter((name) => name in sdk);
         if (leakedExports.length > 0) {
@@ -1417,6 +1425,10 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
         const leakedHooks = [
           "runWithSimulatedProductionProcess",
           "installSimulatedProcessTrustForTests",
+          "applyOfficialProductionTrustEstablishment",
+          "markOfficialProductionTrustFailedClosed",
+          "isProductionTrustBoundaryActive",
+          "isMixedOrInvalidProcessConfiguration",
           "createSealedProductionRuntime",
           "issueProductionRuntimePermit",
           "createProductionEngine",

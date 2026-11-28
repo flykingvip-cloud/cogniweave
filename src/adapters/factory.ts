@@ -1,6 +1,6 @@
 import { ProductionBootstrapError } from "../errors.js";
 import type { EngineConfig } from "../models.js";
-import { getProcessTrustSnapshot, isProductionProcess } from "../auth/process-trust.js";
+import { getProcessTrustSnapshot, isProductionProcess, isProductionTrustBoundaryActive } from "../auth/process-trust.js";
 import {
   InMemoryGraphStore,
   InMemoryMetadataStore,
@@ -92,7 +92,7 @@ function createMetadataStore(config: EngineConfig): MetadataStore {
 }
 
 export function createAdapterBundle(config: EngineConfig): AdapterBundle {
-  if (isProductionProcess() && !officialProductionBundleGate.open) {
+  if (isProductionTrustBoundaryActive() && !officialProductionBundleGate.open) {
     denyPublicProductionAdapterBundle();
   }
   const metadataStore = createMetadataStore(config);

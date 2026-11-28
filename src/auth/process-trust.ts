@@ -1,10 +1,29 @@
-import type { MemorySubject, Scope, ScopeVisibility } from "../models.js";
+import type { MemorySubject, ScopeVisibility } from "../models.js";
 /**
- * CW-09-02-R5-B: process-start trust snapshot.
+ * CW-09-02-R5-B-R1: process-start trust claim and official production identity.
  *
- * Production bootstrap identity is determined only by a sealed process-start
- * boundary. Request parameters, ordinary config objects, caller-declared
- * fields, and later mutations of process.env cannot change this snapshot.
+ * A Node.js library cannot run before ordinary application code prepares
+ * `process.env` or chooses when to import the SDK. Environment variables are
+ * therefore not an unforgeable production-identity root.
+ *
+ * What this module can guarantee:
+ * - At SDK module evaluation (before any ordinary public SDK API returns),
+ *   a frozen process-environment *claim* is captured. Later `process.env`
+ *   mutations, including those that happen after import but before the first
+ *   trust API call, cannot change that claim and cannot downgrade a
+ *   production request into ordinary non-production.
+ * - Ordinary public SDK APIs never establish, reset, or replace production
+ *   identity. Their first call does not decide whether the process is
+ *   production or non-production.
+ * - Production identity (`mode === "production"`) is established only by the
+ *   official, zero-argument process-start assembly path
+ *   (`bootstrapProductionTrustedRuntime()`), which applies the frozen claim
+ *   and then runs the assembly guard. A public setter, ordinary config
+ *   object, mutable global, or caller-injectable callback cannot do this.
+ * - If official production establishment fails after identity is applied,
+ *   the process stays on the production boundary and fail-closes. It does
+ *   not degrade to ordinary non-production and then accept caller-injected
+ *   authorization services.
  *
  * `createTrustedRuntime()` is not production authorization proof.
  */
@@ -31,8 +50,24 @@ const SECRET_ENV_KEYS = [
 
 export type ProcessTrustMode = "production" | "non_production";
 
+/**
+ * Distinct process configuration state.
+ * Mixed/invalid is never implicitly ordinary non-production.
+ * `"production"` means official production identity has been established,
+ * not merely that an environment variable requested it.
+ */
+export type ProcessConfigurationState = "production" | "non_production" | "mixed_or_invalid";
+
+export type ProcessTrustEstablishment = "unestablished" | "established" | "failed_closed";
+
 export type ProcessTrustSnapshot = {
   readonly mode: ProcessTrustMode;
+  readonly configurationState: ProcessConfigurationState;
+  /** Frozen at SDK module evaluation. Not an unforgeable production identity root. */
+  readonly productionRequested: boolean;
+  /** True only after the official process-start assembly path establishes production trust. */
+  readonly productionTrustEstablished: boolean;
+  readonly establishment: ProcessTrustEstablishment;
   readonly simulated: boolean;
   readonly mixedConfiguration: boolean;
   readonly authorityId: string | null;
@@ -85,9 +120,19 @@ type InternalSnapshot = ProcessTrustSnapshot & {
   readonly authoritativeScopes?: SimulatedProductionTrustFixture["authoritativeScopes"];
 };
 
-let snapshot: InternalSnapshot | undefined;
-let sealedSecrets: SealedSecrets | undefined;
-const simulatedCleanupHooks: Array<() => void> = [];
+type FrozenEnvironmentClaim = {
+  readonly productionRequested: boolean;
+  readonly mixedConfiguration: boolean;
+  readonly authorityId: string | null;
+  readonly engineEnvironment: "service" | "cloud" | null;
+  readonly metadataBackend: string | null;
+  readonly graphBackend: string | null;
+  readonly vectorBackend: string | null;
+  readonly evidenceBackend: string | null;
+  readonly testHarnessPresent: boolean;
+  readonly sealedAt: string;
+  readonly secrets: SealedSecrets;
+};
 
 function trimEnv(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
@@ -105,14 +150,17 @@ function readEngineEnvironment(value: string | undefined): "service" | "cloud" |
   return null;
 }
 
-function readFromEnv(env: NodeJS.ProcessEnv): { snapshot: InternalSnapshot; secrets: SealedSecrets } {
+function captureEnvironmentClaim(env: NodeJS.ProcessEnv): FrozenEnvironmentClaim {
   const testHarnessPresent = isTestHarnessPresent(env);
-  const wantsProduction = trimEnv(env[PROCESS_TRUST_MODE_ENV]) === "production";
-  const mixedConfiguration = wantsProduction && testHarnessPresent;
+  const productionRequested = trimEnv(env[PROCESS_TRUST_MODE_ENV]) === "production";
+  const mixedConfiguration = productionRequested && testHarnessPresent;
   const authorityId = trimEnv(env[PROCESS_TRUST_AUTHORITY_ENV]) ?? null;
-  const snapshot: InternalSnapshot = Object.freeze({
-    mode: wantsProduction && !mixedConfiguration ? "production" : "non_production",
-    simulated: false,
+  const postgresUrl =
+    trimEnv(env.COGNIWEAVE_POSTGRES_URL) ??
+    trimEnv(env.OPENBOT_COGNIWEAVE_POSTGRES_URL) ??
+    trimEnv(env.DATABASE_URL);
+  return Object.freeze({
+    productionRequested,
     mixedConfiguration,
     authorityId,
     engineEnvironment: readEngineEnvironment(env[PROCESS_TRUST_ENGINE_ENVIRONMENT_ENV]),
@@ -122,62 +170,202 @@ function readFromEnv(env: NodeJS.ProcessEnv): { snapshot: InternalSnapshot; secr
     evidenceBackend: trimEnv(env[PROCESS_TRUST_EVIDENCE_BACKEND_ENV]) ?? null,
     testHarnessPresent,
     sealedAt: new Date().toISOString(),
+    secrets: Object.freeze({
+      ...(postgresUrl ? { postgresUrl } : {}),
+    }),
   });
-  const postgresUrl =
-    trimEnv(env.COGNIWEAVE_POSTGRES_URL) ??
-    trimEnv(env.OPENBOT_COGNIWEAVE_POSTGRES_URL) ??
-    trimEnv(env.DATABASE_URL);
-  const secrets: SealedSecrets = Object.freeze({
-    ...(postgresUrl ? { postgresUrl } : {}),
+}
+
+function configurationStateOf(input: {
+  mixedConfiguration: boolean;
+  productionTrustEstablished: boolean;
+  establishment: ProcessTrustEstablishment;
+}): ProcessConfigurationState {
+  if (input.mixedConfiguration || input.establishment === "failed_closed") {
+    return "mixed_or_invalid";
+  }
+  if (input.productionTrustEstablished) {
+    return "production";
+  }
+  return "non_production";
+}
+
+function snapshotFromClaim(
+  claim: FrozenEnvironmentClaim,
+  extras: {
+    mode: ProcessTrustMode;
+    productionTrustEstablished: boolean;
+    establishment: ProcessTrustEstablishment;
+    simulated: boolean;
+    principalBindings?: SimulatedProductionTrustFixture["principalBindings"];
+    authoritativeScopes?: SimulatedProductionTrustFixture["authoritativeScopes"];
+  },
+): InternalSnapshot {
+  return Object.freeze({
+    mode: extras.mode,
+    configurationState: configurationStateOf({
+      mixedConfiguration: claim.mixedConfiguration,
+      productionTrustEstablished: extras.productionTrustEstablished,
+      establishment: extras.establishment,
+    }),
+    productionRequested: claim.productionRequested,
+    productionTrustEstablished: extras.productionTrustEstablished,
+    establishment: extras.establishment,
+    simulated: extras.simulated,
+    mixedConfiguration: claim.mixedConfiguration,
+    authorityId: claim.authorityId,
+    engineEnvironment: claim.engineEnvironment,
+    metadataBackend: claim.metadataBackend,
+    graphBackend: claim.graphBackend,
+    vectorBackend: claim.vectorBackend,
+    evidenceBackend: claim.evidenceBackend,
+    testHarnessPresent: claim.testHarnessPresent,
+    sealedAt: claim.sealedAt,
+    ...(extras.principalBindings ? { principalBindings: extras.principalBindings } : {}),
+    ...(extras.authoritativeScopes ? { authoritativeScopes: extras.authoritativeScopes } : {}),
   });
-  return { snapshot, secrets };
 }
 
 /**
- * Returns the sealed process-start trust snapshot.
- * The first call freezes the snapshot; later process.env mutations are ignored.
+ * Frozen at this module's evaluation, which happens before any ordinary
+ * public SDK API that depends on process trust can return. This is a claim,
+ * not production identity. Ordinary application code may still have mutated
+ * `process.env` before importing the SDK; that is why environment variables
+ * are not treated as an unforgeable production-identity root.
+ */
+const frozenEnvironmentClaim: FrozenEnvironmentClaim = captureEnvironmentClaim(process.env);
+let sealedSecrets: SealedSecrets = frozenEnvironmentClaim.secrets;
+let snapshot: InternalSnapshot = snapshotFromClaim(frozenEnvironmentClaim, {
+  mode: "non_production",
+  productionTrustEstablished: false,
+  establishment: "unestablished",
+  simulated: false,
+});
+const simulatedCleanupHooks: Array<() => void> = [];
+
+/**
+ * Returns the process trust snapshot.
+ * The environment claim was frozen at module evaluation. This function never
+ * re-reads `process.env` and never establishes production identity.
  */
 export function getProcessTrustSnapshot(): ProcessTrustSnapshot {
-  if (!snapshot) {
-    const read = readFromEnv(process.env);
-    snapshot = read.snapshot;
-    sealedSecrets = read.secrets;
-  }
   return snapshot;
 }
 
+/**
+ * True only after official production identity has been established.
+ * A frozen environment claim that requested production is not enough.
+ */
 export function isProductionProcess(): boolean {
-  return getProcessTrustSnapshot().mode === "production";
+  return snapshot.mode === "production" && snapshot.productionTrustEstablished;
+}
+
+/**
+ * True when ordinary public APIs must not act as a non-production caller
+ * because production was requested at module evaluation or official
+ * production identity has been established.
+ *
+ * Mixed/invalid configuration is a distinct rejection state and is not
+ * implied by this helper.
+ */
+export function isProductionTrustBoundaryActive(): boolean {
+  return (
+    snapshot.productionTrustEstablished ||
+    snapshot.mode === "production" ||
+    (snapshot.productionRequested && !snapshot.mixedConfiguration)
+  );
+}
+
+/**
+ * Distinct mixed/invalid configuration state. Must not be treated as
+ * ordinary non-production.
+ */
+export function isMixedOrInvalidProcessConfiguration(): boolean {
+  return snapshot.mixedConfiguration || snapshot.configurationState === "mixed_or_invalid";
 }
 
 export function isSimulatedProductionProcess(): boolean {
-  const current = getProcessTrustSnapshot();
-  return current.mode === "production" && current.simulated;
+  return snapshot.mode === "production" && snapshot.simulated;
 }
 
 export function getSealedProcessTrustMode(): ProcessTrustMode {
-  return getProcessTrustSnapshot().mode;
+  return snapshot.mode;
 }
 
 /** Same-bundle only. Never include the result in audit records or logs. */
 export function getSealedProcessSecrets(): SealedSecrets {
-  getProcessTrustSnapshot();
-  return sealedSecrets ?? Object.freeze({});
+  return sealedSecrets;
 }
 
 /** Same-bundle only. Simulated principal bindings never come from request input. */
 export function getSimulatedPrincipalBindings(): SimulatedProductionTrustFixture["principalBindings"] {
-  const current = snapshot ?? getProcessTrustSnapshot();
-  return (current as InternalSnapshot).principalBindings;
+  return snapshot.principalBindings;
 }
 
 export function getSimulatedAuthoritativeScopes(): SimulatedProductionTrustFixture["authoritativeScopes"] {
-  const current = snapshot ?? getProcessTrustSnapshot();
-  return (current as InternalSnapshot).authoritativeScopes;
+  return snapshot.authoritativeScopes;
 }
 
 export function registerSimulatedProductionCleanup(hook: () => void): void {
   simulatedCleanupHooks.push(hook);
+}
+
+export type OfficialProductionTrustEstablishmentResult =
+  | { readonly ok: true; readonly snapshot: ProcessTrustSnapshot }
+  | {
+      readonly ok: false;
+      readonly reason: "mixed_test_and_production_configuration" | "process_not_production";
+    };
+
+/**
+ * Same-bundle helper used only by the official production bootstrap.
+ * This is the only path that can establish production identity from the
+ * frozen environment claim. Not a public SDK export. Not a setter for
+ * ordinary callers. Does not re-read `process.env`.
+ */
+export function applyOfficialProductionTrustEstablishment(): OfficialProductionTrustEstablishmentResult {
+  if (snapshot.mixedConfiguration) {
+    if (snapshot.establishment === "unestablished") {
+      snapshot = Object.freeze({
+        ...snapshot,
+        establishment: "failed_closed",
+        configurationState: "mixed_or_invalid",
+      });
+    }
+    return { ok: false, reason: "mixed_test_and_production_configuration" };
+  }
+  if (snapshot.mode === "production" && snapshot.productionTrustEstablished) {
+    return { ok: true, snapshot };
+  }
+  if (!snapshot.productionRequested && !snapshot.simulated) {
+    return { ok: false, reason: "process_not_production" };
+  }
+  snapshot = Object.freeze({
+    ...snapshot,
+    mode: "production",
+    productionTrustEstablished: true,
+    establishment: "established",
+    configurationState: "production",
+  });
+  return { ok: true, snapshot };
+}
+
+/**
+ * Same-bundle helper. After official production identity has been applied,
+ * a later assembly failure must not degrade the process to ordinary
+ * non-production. Not a public SDK export.
+ */
+export function markOfficialProductionTrustFailedClosed(): void {
+  if (snapshot.mode === "production" || snapshot.productionRequested) {
+    snapshot = Object.freeze({
+      ...snapshot,
+      mode: snapshot.mode === "production" ? "production" : snapshot.mode,
+      productionTrustEstablished: snapshot.productionTrustEstablished || snapshot.mode === "production",
+      establishment: snapshot.productionTrustEstablished || snapshot.mode === "production" ? "established" : "failed_closed",
+      configurationState:
+        snapshot.mode === "production" || snapshot.productionTrustEstablished ? "production" : "mixed_or_invalid",
+    });
+  }
 }
 
 /**
@@ -205,6 +393,10 @@ export function installSimulatedProcessTrustForTests(fixture: SimulatedProductio
   const previousSecrets = sealedSecrets;
   snapshot = Object.freeze({
     mode: "production",
+    configurationState: "production",
+    productionRequested: true,
+    productionTrustEstablished: true,
+    establishment: "established",
     simulated: true,
     mixedConfiguration: false,
     authorityId,

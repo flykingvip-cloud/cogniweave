@@ -1,8 +1,9 @@
 /**
  * CW-09-02-R5-B: official production Trusted Runtime bootstrap.
  *
- * Ordinary callers cannot assemble a production runtime. This module reads only
- * the sealed process-start trust snapshot, creates trusted services internally,
+ * Ordinary callers cannot assemble a production runtime. This module is the
+ * only official process-start path that can establish production identity from
+ * the frozen environment claim, creates trusted services internally,
  * runs the assembly guard, seals a write-once production assembly, and returns
  * a handle plus a redacted audit record. Store and trusted-service references
  * are not returned to the caller.
@@ -26,6 +27,7 @@ import {
 } from "./delegation.js";
 import { isUsableTrustedPrincipal, type TrustedPrincipal, type TrustedPrincipalProvider } from "./principal.js";
 import {
+  applyOfficialProductionTrustEstablishment,
   assertNoSecretMaterial,
   getProcessTrustSnapshot,
   getSealedProcessSecrets,
@@ -35,6 +37,7 @@ import {
   installSimulatedProcessTrustForTests,
   isProductionProcess,
   isSimulatedProductionProcess,
+  markOfficialProductionTrustFailedClosed,
   registerSimulatedProductionCleanup,
   type SimulatedProductionTrustFixture,
 } from "./process-trust.js";
@@ -129,6 +132,9 @@ function fail(
   message: string,
   extras: Partial<ProductionAssemblyAuditRecord> = {},
 ): never {
+  if (reason !== "process_not_production" && reason !== "caller_injection_rejected") {
+    markOfficialProductionTrustFailedClosed();
+  }
   const audit = baseAudit({ ...extras, verificationResult: "failed", failureReason: reason });
   failedBootstrapAudits.push(audit);
   throw new ProductionBootstrapError(message, reason, audit);
@@ -427,6 +433,15 @@ export async function bootstrapProductionTrustedRuntime(
 ): Promise<ProductionBootstrapResult> {
   rejectCallerInput(arguments);
   void forbidden;
+  const established = applyOfficialProductionTrustEstablishment();
+  if (!established.ok) {
+    fail(
+      established.reason,
+      established.reason === "mixed_test_and_production_configuration"
+        ? "Process trust snapshot mixes test harness markers with production mode"
+        : "Ordinary callers cannot create a production Trusted Runtime; official bootstrap requires a sealed production process-start boundary",
+    );
+  }
   const trust = getProcessTrustSnapshot();
   if (trust.mixedConfiguration) {
     fail(
@@ -434,7 +449,7 @@ export async function bootstrapProductionTrustedRuntime(
       "Process trust snapshot mixes test harness markers with production mode",
     );
   }
-  if (trust.mode !== "production") {
+  if (trust.mode !== "production" || !trust.productionTrustEstablished) {
     fail(
       "process_not_production",
       "Ordinary callers cannot create a production Trusted Runtime; official bootstrap requires a sealed production process-start boundary",

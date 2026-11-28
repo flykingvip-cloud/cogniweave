@@ -37,7 +37,7 @@ import {
   type EngineDirectAuthorizationResult,
 } from "../auth/engine-invocation.js";
 import { sameMemorySubject } from "../auth/delegation.js";
-import { getProcessTrustSnapshot, isProductionProcess } from "../auth/process-trust.js";
+import { getProcessTrustSnapshot, isProductionProcess, isProductionTrustBoundaryActive } from "../auth/process-trust.js";
 import {
   bindEngineTrustedRuntime,
   createImplicitLocalRuntime,
@@ -768,7 +768,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     config: EngineConfig,
     stores?: InMemoryEngineConstructionStores,
   ) {
-    if (isProductionProcess() && !productionConstructionGate.open) {
+    if (isProductionTrustBoundaryActive() && !productionConstructionGate.open) {
       throw new ProductionBootstrapError(
         "Ordinary callers cannot construct a production Engine; use the official production bootstrap",
         "engine_construction_rejected",
@@ -810,7 +810,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
           { decision: "deny", reason: "untrusted_runtime" },
         );
       }
-      if (isProductionProcess()) {
+      if (isProductionTrustBoundaryActive()) {
         const trust = getProcessTrustSnapshot();
         if (!isProductionTrustClass(assembly.trustClass)) {
           throw new ProductionBootstrapError(
@@ -836,7 +836,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       }
       return runtime;
     }
-    if (isProductionProcess()) {
+    if (isProductionTrustBoundaryActive()) {
       throw new ProductionBootstrapError(
         "A production Engine requires the official production Trusted Runtime; implicit construction is refused",
         "engine_construction_rejected",
