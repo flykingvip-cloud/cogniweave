@@ -1,3 +1,4 @@
+import { assertNotMixedOrInvalidProcessConfiguration } from "../auth/process-trust.js";
 import { LocalMetadataStore } from "../adapters/local-metadata.js";
 import { PostgresMetadataStore, type PostgresSqlClient } from "../adapters/postgres-metadata.js";
 import type { Scope } from "../models.js";
@@ -66,6 +67,7 @@ async function listLifecycleReceiptsFromLocal(
 export async function migrateLocalCanonicalToPostgres(
   input: MigrateLocalCanonicalToPostgresInput,
 ): Promise<LocalToPostgresMigrationResult> {
+  assertNotMixedOrInvalidProcessConfiguration("migrateLocalCanonicalToPostgres()");
   const started = performance.now();
   const schema = (input.schema?.trim() || "cogniweave_drill").replace(/[^a-zA-Z0-9_]/g, "_");
   const source = new LocalMetadataStore({

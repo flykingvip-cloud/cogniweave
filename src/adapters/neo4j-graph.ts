@@ -1,3 +1,4 @@
+import { assertNotMixedOrInvalidProcessConfiguration } from "../auth/process-trust.js";
 import { StorageConsistencyError } from "../errors.js";
 import type { DistillationResult } from "../models.js";
 import type { MetadataBundle, GraphStore } from "../storage/types.js";
@@ -80,6 +81,7 @@ export class Neo4jGraphStore implements GraphStore {
   private readonly client?: Neo4jCypherClient;
 
   constructor(config: Neo4jGraphStoreConfig) {
+    assertNotMixedOrInvalidProcessConfiguration("Neo4jGraphStore");
     this.client = config.client;
     this.database = config.database;
     this.namespace = config.namespace;

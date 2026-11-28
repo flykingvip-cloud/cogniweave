@@ -5,6 +5,8 @@ import {
   type PostgresQueryResult,
   type PostgresSqlClient,
   buildPostgresMetadataSchema,
+  createMemoryPartitionKeyV1,
+  createMemorySubjectBinding,
 } from "../index.js";
 
 describe("PostgresMetadataStore", () => {
@@ -18,6 +20,8 @@ describe("PostgresMetadataStore", () => {
     expect(ddl).toContain(POSTGRES_METADATA_TABLES.sourceBindings);
     expect(ddl).toContain(POSTGRES_METADATA_TABLES.sourceObjectLinks);
     expect(ddl).toContain(POSTGRES_METADATA_TABLES.writeOperations);
+    expect(ddl).toContain(POSTGRES_METADATA_TABLES.memorySubjectBindings);
+    expect(ddl).toContain("idx_cogniweave_subject_bindings_partition");
     expect(ddl).toContain(POSTGRES_METADATA_TABLES.meta);
   });
 
@@ -430,5 +434,112 @@ describe("PostgresMetadataStore", () => {
       completedAt: now,
     });
     expect((await store.getWriteOperation("opk/1/test"))?.kind).toBe("WRITE");
+  });
+
+  it("CW-09-02: persists and lists MemorySubjectBinding rows (adapter unit test, not real PG E2E)", async () => {
+    const rows = new Map<string, { payload: string; cols: Record<string, unknown> }>();
+    const client: PostgresSqlClient = {
+      async query<Row = Record<string, unknown>>(
+        sql: string,
+        params?: readonly unknown[],
+      ): Promise<PostgresQueryResult<Row>> {
+        if (sql.includes("cogniweave_memory_subject_bindings") && sql.includes("insert into")) {
+          rows.set(String(params?.[0]), {
+            payload: String(params?.[11]),
+            cols: {
+              id: params?.[0],
+              data_plane_id: params?.[1],
+              scope_fingerprint: params?.[2],
+              tenant_id: params?.[3],
+              owner_type: params?.[4],
+              owner_id: params?.[5],
+              workspace_id: params?.[6],
+              project_id: params?.[7],
+              agent_id: params?.[8],
+              visibility: params?.[9],
+              unbound_at: params?.[10],
+            },
+          });
+          return { rows: [], rowCount: 1 };
+        }
+        if (
+          sql.includes("cogniweave_memory_subject_bindings") &&
+          sql.includes("where id = $1") &&
+          sql.includes("select payload")
+        ) {
+          const row = rows.get(String(params?.[0]));
+          return {
+            rows: row ? ([{ payload: row.payload }] as Row[]) : [],
+            rowCount: row ? 1 : 0,
+          };
+        }
+        if (sql.includes("cogniweave_memory_subject_bindings") && sql.includes("select payload")) {
+          const wanted = [...rows.values()].filter((row) => {
+            if (sql.includes("unbound_at is null") && row.cols.unbound_at) return false;
+            for (const [index, value] of (params ?? []).entries()) {
+              const token = `$${index + 1}`;
+              if (!sql.includes(token)) continue;
+              // Match the bound parameter against any stored column used by the filter.
+              if (!Object.values(row.cols).includes(value)) return false;
+            }
+            return true;
+          });
+          return {
+            rows: wanted.map((row) => ({ payload: row.payload })) as Row[],
+            rowCount: wanted.length,
+          };
+        }
+        if (sql.includes("cogniweave_memory_subject_bindings") && sql.includes("delete from")) {
+          rows.delete(String(params?.[0]));
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+    };
+
+    const store = new PostgresMetadataStore({
+      backend: "postgres",
+      environment: "service",
+      client,
+      schema: "cogniweave",
+    });
+
+    const scope = {
+      workspaceId: "ws_pg",
+      projectId: "proj_pg",
+      agentId: "agent_main",
+      visibility: "private" as const,
+    };
+    const partition = createMemoryPartitionKeyV1("dp_pg", scope);
+    const subject = { tenantId: "t_pg", ownerType: "agent" as const, ownerId: "agent_main" };
+    const live = createMemorySubjectBinding({
+      partition,
+      scope,
+      subject,
+      now: "2026-11-27T00:00:00.000Z",
+    });
+    await store.saveMemorySubjectBinding(live);
+    expect(await store.getMemorySubjectBinding(live.id)).toEqual(live);
+    expect(
+      await store.listMemorySubjectBindings({
+        tenantId: "t_pg",
+        dataPlaneId: "dp_pg",
+        liveOnly: true,
+      }),
+    ).toEqual([live]);
+
+    const unbound = {
+      ...live,
+      unboundAt: "2026-11-27T01:00:00.000Z",
+      updatedAt: "2026-11-27T01:00:00.000Z",
+    };
+    await store.saveMemorySubjectBinding(unbound);
+    expect(
+      await store.listMemorySubjectBindings({ tenantId: "t_pg", dataPlaneId: "dp_pg", liveOnly: true }),
+    ).toEqual([]);
+    expect(await store.getMemorySubjectBinding(live.id)).toEqual(unbound);
+
+    await store.deleteMemorySubjectBinding(live.id);
+    expect(await store.getMemorySubjectBinding(live.id)).toBeUndefined();
   });
 });

@@ -6,6 +6,7 @@ import type {
   CogniWeaveEngine,
   CompactJournalsOptions,
   CompactJournalsResult,
+  EngineCallOptions,
   IngestInput,
   IngestResult,
   QueryAtomsHybridOptions,
@@ -16,6 +17,7 @@ import type {
   ResolveEvidenceOptions,
   SearchEvidenceOptions,
   TraceOptions,
+  UpsertAtomsOptions,
 } from "../contracts.js";
 import { withAtomV2Defaults } from "../domain/atom-v2.js";
 import {
@@ -24,15 +26,32 @@ import {
   isRebuildObjectType,
   journalObjectIdsForType,
   resolveCanonicalResourceScope as resolveCanonicalResourceScopeFromLookup,
+  type CanonicalAuthorizationMode,
   type CanonicalResourceKind,
   type CanonicalResourceLookup,
   type CanonicalResourceScope,
+  type CanonicalResourceScopeResolver,
 } from "../auth/canonical-scope.js";
-import { IdempotencyConflictError, ScopeViolationError, StoreUnavailableError, ValidationError } from "../errors.js";
+import {
+  authorizeEngineDirectInvocation,
+  type EngineDirectAuthorizationResult,
+} from "../auth/engine-invocation.js";
+import { sameMemorySubject } from "../auth/delegation.js";
+import { assertNotMixedOrInvalidProcessConfiguration, getProcessTrustSnapshot, isProductionProcess, isProductionTrustBoundaryActive } from "../auth/process-trust.js";
+import {
+  bindEngineTrustedRuntime,
+  createImplicitLocalRuntime,
+  createTrustedRuntime,
+  isProductionTrustClass,
+  resolveTrustedRuntimeAssembly,
+  type TrustedRuntime,
+} from "../auth/trusted-runtime.js";
+import { IdempotencyConflictError, ProductionBootstrapError, ScopeViolationError, StoreUnavailableError, UntrustedRuntimeError, ValidationError } from "../errors.js";
 import {
   repairDerivedIndexes as repairJournalDerivedIndexes,
   rebuildFromTruth as rebuildDerivedFromTruth,
 } from "../journal/repair.js";
+import { registerEngineCanonicalAuthorizationResolver } from "./canonical-resolver-registry.js";
 import {
   computeDedupKey,
   computeEventKey,
@@ -671,100 +690,237 @@ function assertCanonicalScopeHierarchy(distillation: DistillationResult): void {
   }
 }
 
+export type InMemoryEngineConstructionStores = {
+  metadataStore?: MetadataStore;
+  graphStore?: GraphStore;
+  vectorStore?: VectorStore;
+  taskFramingStrategy?: TaskFramingStrategy;
+  distillationStrategy?: DistillationStrategy;
+  templateRegistry?: TemplateRegistry;
+  runtime?: TrustedRuntime;
+};
+
+const productionConstructionGate = { open: false };
+
+function productionEngineDeniedAudit() {
+  const trust = getProcessTrustSnapshot();
+  return Object.freeze({
+    assemblyId: "unissued",
+    trustClass: "none",
+    runtimeEnvironment: trust.engineEnvironment,
+    processTrustMode: trust.mode,
+    bootstrapAuthorityId: trust.authorityId,
+    createdAt: new Date().toISOString(),
+    verificationResult: "failed",
+    failureReason: "engine_construction_rejected",
+    services: {},
+    canonicalStoreBindingQueryAssociation: "missing",
+  });
+}
+
+/**
+ * Same-bundle official production Engine constructor. Not a public SDK export.
+ * The public `new InMemoryCogniWeaveEngine()` path is refused in a production process.
+ */
+export function createProductionEngine(
+  config: EngineConfig,
+  stores: Required<Pick<InMemoryEngineConstructionStores, "metadataStore" | "graphStore" | "vectorStore" | "runtime">> &
+    InMemoryEngineConstructionStores,
+): InMemoryCogniWeaveEngine {
+  if (!isProductionProcess()) {
+    throw new ProductionBootstrapError(
+      "createProductionEngine() requires a sealed production process trust snapshot",
+      "process_not_production",
+      productionEngineDeniedAudit(),
+    );
+  }
+  productionConstructionGate.open = true;
+  try {
+    return new InMemoryCogniWeaveEngine(config, stores);
+  } finally {
+    productionConstructionGate.open = false;
+  }
+}
+
 export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   readonly config: EngineConfig;
 
-  private readonly metadataStore: MetadataStore;
-  private readonly graphStore: GraphStore;
-  private readonly vectorStore: VectorStore;
-  private readonly packages = new Map<string, CognitivePackage>();
-  private readonly packageTraces = new Map<string, TracePackageResult>();
-  private readonly reasoningSessions = new Map<string, TraceReasoningSessionResult>();
-  private readonly taskFrameCache = new Map<string, TaskFrame>();
-  private readonly taskFramingStrategy: TaskFramingStrategy;
-  private readonly distillationStrategy: DistillationStrategy;
-  private readonly templateRegistry: TemplateRegistry;
+  readonly #metadataStore: MetadataStore;
+  readonly #graphStore: GraphStore;
+  readonly #vectorStore: VectorStore;
+  readonly #packages = new Map<string, CognitivePackage>();
+  readonly #packageTraces = new Map<string, TracePackageResult>();
+  readonly #reasoningSessions = new Map<string, TraceReasoningSessionResult>();
+  readonly #taskFrameCache = new Map<string, TaskFrame>();
+  readonly #taskFramingStrategy: TaskFramingStrategy;
+  readonly #distillationStrategy: DistillationStrategy;
+  readonly #templateRegistry: TemplateRegistry;
   /** In-memory source lifecycle registry (bindings + links + idempotent receipts). */
-  private readonly sourceBindings = new Map<string, SourceBinding>();
-  private readonly sourceBindingsByIdentity = new Map<string, string>();
-  private readonly sourceBindingsByLocator = new Map<string, string>();
-  private readonly sourceObjectLinks = new Map<string, SourceObjectLink>();
-  private readonly sourceLifecycleReceipts = new Map<string, SourceLifecycleReceipt>();
-  private sourceLifecycleHydratePromise: Promise<void> | null = null;
+  readonly #sourceBindings = new Map<string, SourceBinding>();
+  readonly #sourceBindingsByIdentity = new Map<string, string>();
+  readonly #sourceBindingsByLocator = new Map<string, string>();
+  readonly #sourceObjectLinks = new Map<string, SourceObjectLink>();
+  readonly #sourceLifecycleReceipts = new Map<string, SourceLifecycleReceipt>();
+  #sourceLifecycleHydratePromise: Promise<void> | null = null;
+  readonly #trustedRuntime: TrustedRuntime;
 
   constructor(
     config: EngineConfig,
-    stores?: {
-      metadataStore?: MetadataStore;
-      graphStore?: GraphStore;
-      vectorStore?: VectorStore;
-      taskFramingStrategy?: TaskFramingStrategy;
-      distillationStrategy?: DistillationStrategy;
-      templateRegistry?: TemplateRegistry;
-    },
+    stores?: InMemoryEngineConstructionStores,
   ) {
+    assertNotMixedOrInvalidProcessConfiguration("InMemoryCogniWeaveEngine");
+    if (isProductionTrustBoundaryActive() && !productionConstructionGate.open) {
+      throw new ProductionBootstrapError(
+        "Ordinary callers cannot construct a production Engine; use the official production bootstrap",
+        "engine_construction_rejected",
+        productionEngineDeniedAudit(),
+      );
+    }
     this.config = config;
-    const defaults = createAdapterBundle(config);
+    this.#trustedRuntime = this.#initializeTrustedRuntime(stores?.runtime);
+    bindEngineTrustedRuntime(this, this.#trustedRuntime);
+    const hasAllStores = Boolean(stores?.metadataStore && stores.graphStore && stores.vectorStore);
+    const defaults = hasAllStores ? undefined : createAdapterBundle(config);
     const llmTaskFramingProvider = createHttpTaskFramingProvider(config);
     const llmDistillationProvider = createHttpDistillationProvider(config);
-    this.metadataStore = stores?.metadataStore ?? defaults.metadataStore;
-    this.graphStore = stores?.graphStore ?? defaults.graphStore;
-    this.vectorStore = stores?.vectorStore ?? defaults.vectorStore;
-    this.taskFramingStrategy =
+    this.#metadataStore = stores?.metadataStore ?? defaults!.metadataStore;
+    this.#graphStore = stores?.graphStore ?? defaults!.graphStore;
+    this.#vectorStore = stores?.vectorStore ?? defaults!.vectorStore;
+    this.#taskFramingStrategy =
       stores?.taskFramingStrategy ??
       createDefaultTaskFramingStrategy({
         llmProvider: llmTaskFramingProvider,
       });
-    this.distillationStrategy =
+    this.#distillationStrategy =
       stores?.distillationStrategy ??
       createDefaultDistillationStrategy({
         llmProvider: llmDistillationProvider,
       });
-    this.templateRegistry = stores?.templateRegistry ?? DEFAULT_TEMPLATE_REGISTRY;
+    this.#templateRegistry = stores?.templateRegistry ?? DEFAULT_TEMPLATE_REGISTRY;
+    registerEngineCanonicalAuthorizationResolver(this, this.#canonicalResolver());
     // Kick hydrate early so first search/lifecycle sees durable bindings.
-    void this.ensureSourceLifecycleHydrated();
+    void this.#ensureSourceLifecycleHydrated();
   }
 
-  private ensureSourceLifecycleHydrated(): Promise<void> {
-    if (!this.sourceLifecycleHydratePromise) {
-      this.sourceLifecycleHydratePromise = this.hydrateSourceLifecycleFromStore();
+  #initializeTrustedRuntime(runtime?: TrustedRuntime): TrustedRuntime {
+    if (runtime !== undefined) {
+      const assembly = resolveTrustedRuntimeAssembly(runtime);
+      if (assembly.environment !== this.config.environment) {
+        throw new UntrustedRuntimeError(
+          "Trusted runtime environment must match EngineConfig.environment",
+          { decision: "deny", reason: "untrusted_runtime" },
+        );
+      }
+      if (isProductionTrustBoundaryActive()) {
+        const trust = getProcessTrustSnapshot();
+        if (!isProductionTrustClass(assembly.trustClass)) {
+          throw new ProductionBootstrapError(
+            "A production Engine can only be bound to a production Trusted Runtime assembly",
+            "engine_construction_rejected",
+            productionEngineDeniedAudit(),
+          );
+        }
+        if (assembly.trustClass === "simulated_production" && !trust.simulated) {
+          throw new ProductionBootstrapError(
+            "A simulated production assembly cannot be mixed into a real production process",
+            "mixed_test_and_production_configuration",
+            productionEngineDeniedAudit(),
+          );
+        }
+        if (assembly.trustClass === "production" && trust.simulated) {
+          throw new ProductionBootstrapError(
+            "A real production assembly cannot be mixed into a simulated production process",
+            "mixed_test_and_production_configuration",
+            productionEngineDeniedAudit(),
+          );
+        }
+      }
+      return runtime;
     }
-    return this.sourceLifecycleHydratePromise;
+    if (isProductionTrustBoundaryActive()) {
+      throw new ProductionBootstrapError(
+        "A production Engine requires the official production Trusted Runtime; implicit construction is refused",
+        "engine_construction_rejected",
+        productionEngineDeniedAudit(),
+      );
+    }
+    if (this.config.environment === "local") {
+      return createImplicitLocalRuntime();
+    }
+    return createTrustedRuntime({ environment: this.config.environment });
   }
 
-  private async hydrateSourceLifecycleFromStore(): Promise<void> {
-    const list = this.metadataStore.listSourceBindings;
+  #resolveCanonicalResourceScopeForAuthorization(
+    kind: CanonicalResourceKind,
+    id: string,
+  ): Promise<CanonicalResourceScope> {
+    return resolveCanonicalResourceScopeFromLookup(kind, id, this.#canonicalLookup());
+  }
+
+  #canonicalResolver(): CanonicalResourceScopeResolver {
+    return {
+      resolve: (kind, id) => this.#resolveCanonicalResourceScopeForAuthorization(kind, id),
+    };
+  }
+
+  async #assertEngineAuthorized(input: {
+    method: string;
+    mode: CanonicalAuthorizationMode;
+    authorization?: { bearerToken?: string };
+    declaredScope?: Scope | null;
+    resource?: { kind: CanonicalResourceKind; id: string };
+  }): Promise<EngineDirectAuthorizationResult> {
+    return authorizeEngineDirectInvocation({
+      runtime: this.#trustedRuntime,
+      method: input.method,
+      mode: input.mode,
+      authorization: input.authorization,
+      declaredScope: input.declaredScope,
+      resource: input.resource,
+      resolver: input.resource ? this.#canonicalResolver() : undefined,
+    });
+  }
+
+  #ensureSourceLifecycleHydrated(): Promise<void> {
+    if (!this.#sourceLifecycleHydratePromise) {
+      this.#sourceLifecycleHydratePromise = this.#hydrateSourceLifecycleFromStore();
+    }
+    return this.#sourceLifecycleHydratePromise;
+  }
+
+  async #hydrateSourceLifecycleFromStore(): Promise<void> {
+    const list = this.#metadataStore.listSourceBindings;
     if (typeof list === "function") {
-      const bindings = await list.call(this.metadataStore);
+      const bindings = await list.call(this.#metadataStore);
       for (const binding of bindings) {
-        this.sourceBindings.set(binding.id, binding);
-        this.sourceBindingsByIdentity.set(binding.sourceIdentityId, binding.id);
-        this.sourceBindingsByLocator.set(binding.sourceLocator, binding.id);
+        this.#sourceBindings.set(binding.id, binding);
+        this.#sourceBindingsByIdentity.set(binding.sourceIdentityId, binding.id);
+        this.#sourceBindingsByLocator.set(binding.sourceLocator, binding.id);
       }
     }
-    const listLinks = this.metadataStore.listSourceObjectLinks;
+    const listLinks = this.#metadataStore.listSourceObjectLinks;
     if (typeof listLinks === "function") {
-      const links = await listLinks.call(this.metadataStore);
+      const links = await listLinks.call(this.#metadataStore);
       for (const link of links) {
-        this.sourceObjectLinks.set(link.id, link);
+        this.#sourceObjectLinks.set(link.id, link);
       }
     }
   }
 
-  private async persistSourceBinding(binding: SourceBinding): Promise<void> {
-    if (typeof this.metadataStore.saveSourceBinding === "function") {
-      await this.metadataStore.saveSourceBinding(binding);
+  async #persistSourceBinding(binding: SourceBinding): Promise<void> {
+    if (typeof this.#metadataStore.saveSourceBinding === "function") {
+      await this.#metadataStore.saveSourceBinding(binding);
     }
   }
 
-  private async persistSourceObjectLink(link: SourceObjectLink): Promise<void> {
-    this.sourceObjectLinks.set(link.id, link);
-    if (typeof this.metadataStore.saveSourceObjectLink === "function") {
-      await this.metadataStore.saveSourceObjectLink(link);
+  async #persistSourceObjectLink(link: SourceObjectLink): Promise<void> {
+    this.#sourceObjectLinks.set(link.id, link);
+    if (typeof this.#metadataStore.saveSourceObjectLink === "function") {
+      await this.#metadataStore.saveSourceObjectLink(link);
     }
   }
 
-  private makeSourceObjectLinkId(
+  #makeSourceObjectLinkId(
     sourceBindingId: string,
     objectType: SourceObjectType,
     objectId: string,
@@ -775,12 +931,12 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       .slice(0, 20)}`;
   }
 
-  private liveSourceObjectLinks(filter: {
+  #liveSourceObjectLinks(filter: {
     sourceBindingId?: string;
     objectType?: SourceObjectType;
     objectId?: string;
   }): SourceObjectLink[] {
-    return [...this.sourceObjectLinks.values()].filter((link) => {
+    return [...this.#sourceObjectLinks.values()].filter((link) => {
       if (link.unlinkedAt) {
         return false;
       }
@@ -798,18 +954,18 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   /** Backfill evidence↔binding links from URI/locator match (lazy, idempotent). */
-  private async ensureEvidenceLinksForBinding(binding: SourceBinding): Promise<void> {
-    const evidence = await this.metadataStore.listEvidence();
+  async #ensureEvidenceLinksForBinding(binding: SourceBinding): Promise<void> {
+    const evidence = await this.#metadataStore.listEvidence();
     const now = new Date().toISOString();
     for (const item of evidence) {
-      if (!this.evidenceMatchesBinding(item, binding)) {
+      if (!this.#evidenceMatchesBinding(item, binding)) {
         continue;
       }
-      const id = this.makeSourceObjectLinkId(binding.id, "evidence", item.id);
-      if (this.sourceObjectLinks.has(id)) {
+      const id = this.#makeSourceObjectLinkId(binding.id, "evidence", item.id);
+      if (this.#sourceObjectLinks.has(id)) {
         continue;
       }
-      await this.persistSourceObjectLink({
+      await this.#persistSourceObjectLink({
         id,
         sourceBindingId: binding.id,
         objectType: "evidence",
@@ -824,11 +980,11 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
    * Backfill atom↔binding links when atom provenance references evidence that
    * matches (or is already linked to) this binding.
    */
-  private async ensureAtomLinksForBinding(binding: SourceBinding): Promise<void> {
-    const atoms = await this.metadataStore.listAtoms();
+  async #ensureAtomLinksForBinding(binding: SourceBinding): Promise<void> {
+    const atoms = await this.#metadataStore.listAtoms();
     const now = new Date().toISOString();
     const linkedEvidenceIds = new Set(
-      this.liveSourceObjectLinks({
+      this.#liveSourceObjectLinks({
         sourceBindingId: binding.id,
         objectType: "evidence",
       }).map((link) => link.objectId),
@@ -840,8 +996,8 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
           belongs = true;
           break;
         }
-        const evidence = await this.metadataStore.getEvidence(evidenceId);
-        if (evidence && this.evidenceMatchesBinding(evidence, binding)) {
+        const evidence = await this.#metadataStore.getEvidence(evidenceId);
+        if (evidence && this.#evidenceMatchesBinding(evidence, binding)) {
           belongs = true;
           break;
         }
@@ -849,11 +1005,11 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       if (!belongs) {
         continue;
       }
-      const id = this.makeSourceObjectLinkId(binding.id, "atom", atom.id);
-      if (this.sourceObjectLinks.has(id)) {
+      const id = this.#makeSourceObjectLinkId(binding.id, "atom", atom.id);
+      if (this.#sourceObjectLinks.has(id)) {
         continue;
       }
-      await this.persistSourceObjectLink({
+      await this.#persistSourceObjectLink({
         id,
         sourceBindingId: binding.id,
         objectType: "atom",
@@ -864,7 +1020,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     }
   }
 
-  private async evidenceRefsBelongToBinding(
+  async #evidenceRefsBelongToBinding(
     evidenceRefs: string[],
     binding: SourceBinding,
     linkedEvidenceIds: Set<string>,
@@ -873,25 +1029,25 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       if (linkedEvidenceIds.has(evidenceId)) {
         return true;
       }
-      const evidence = await this.metadataStore.getEvidence(evidenceId);
-      if (evidence && this.evidenceMatchesBinding(evidence, binding)) {
+      const evidence = await this.#metadataStore.getEvidence(evidenceId);
+      if (evidence && this.#evidenceMatchesBinding(evidence, binding)) {
         return true;
       }
     }
     return false;
   }
 
-  private async ensureDerivedObjectLink(
+  async #ensureDerivedObjectLink(
     sourceBindingId: string,
     objectType: "event" | "relation" | "entity" | "scenario" | "problem",
     objectId: string,
     now: string,
   ): Promise<void> {
-    const id = this.makeSourceObjectLinkId(sourceBindingId, objectType, objectId);
-    if (this.sourceObjectLinks.has(id)) {
+    const id = this.#makeSourceObjectLinkId(sourceBindingId, objectType, objectId);
+    if (this.#sourceObjectLinks.has(id)) {
       return;
     }
-    await this.persistSourceObjectLink({
+    await this.#persistSourceObjectLink({
       id,
       sourceBindingId,
       objectType,
@@ -902,7 +1058,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   /** Ensure sibling bindings that still own live evidence also get a derived link. */
-  private async backfillSiblingDerivedLinks(
+  async #backfillSiblingDerivedLinks(
     objectType: "event" | "relation" | "entity" | "scenario" | "problem",
     objectId: string,
     evidenceRefs: string[],
@@ -910,7 +1066,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   ): Promise<void> {
     const siblingBindingIds = new Set<string>();
     for (const evidenceId of evidenceRefs) {
-      for (const link of this.liveSourceObjectLinks({
+      for (const link of this.#liveSourceObjectLinks({
         objectType: "evidence",
         objectId: evidenceId,
       })) {
@@ -918,22 +1074,22 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       }
     }
     for (const siblingBindingId of siblingBindingIds) {
-      await this.ensureDerivedObjectLink(siblingBindingId, objectType, objectId, now);
+      await this.#ensureDerivedObjectLink(siblingBindingId, objectType, objectId, now);
     }
   }
 
   /** Backfill event↔binding links via evidence membership. */
-  private async ensureEventLinksForBinding(binding: SourceBinding): Promise<void> {
-    const events = await this.metadataStore.listEvents();
+  async #ensureEventLinksForBinding(binding: SourceBinding): Promise<void> {
+    const events = await this.#metadataStore.listEvents();
     const now = new Date().toISOString();
     const linkedEvidenceIds = new Set(
-      this.liveSourceObjectLinks({
+      this.#liveSourceObjectLinks({
         sourceBindingId: binding.id,
         objectType: "evidence",
       }).map((link) => link.objectId),
     );
     for (const event of events) {
-      const belongs = await this.evidenceRefsBelongToBinding(
+      const belongs = await this.#evidenceRefsBelongToBinding(
         event.evidenceRefs,
         binding,
         linkedEvidenceIds,
@@ -941,29 +1097,29 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       if (!belongs) {
         continue;
       }
-      await this.ensureDerivedObjectLink(binding.id, "event", event.id, now);
-      await this.backfillSiblingDerivedLinks("event", event.id, event.evidenceRefs, now);
+      await this.#ensureDerivedObjectLink(binding.id, "event", event.id, now);
+      await this.#backfillSiblingDerivedLinks("event", event.id, event.evidenceRefs, now);
     }
   }
 
   /** Backfill relation↔binding links via evidence / linked atom endpoints. */
-  private async ensureRelationLinksForBinding(binding: SourceBinding): Promise<void> {
-    const relations = await this.metadataStore.listRelations();
+  async #ensureRelationLinksForBinding(binding: SourceBinding): Promise<void> {
+    const relations = await this.#metadataStore.listRelations();
     const now = new Date().toISOString();
     const linkedEvidenceIds = new Set(
-      this.liveSourceObjectLinks({
+      this.#liveSourceObjectLinks({
         sourceBindingId: binding.id,
         objectType: "evidence",
       }).map((link) => link.objectId),
     );
     const linkedAtomIds = new Set(
-      this.liveSourceObjectLinks({
+      this.#liveSourceObjectLinks({
         sourceBindingId: binding.id,
         objectType: "atom",
       }).map((link) => link.objectId),
     );
     for (const relation of relations) {
-      const viaEvidence = await this.evidenceRefsBelongToBinding(
+      const viaEvidence = await this.#evidenceRefsBelongToBinding(
         relation.provenance.evidenceRefs,
         binding,
         linkedEvidenceIds,
@@ -974,8 +1130,8 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       if (!viaEvidence && !viaAtomEndpoint) {
         continue;
       }
-      await this.ensureDerivedObjectLink(binding.id, "relation", relation.id, now);
-      await this.backfillSiblingDerivedLinks(
+      await this.#ensureDerivedObjectLink(binding.id, "relation", relation.id, now);
+      await this.#backfillSiblingDerivedLinks(
         "relation",
         relation.id,
         relation.provenance.evidenceRefs,
@@ -985,25 +1141,25 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   /** Backfill entity/scenario/problem↔binding links via evidence membership. */
-  private async ensureProvenanceObjectLinksForBinding(
+  async #ensureProvenanceObjectLinksForBinding(
     binding: SourceBinding,
     objectType: "entity" | "scenario" | "problem",
   ): Promise<void> {
     const items =
       objectType === "entity"
-        ? await this.metadataStore.listEntities()
+        ? await this.#metadataStore.listEntities()
         : objectType === "scenario"
-          ? await this.metadataStore.listScenarios()
-          : await this.metadataStore.listProblems();
+          ? await this.#metadataStore.listScenarios()
+          : await this.#metadataStore.listProblems();
     const now = new Date().toISOString();
     const linkedEvidenceIds = new Set(
-      this.liveSourceObjectLinks({
+      this.#liveSourceObjectLinks({
         sourceBindingId: binding.id,
         objectType: "evidence",
       }).map((link) => link.objectId),
     );
     for (const item of items) {
-      const belongs = await this.evidenceRefsBelongToBinding(
+      const belongs = await this.#evidenceRefsBelongToBinding(
         item.provenance.evidenceRefs,
         binding,
         linkedEvidenceIds,
@@ -1011,8 +1167,8 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       if (!belongs) {
         continue;
       }
-      await this.ensureDerivedObjectLink(binding.id, objectType, item.id, now);
-      await this.backfillSiblingDerivedLinks(
+      await this.#ensureDerivedObjectLink(binding.id, objectType, item.id, now);
+      await this.#backfillSiblingDerivedLinks(
         objectType,
         item.id,
         item.provenance.evidenceRefs,
@@ -1021,43 +1177,43 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     }
   }
 
-  private async recomputeProvenanceObjectAfterSourceChange(
+  async #recomputeProvenanceObjectAfterSourceChange(
     objectType: "entity" | "scenario" | "problem",
     objectId: string,
     mode: "forget" | "purge",
   ): Promise<void> {
     const item =
       objectType === "entity"
-        ? await this.metadataStore.getEntity(objectId)
+        ? await this.#metadataStore.getEntity(objectId)
         : objectType === "scenario"
-          ? await this.metadataStore.getScenario(objectId)
-          : await this.metadataStore.getProblem(objectId);
+          ? await this.#metadataStore.getScenario(objectId)
+          : await this.#metadataStore.getProblem(objectId);
     if (!item) {
       return;
     }
     const keptEvidenceRefs: string[] = [];
     for (const evidenceId of item.provenance.evidenceRefs) {
-      if (this.liveSourceObjectLinks({ objectType: "evidence", objectId: evidenceId }).length > 0) {
+      if (this.#liveSourceObjectLinks({ objectType: "evidence", objectId: evidenceId }).length > 0) {
         keptEvidenceRefs.push(evidenceId);
       }
     }
-    const liveObjectLinks = this.liveSourceObjectLinks({ objectType, objectId });
+    const liveObjectLinks = this.#liveSourceObjectLinks({ objectType, objectId });
     if (keptEvidenceRefs.length === 0 && liveObjectLinks.length === 0) {
       if (mode === "purge") {
-        if (objectType === "entity" && typeof this.metadataStore.deleteEntity === "function") {
-          await this.metadataStore.deleteEntity(objectId);
+        if (objectType === "entity" && typeof this.#metadataStore.deleteEntity === "function") {
+          await this.#metadataStore.deleteEntity(objectId);
         } else if (
           objectType === "scenario" &&
-          typeof this.metadataStore.deleteScenario === "function"
+          typeof this.#metadataStore.deleteScenario === "function"
         ) {
-          await this.metadataStore.deleteScenario(objectId);
+          await this.#metadataStore.deleteScenario(objectId);
         } else if (
           objectType === "problem" &&
-          typeof this.metadataStore.deleteProblem === "function"
+          typeof this.#metadataStore.deleteProblem === "function"
         ) {
-          await this.metadataStore.deleteProblem(objectId);
+          await this.#metadataStore.deleteProblem(objectId);
         }
-        await this.removeObjectLinkRows(objectType, objectId);
+        await this.#removeObjectLinkRows(objectType, objectId);
         return;
       }
       const cleared = {
@@ -1065,18 +1221,18 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         provenance: { evidenceRefs: [] as string[], sourceEventIds: [] as string[] },
       };
       if (objectType === "entity") {
-        await this.metadataStore.saveEntity(cleared as EntityRecord);
+        await this.#metadataStore.saveEntity(cleared as EntityRecord);
       } else if (objectType === "scenario") {
-        await this.metadataStore.saveScenario(cleared as ScenarioRecord);
+        await this.#metadataStore.saveScenario(cleared as ScenarioRecord);
       } else {
-        await this.metadataStore.saveProblem(cleared as ProblemRecord);
+        await this.#metadataStore.saveProblem(cleared as ProblemRecord);
       }
       return;
     }
 
     const keptEventIds: string[] = [];
     for (const eventId of item.provenance.sourceEventIds) {
-      if (this.liveSourceObjectLinks({ objectType: "event", objectId: eventId }).length > 0) {
+      if (this.#liveSourceObjectLinks({ objectType: "event", objectId: eventId }).length > 0) {
         keptEventIds.push(eventId);
       }
     }
@@ -1085,25 +1241,25 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       provenance: { evidenceRefs: keptEvidenceRefs, sourceEventIds: keptEventIds },
     };
     if (objectType === "entity") {
-      await this.metadataStore.saveEntity(next as EntityRecord);
+      await this.#metadataStore.saveEntity(next as EntityRecord);
     } else if (objectType === "scenario") {
-      await this.metadataStore.saveScenario(next as ScenarioRecord);
+      await this.#metadataStore.saveScenario(next as ScenarioRecord);
     } else {
-      await this.metadataStore.saveProblem(next as ProblemRecord);
+      await this.#metadataStore.saveProblem(next as ProblemRecord);
     }
   }
 
-  private async recomputeRelationAfterSourceChange(
+  async #recomputeRelationAfterSourceChange(
     relationId: string,
     mode: "forget" | "purge",
   ): Promise<void> {
-    const relation = await this.metadataStore.getRelation(relationId);
+    const relation = await this.#metadataStore.getRelation(relationId);
     if (!relation) {
       return;
     }
     const keptEvidenceRefs: string[] = [];
     for (const evidenceId of relation.provenance.evidenceRefs) {
-      const evidenceLive = this.liveSourceObjectLinks({
+      const evidenceLive = this.#liveSourceObjectLinks({
         objectType: "evidence",
         objectId: evidenceId,
       });
@@ -1111,26 +1267,26 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         keptEvidenceRefs.push(evidenceId);
       }
     }
-    const liveRelationLinks = this.liveSourceObjectLinks({
+    const liveRelationLinks = this.#liveSourceObjectLinks({
       objectType: "relation",
       objectId: relationId,
     });
     const endpointStillLive =
       (relation.fromNodeType === "MemoryAtom" &&
-        this.liveSourceObjectLinks({ objectType: "atom", objectId: relation.fromId }).length > 0) ||
+        this.#liveSourceObjectLinks({ objectType: "atom", objectId: relation.fromId }).length > 0) ||
       (relation.toNodeType === "MemoryAtom" &&
-        this.liveSourceObjectLinks({ objectType: "atom", objectId: relation.toId }).length > 0);
+        this.#liveSourceObjectLinks({ objectType: "atom", objectId: relation.toId }).length > 0);
 
     if (keptEvidenceRefs.length === 0 && liveRelationLinks.length === 0 && !endpointStillLive) {
       if (mode === "purge") {
-        if (typeof this.metadataStore.deleteRelation === "function") {
-          await this.metadataStore.deleteRelation(relationId);
+        if (typeof this.#metadataStore.deleteRelation === "function") {
+          await this.#metadataStore.deleteRelation(relationId);
         }
-        await this.removeObjectLinkRows("relation", relationId);
+        await this.#removeObjectLinkRows("relation", relationId);
         return;
       }
       if (relation.status !== "deprecated") {
-        await this.metadataStore.saveRelation({
+        await this.#metadataStore.saveRelation({
           ...relation,
           status: "deprecated",
           provenance: {
@@ -1144,7 +1300,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
 
     const keptEventIds: string[] = [];
     for (const eventId of relation.provenance.sourceEventIds) {
-      const eventLive = this.liveSourceObjectLinks({
+      const eventLive = this.#liveSourceObjectLinks({
         objectType: "event",
         objectId: eventId,
       });
@@ -1152,7 +1308,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         keptEventIds.push(eventId);
       }
     }
-    await this.metadataStore.saveRelation({
+    await this.#metadataStore.saveRelation({
       ...relation,
       status: relation.status === "deprecated" ? "active" : relation.status,
       provenance: {
@@ -1162,106 +1318,106 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     });
   }
 
-  private async objectStillSupportedByLiveEvidence(evidenceRefs: string[]): Promise<boolean> {
+  async #objectStillSupportedByLiveEvidence(evidenceRefs: string[]): Promise<boolean> {
     for (const evidenceId of evidenceRefs) {
-      if (this.liveSourceObjectLinks({ objectType: "evidence", objectId: evidenceId }).length > 0) {
+      if (this.#liveSourceObjectLinks({ objectType: "evidence", objectId: evidenceId }).length > 0) {
         return true;
       }
     }
     return false;
   }
 
-  private async purgeOrphanObjectsForBinding(
+  async #purgeOrphanObjectsForBinding(
     bindingId: string,
     objectType: "evidence" | "event" | "relation" | "entity" | "scenario" | "problem",
   ): Promise<void> {
     const objectIds = [
       ...new Set(
-        [...this.sourceObjectLinks.values()]
+        [...this.#sourceObjectLinks.values()]
           .filter((link) => link.sourceBindingId === bindingId && link.objectType === objectType)
           .map((link) => link.objectId),
       ),
     ];
     for (const objectId of objectIds) {
-      const remaining = this.liveSourceObjectLinks({ objectType, objectId });
+      const remaining = this.#liveSourceObjectLinks({ objectType, objectId });
       if (remaining.length > 0) {
         continue;
       }
       // Derived objects may lack sibling link rows; keep them while supporting evidence is live.
       if (objectType === "event") {
-        const event = await this.metadataStore.getEvent(objectId);
-        if (event && (await this.objectStillSupportedByLiveEvidence(event.evidenceRefs))) {
+        const event = await this.#metadataStore.getEvent(objectId);
+        if (event && (await this.#objectStillSupportedByLiveEvidence(event.evidenceRefs))) {
           continue;
         }
       } else if (objectType === "relation") {
-        const relation = await this.metadataStore.getRelation(objectId);
+        const relation = await this.#metadataStore.getRelation(objectId);
         if (
           relation &&
-          (await this.objectStillSupportedByLiveEvidence(relation.provenance.evidenceRefs))
+          (await this.#objectStillSupportedByLiveEvidence(relation.provenance.evidenceRefs))
         ) {
           continue;
         }
       } else if (objectType === "entity") {
-        const entity = await this.metadataStore.getEntity(objectId);
+        const entity = await this.#metadataStore.getEntity(objectId);
         if (
           entity &&
-          (await this.objectStillSupportedByLiveEvidence(entity.provenance.evidenceRefs))
+          (await this.#objectStillSupportedByLiveEvidence(entity.provenance.evidenceRefs))
         ) {
           continue;
         }
       } else if (objectType === "scenario") {
-        const scenario = await this.metadataStore.getScenario(objectId);
+        const scenario = await this.#metadataStore.getScenario(objectId);
         if (
           scenario &&
-          (await this.objectStillSupportedByLiveEvidence(scenario.provenance.evidenceRefs))
+          (await this.#objectStillSupportedByLiveEvidence(scenario.provenance.evidenceRefs))
         ) {
           continue;
         }
       } else if (objectType === "problem") {
-        const problem = await this.metadataStore.getProblem(objectId);
+        const problem = await this.#metadataStore.getProblem(objectId);
         if (
           problem &&
-          (await this.objectStillSupportedByLiveEvidence(problem.provenance.evidenceRefs))
+          (await this.#objectStillSupportedByLiveEvidence(problem.provenance.evidenceRefs))
         ) {
           continue;
         }
       }
-      if (objectType === "evidence" && typeof this.metadataStore.deleteEvidence === "function") {
-        await this.metadataStore.deleteEvidence(objectId);
-      } else if (objectType === "event" && typeof this.metadataStore.deleteEvent === "function") {
-        await this.metadataStore.deleteEvent(objectId);
+      if (objectType === "evidence" && typeof this.#metadataStore.deleteEvidence === "function") {
+        await this.#metadataStore.deleteEvidence(objectId);
+      } else if (objectType === "event" && typeof this.#metadataStore.deleteEvent === "function") {
+        await this.#metadataStore.deleteEvent(objectId);
       } else if (
         objectType === "relation" &&
-        typeof this.metadataStore.deleteRelation === "function"
+        typeof this.#metadataStore.deleteRelation === "function"
       ) {
-        await this.metadataStore.deleteRelation(objectId);
-      } else if (objectType === "entity" && typeof this.metadataStore.deleteEntity === "function") {
-        await this.metadataStore.deleteEntity(objectId);
+        await this.#metadataStore.deleteRelation(objectId);
+      } else if (objectType === "entity" && typeof this.#metadataStore.deleteEntity === "function") {
+        await this.#metadataStore.deleteEntity(objectId);
       } else if (
         objectType === "scenario" &&
-        typeof this.metadataStore.deleteScenario === "function"
+        typeof this.#metadataStore.deleteScenario === "function"
       ) {
-        await this.metadataStore.deleteScenario(objectId);
+        await this.#metadataStore.deleteScenario(objectId);
       } else if (
         objectType === "problem" &&
-        typeof this.metadataStore.deleteProblem === "function"
+        typeof this.#metadataStore.deleteProblem === "function"
       ) {
-        await this.metadataStore.deleteProblem(objectId);
+        await this.#metadataStore.deleteProblem(objectId);
       }
-      await this.removeObjectLinkRows(objectType, objectId);
+      await this.#removeObjectLinkRows(objectType, objectId);
     }
   }
 
-  private async removeObjectLinkRows(
+  async #removeObjectLinkRows(
     objectType: SourceObjectType,
     objectId: string,
   ): Promise<void> {
-    for (const stale of [...this.sourceObjectLinks.values()].filter(
+    for (const stale of [...this.#sourceObjectLinks.values()].filter(
       (link) => link.objectType === objectType && link.objectId === objectId,
     )) {
-      this.sourceObjectLinks.delete(stale.id);
-      if (typeof this.metadataStore.deleteSourceObjectLink === "function") {
-        await this.metadataStore.deleteSourceObjectLink(stale.id);
+      this.#sourceObjectLinks.delete(stale.id);
+      if (typeof this.#metadataStore.deleteSourceObjectLink === "function") {
+        await this.#metadataStore.deleteSourceObjectLink(stale.id);
       }
     }
   }
@@ -1273,18 +1429,18 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
    * Membership is evidence-centric so a missing atom-link on a still-live
    * sibling source cannot incorrectly tombstone a multi-source atom.
    */
-  private async recomputeAtomAfterSourceChange(
+  async #recomputeAtomAfterSourceChange(
     atomId: string,
     mode: "forget" | "purge",
   ): Promise<void> {
-    const atom = await this.metadataStore.getAtom(atomId);
+    const atom = await this.#metadataStore.getAtom(atomId);
     if (!atom) {
       return;
     }
     const originalEvidenceCount = atom.provenance.evidenceRefs.length;
     const keptEvidenceRefs: string[] = [];
     for (const evidenceId of atom.provenance.evidenceRefs) {
-      const evidenceLive = this.liveSourceObjectLinks({
+      const evidenceLive = this.#liveSourceObjectLinks({
         objectType: "evidence",
         objectId: evidenceId,
       });
@@ -1292,18 +1448,18 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         keptEvidenceRefs.push(evidenceId);
       }
     }
-    const liveAtomLinks = this.liveSourceObjectLinks({
+    const liveAtomLinks = this.#liveSourceObjectLinks({
       objectType: "atom",
       objectId: atomId,
     });
     if (keptEvidenceRefs.length === 0 && liveAtomLinks.length === 0) {
       if (mode === "purge") {
-        await this.metadataStore.deleteAtom(atomId);
-        await this.removeObjectLinkRows("atom", atomId);
+        await this.#metadataStore.deleteAtom(atomId);
+        await this.#removeObjectLinkRows("atom", atomId);
         return;
       }
       if (atom.state.status !== "deprecated") {
-        await this.metadataStore.saveAtom({
+        await this.#metadataStore.saveAtom({
           ...atom,
           provenance: { evidenceRefs: [], sourceEventIds: [] },
           state: { ...atom.state, status: "deprecated" },
@@ -1318,7 +1474,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
 
     const keptEventIds: string[] = [];
     for (const eventId of atom.provenance.sourceEventIds) {
-      const eventLive = this.liveSourceObjectLinks({
+      const eventLive = this.#liveSourceObjectLinks({
         objectType: "event",
         objectId: eventId,
       });
@@ -1326,7 +1482,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         keptEventIds.push(eventId);
         continue;
       }
-      const event = await this.metadataStore.getEvent(eventId);
+      const event = await this.#metadataStore.getEvent(eventId);
       if (event && event.evidenceRefs.some((evidenceId) => keptEvidenceRefs.includes(evidenceId))) {
         keptEventIds.push(eventId);
       }
@@ -1337,7 +1493,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       0,
       Math.min(atom.metrics.confidence, atom.metrics.confidence * ratio),
     );
-    await this.metadataStore.saveAtom({
+    await this.#metadataStore.saveAtom({
       ...atom,
       provenance: {
         evidenceRefs: keptEvidenceRefs,
@@ -1359,61 +1515,67 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     });
   }
 
-  private async persistSourceLifecycleReceipt(
+  async #persistSourceLifecycleReceipt(
     receipt: SourceLifecycleReceipt,
     reasonCode?: string,
   ): Promise<void> {
-    this.sourceLifecycleReceipts.set(receipt.operationId, receipt);
-    if (typeof this.metadataStore.putSourceLifecycleReceipt === "function") {
-      await this.metadataStore.putSourceLifecycleReceipt({
+    this.#sourceLifecycleReceipts.set(receipt.operationId, receipt);
+    if (typeof this.#metadataStore.putSourceLifecycleReceipt === "function") {
+      await this.#metadataStore.putSourceLifecycleReceipt({
         ...receipt,
         ...(reasonCode ? { reasonCode } : {}),
       });
     }
   }
 
-  private async loadSourceLifecycleReceipt(
+  async #loadSourceLifecycleReceipt(
     operationId: string,
   ): Promise<SourceLifecycleReceipt | undefined> {
-    const cached = this.sourceLifecycleReceipts.get(operationId);
+    const cached = this.#sourceLifecycleReceipts.get(operationId);
     if (cached) {
       return cached;
     }
-    if (typeof this.metadataStore.getSourceLifecycleReceipt !== "function") {
+    if (typeof this.#metadataStore.getSourceLifecycleReceipt !== "function") {
       return undefined;
     }
-    const persisted = await this.metadataStore.getSourceLifecycleReceipt(operationId);
+    const persisted = await this.#metadataStore.getSourceLifecycleReceipt(operationId);
     if (persisted) {
       const { reasonCode: _reasonCode, ...receipt } = persisted;
-      this.sourceLifecycleReceipts.set(operationId, receipt);
+      this.#sourceLifecycleReceipts.set(operationId, receipt);
       return receipt;
     }
     return undefined;
   }
 
-  private async runMetadataTransaction<T>(runner: () => Promise<T>): Promise<T> {
-    if (this.metadataStore.withTransaction) {
-      return this.metadataStore.withTransaction(runner);
+  async #runMetadataTransaction<T>(runner: () => Promise<T>): Promise<T> {
+    if (this.#metadataStore.withTransaction) {
+      return this.#metadataStore.withTransaction(runner);
     }
     return runner();
   }
 
   async frameTask(
     rawInput: string | Record<string, unknown>,
-    options?: { scope?: ScopeInput; hints?: Record<string, string | string[]>; forceLlm?: boolean },
+    options?: { scope?: ScopeInput; hints?: Record<string, string | string[]>; forceLlm?: boolean; authorization?: { bearerToken?: string } },
   ): Promise<TaskFrame> {
-    await this.ensureSourceLifecycleHydrated();
     const scope = resolveScope(options?.scope, this.config);
+    await this.#assertEngineAuthorized({
+      method: "frameTask",
+      mode: "manage",
+      authorization: options?.authorization,
+      declaredScope: scope,
+    });
+    await this.#ensureSourceLifecycleHydrated();
     const cacheKey = buildTaskFrameCacheKey(rawInput, scope, options?.hints);
     const forceLlm = options?.forceLlm === true;
     if (!forceLlm) {
-      const cached = this.taskFrameCache.get(cacheKey);
+      const cached = this.#taskFrameCache.get(cacheKey);
       if (cached) {
         return appendTaskFrameHint(cloneTaskFrame(cached), "cache_hit");
       }
     }
 
-    const ruleFraming = await this.taskFramingStrategy.frame({
+    const ruleFraming = await this.#taskFramingStrategy.frame({
       rawInput,
       config: this.config,
       scope,
@@ -1425,12 +1587,12 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     if (ruleFraming.source === "llm") {
       const llmHint = forceLlm ? "llm_fallback_forced" : "llm_fallback";
       const result = appendTaskFrameHint(ruleTaskFrame, llmHint);
-      this.taskFrameCache.set(cacheKey, cloneTaskFrame(result));
+      this.#taskFrameCache.set(cacheKey, cloneTaskFrame(result));
       return result;
     }
     if (!forceLlm && ruleConfidence >= 0.5) {
       const result = appendTaskFrameHint(ruleTaskFrame, "rule_based");
-      this.taskFrameCache.set(cacheKey, cloneTaskFrame(result));
+      this.#taskFrameCache.set(cacheKey, cloneTaskFrame(result));
       return result;
     }
 
@@ -1441,7 +1603,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
           ? "llm_fallback_forced"
           : "llm_fallback";
     const fallbackTaskFrame = appendTaskFrameHint(ruleTaskFrame, fallbackHint);
-    this.taskFrameCache.set(cacheKey, cloneTaskFrame(fallbackTaskFrame));
+    this.#taskFrameCache.set(cacheKey, cloneTaskFrame(fallbackTaskFrame));
     return fallbackTaskFrame;
   }
 
@@ -1454,21 +1616,27 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   async reason(taskFrame: TaskFrame, options?: ReasonOptions): Promise<CognitivePackage> {
-    const [pkg] = await this.reasonWithDebug(taskFrame, { maxPaths: options?.maxPaths });
+    const [pkg] = await this.reasonWithDebug(taskFrame, options);
     return pkg;
   }
 
   async reasonWithDebug(
     taskFrame: TaskFrame,
-    options?: Pick<ReasonOptions, "maxPaths">,
+    options?: Pick<ReasonOptions, "maxPaths" | "authorization">,
   ): Promise<[CognitivePackage, ReasonDebugPayload]> {
     const normalizedTaskFrame = normalizeTaskFrame(taskFrame);
+    await this.#assertEngineAuthorized({
+      method: "reasonWithDebug",
+      mode: "read",
+      authorization: options?.authorization,
+      declaredScope: normalizedTaskFrame.scope,
+    });
     const sessionId = createId("rsn");
-    const template = this.templateRegistry.select(normalizedTaskFrame.taskType);
+    const template = this.#templateRegistry.select(normalizedTaskFrame.taskType);
     const selectedTemplate = template.id;
 
     const allScopedAtoms = selectLatestAtoms(
-      (await this.metadataStore.listAtoms())
+      (await this.#metadataStore.listAtoms())
         .filter((atom) => matchesScope(atom.scope, normalizedTaskFrame.scope))
         .filter((atom) => atom.state.status !== "deprecated"),
     );
@@ -1488,7 +1656,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       .sort((a, b) => b.score - a.score);
 
     const atomsById = new Map(allScopedAtoms.map((atom) => [atom.id, atom]));
-    const relations = (await this.metadataStore.listRelations())
+    const relations = (await this.#metadataStore.listRelations())
       .filter((relation) => matchesScope(relation.scope, normalizedTaskFrame.scope))
       .filter((relation) => relation.status === "active");
     const relationById = new Map(relations.map((relation) => [relation.id, relation]));
@@ -1610,9 +1778,9 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       evidenceRefs: pkg.evidenceRefs,
     };
 
-    this.packages.set(pkg.packageId, pkg);
-    this.packageTraces.set(pkg.packageId, trace);
-    this.reasoningSessions.set(sessionId, {
+    this.#packages.set(pkg.packageId, pkg);
+    this.#packageTraces.set(pkg.packageId, trace);
+    this.#reasoningSessions.set(sessionId, {
       sessionId,
       taskFrame: normalizedTaskFrame,
       package: pkg,
@@ -1627,18 +1795,30 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
 
   async ingest(input: IngestInput): Promise<IngestResult> {
     const resolvedScope = resolveScope(input.scope, this.config);
+    await this.#assertEngineAuthorized({
+      method: "ingest",
+      mode: "manage",
+      authorization: input.authorization,
+      declaredScope: resolvedScope,
+    });
     const ingestionId = createId("ing");
     const result: IngestResult = {
       ingestionId,
       ingestionChecksum: computeIngestionChecksum(input.rawInput, input.metadata),
       status: "RECEIVED",
     };
-    await this.metadataStore.saveIngestion(result);
+    await this.#metadataStore.saveIngestion(result);
     return result;
   }
 
   async distill(input: IngestInput & { forceRebuild?: boolean }): Promise<DistillationResult> {
-    return this.distillationStrategy.distill({
+    await this.#assertEngineAuthorized({
+      method: "distill",
+      mode: "manage",
+      authorization: input.authorization,
+      declaredScope: resolveScope(input.scope, this.config),
+    });
+    return this.#distillationStrategy.distill({
       rawInput: input.rawInput,
       config: this.config,
       scope: input.scope,
@@ -1653,9 +1833,15 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   async writeBack(
     input: IngestInput & { package?: CognitivePackage | null },
   ): Promise<WriteBackResult> {
-    const writeOperationKey = await this.resolveWriteOperationKey(input);
-    if (writeOperationKey && typeof this.metadataStore.getWriteOperation === "function") {
-      const existing = await this.metadataStore.getWriteOperation(writeOperationKey);
+    await this.#assertEngineAuthorized({
+      method: "writeBack",
+      mode: "manage",
+      authorization: input.authorization,
+      declaredScope: resolveScope(input.scope, this.config),
+    });
+    const writeOperationKey = await this.#resolveWriteOperationKey(input);
+    if (writeOperationKey && typeof this.#metadataStore.getWriteOperation === "function") {
+      const existing = await this.#metadataStore.getWriteOperation(writeOperationKey);
       if (existing?.result) {
         return existing.result;
       }
@@ -1688,15 +1874,15 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       retryCount: 0,
       updatedAt: new Date().toISOString(),
     };
-    await this.metadataStore.putJournal(journal);
+    await this.#metadataStore.putJournal(journal);
 
     try {
-      const canonicalCommit = await this.runMetadataTransaction(async () => {
-        const existingEvent = await this.metadataStore.findEventByKey(distillation.keys.eventKey);
+      const canonicalCommit = await this.#runMetadataTransaction(async () => {
+        const existingEvent = await this.#metadataStore.findEventByKey(distillation.keys.eventKey);
         const withCanonicalEvent = canonicalizeDistillation(distillation, {
           eventId: existingEvent?.id ?? distillation.event.id,
         });
-        const atomDecisions = await this.upsertAtoms(withCanonicalEvent.atoms);
+        const atomDecisions = await this.upsertAtoms(withCanonicalEvent.atoms, { authorization: input.authorization });
         const atomIdMap = new Map(
           atomDecisions.map((decision) => [
             decision.atomId,
@@ -1705,28 +1891,28 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         );
         const canonicalDistillation = canonicalizeDistillation(withCanonicalEvent, { atomIdMap });
         assertCanonicalScopeHierarchy(canonicalDistillation);
-        const upsertedEvent = await this.upsertEvent(canonicalDistillation.event);
+        const upsertedEvent = await this.upsertEvent(canonicalDistillation.event, { authorization: input.authorization });
 
         for (const entity of canonicalDistillation.entities) {
-          await this.metadataStore.saveEntity(entity);
+          await this.#metadataStore.saveEntity(entity);
         }
         for (const scenario of canonicalDistillation.scenarios) {
-          await this.metadataStore.saveScenario(scenario);
+          await this.#metadataStore.saveScenario(scenario);
         }
         for (const problem of canonicalDistillation.problems) {
-          await this.metadataStore.saveProblem(problem);
+          await this.#metadataStore.saveProblem(problem);
         }
         for (const evidenceRecord of canonicalDistillation.evidence) {
-          await this.metadataStore.saveEvidence(evidenceRecord);
+          await this.#metadataStore.saveEvidence(evidenceRecord);
         }
         for (const relation of canonicalDistillation.relations) {
-          await this.metadataStore.saveRelation(relation);
+          await this.#metadataStore.saveRelation(relation);
         }
 
         const committedAtomIds = atomDecisions.map(
           (decision) => decision.targetAtomId ?? decision.atomId,
         );
-        await this.metadataStore.updateJournal(journalId, {
+        await this.#metadataStore.updateJournal(journalId, {
           status: "METADATA_COMMITTED",
           phase: "METADATA_COMMITTED",
           objectIds: {
@@ -1750,14 +1936,14 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       });
 
       try {
-        await this.graphStore.syncFromDistillation(canonicalCommit.canonicalDistillation);
-        await this.metadataStore.updateJournal(journalId, {
+        await this.#graphStore.syncFromDistillation(canonicalCommit.canonicalDistillation);
+        await this.#metadataStore.updateJournal(journalId, {
           phase: "GRAPH_SYNCED",
           updatedAt: new Date().toISOString(),
         });
 
-        await this.vectorStore.syncFromDistillation(canonicalCommit.canonicalDistillation);
-        await this.metadataStore.updateJournal(journalId, {
+        await this.#vectorStore.syncFromDistillation(canonicalCommit.canonicalDistillation);
+        await this.#metadataStore.updateJournal(journalId, {
           status: "COMPLETED",
           phase: "COMPLETED",
           updatedAt: new Date().toISOString(),
@@ -1771,10 +1957,10 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
           derivedStatus: "SYNCED",
           status: "COMPLETED",
         };
-        await this.persistWriteOperation(writeOperationKey, completed);
+        await this.#persistWriteOperation(writeOperationKey, completed);
         return completed;
       } catch (error) {
-        await this.metadataStore.updateJournal(journalId, {
+        await this.#metadataStore.updateJournal(journalId, {
           status: "DERIVED_OUT_OF_SYNC",
           lastError: error instanceof Error ? error.message : String(error),
           updatedAt: new Date().toISOString(),
@@ -1789,7 +1975,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         };
       }
     } catch (error) {
-      await this.metadataStore.updateJournal(journalId, {
+      await this.#metadataStore.updateJournal(journalId, {
         status: "FAILED",
         lastError: error instanceof Error ? error.message : String(error),
         updatedAt: new Date().toISOString(),
@@ -1805,11 +1991,11 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     }
   }
 
-  private async resolveWriteOperationKey(input: IngestInput): Promise<string | null> {
-    if (typeof this.metadataStore.ensureDataPlaneId !== "function") {
+  async #resolveWriteOperationKey(input: IngestInput): Promise<string | null> {
+    if (typeof this.#metadataStore.ensureDataPlaneId !== "function") {
       return null;
     }
-    const dataPlaneId = await this.metadataStore.ensureDataPlaneId();
+    const dataPlaneId = await this.#metadataStore.ensureDataPlaneId();
     const partition = createMemoryPartitionKeyV1(dataPlaneId, input.scope);
     return computeWriteOperationKey({
       partition,
@@ -1819,14 +2005,14 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     });
   }
 
-  private async persistWriteOperation(
+  async #persistWriteOperation(
     writeOperationKey: string | null,
     result: WriteBackResult,
   ): Promise<void> {
-    if (!writeOperationKey || typeof this.metadataStore.putWriteOperation !== "function") {
+    if (!writeOperationKey || typeof this.#metadataStore.putWriteOperation !== "function") {
       return;
     }
-    await this.metadataStore.putWriteOperation({
+    await this.#metadataStore.putWriteOperation({
       writeOperationKey,
       kind: "WRITE",
       result,
@@ -1852,7 +2038,13 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return computeIngestionChecksum(rawInput, metadata);
   }
 
-  async upsertEvent(event: EventSkeleton): Promise<EventSkeleton> {
+  async upsertEvent(event: EventSkeleton, options?: EngineCallOptions): Promise<EventSkeleton> {
+    await this.#assertEngineAuthorized({
+      method: "upsertEvent",
+      mode: "manage",
+      authorization: options?.authorization,
+      declaredScope: event.scope,
+    });
     const eventKey =
       event.eventKey ??
       computeEventKey({
@@ -1863,24 +2055,39 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         sourceTurnRange: event.provenance.sourceTurnRange,
         metadata: {},
       });
-    const existingEvent = await this.metadataStore.findEventByKey(eventKey);
+    const existingEvent = await this.#metadataStore.findEventByKey(eventKey);
     if (existingEvent) {
-      return this.metadataStore.upsertEvent({ ...event, id: existingEvent.id, eventKey });
+      return this.#metadataStore.upsertEvent({ ...event, id: existingEvent.id, eventKey });
     }
-    return this.metadataStore.upsertEvent({ ...event, eventKey });
+    return this.#metadataStore.upsertEvent({ ...event, eventKey });
   }
 
-  async upsertAtoms(atoms: MemoryAtom[]): Promise<AtomUpsertDecision[]> {
+  async upsertAtoms(atoms: MemoryAtom[], options?: UpsertAtomsOptions): Promise<AtomUpsertDecision[]> {
+    if (atoms.length === 0) {
+      return [];
+    }
+    const firstScope = atoms[0]?.scope;
+    await this.#assertEngineAuthorized({
+      method: "upsertAtoms",
+      mode: "manage",
+      authorization: options?.authorization,
+      declaredScope: firstScope,
+    });
+    for (const atom of atoms) {
+      if (!isCompleteScope(atom.scope) || !firstScope || !matchesScope(atom.scope, firstScope)) {
+        throw new ScopeViolationError("upsertAtoms mixed-scope batch is not authorized");
+      }
+    }
     const decisions: AtomUpsertDecision[] = [];
 
     for (const incomingAtom of atoms.map((atom) => attachDedupKey(withAtomV2Defaults(atom)))) {
       const dedupKey = incomingAtom.dedupKey!;
-      const candidates = await this.metadataStore.findAtomsByDedupKey(dedupKey);
+      const candidates = await this.#metadataStore.findAtomsByDedupKey(dedupKey);
       const mergeTarget = candidates.find((existing) => isMergeCompatible(existing, incomingAtom));
 
       if (mergeTarget) {
         const merged = mergeAtoms(mergeTarget, incomingAtom);
-        await this.metadataStore.saveAtom(merged);
+        await this.#metadataStore.saveAtom(merged);
         decisions.push({
           atomId: incomingAtom.id,
           dedupKey,
@@ -1892,8 +2099,8 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       }
 
       const hasCandidates = candidates.length > 0;
-      await this.metadataStore.saveAtom(incomingAtom);
-      await this.metadataStore.bindDedupKey(dedupKey, incomingAtom.id);
+      await this.#metadataStore.saveAtom(incomingAtom);
+      await this.#metadataStore.bindDedupKey(dedupKey, incomingAtom.id);
 
       decisions.push({
         atomId: incomingAtom.id,
@@ -1907,8 +2114,14 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   async trace(atomId: string, options?: TraceOptions): Promise<MemoryTrace> {
+    await this.#assertEngineAuthorized({
+      method: "trace",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
     const requestedScope = resolveReadScopeOrThrow(options?.scope, this.config, "trace");
-    const atom = await this.metadataStore.getAtom(atomId);
+    const atom = await this.#metadataStore.getAtom(atomId);
     if (!atom) {
       return {
         atom: {
@@ -1936,8 +2149,14 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   async tracePackage(packageId: string, _options?: TraceOptions): Promise<TracePackageResult> {
+    await this.#assertEngineAuthorized({
+      method: "tracePackage",
+      mode: "read",
+      authorization: _options?.authorization,
+      resource: { kind: "package", id: packageId },
+    });
     const requestedScope = resolveReadScopeOrThrow(_options?.scope, this.config, "tracePackage");
-    const trace = this.packageTraces.get(packageId);
+    const trace = this.#packageTraces.get(packageId);
     if (!trace) {
       throw new Error(`Unknown package trace: ${packageId}`);
     }
@@ -1949,12 +2168,18 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     sessionId: string,
     options?: TraceOptions,
   ): Promise<TraceReasoningSessionResult> {
+    await this.#assertEngineAuthorized({
+      method: "traceReasoningSession",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "session", id: sessionId },
+    });
     const requestedScope = resolveReadScopeOrThrow(
       options?.scope,
       this.config,
       "traceReasoningSession",
     );
-    const trace = this.reasoningSessions.get(sessionId);
+    const trace = this.#reasoningSessions.get(sessionId);
     if (!trace) {
       throw new Error(`Unknown reasoning session: ${sessionId}`);
     }
@@ -1962,21 +2187,39 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return trace;
   }
 
-  async getProvenance(atomId: string) {
-    const atom = await this.metadataStore.getAtom(atomId);
+  async getProvenance(atomId: string, options?: EngineCallOptions) {
+    await this.#assertEngineAuthorized({
+      method: "getProvenance",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
+    const atom = await this.#metadataStore.getAtom(atomId);
     return atom?.provenance ?? { sourceEventIds: [], evidenceRefs: [] };
   }
 
-  async getConflicts(atomId: string): Promise<string[]> {
-    return (await this.metadataStore.getAtom(atomId))?.state.conflictsWith ?? [];
+  async getConflicts(atomId: string, options?: EngineCallOptions): Promise<string[]> {
+    await this.#assertEngineAuthorized({
+      method: "getConflicts",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
+    return (await this.#metadataStore.getAtom(atomId))?.state.conflictsWith ?? [];
   }
 
-  async getVersionHistory(atomId: string): Promise<MemoryAtom[]> {
-    const atom = await this.metadataStore.getAtom(atomId);
+  async getVersionHistory(atomId: string, options?: EngineCallOptions): Promise<MemoryAtom[]> {
+    await this.#assertEngineAuthorized({
+      method: "getVersionHistory",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
+    const atom = await this.#metadataStore.getAtom(atomId);
     if (!atom) {
       return [];
     }
-    return (await this.metadataStore.listAtoms()).filter(
+    return (await this.#metadataStore.listAtoms()).filter(
       (candidate) =>
         candidate.id === atom.id ||
         candidate.versioning.parentVersion === atom.id ||
@@ -1987,7 +2230,29 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   async resolveEvidence(options: ResolveEvidenceOptions) {
     const requestedScope = resolveReadScopeOrThrow(options.scope, this.config, "resolveEvidence");
     if (options.evidenceId) {
-      const item = await this.metadataStore.getEvidence(options.evidenceId);
+      await this.#assertEngineAuthorized({
+        method: "resolveEvidence",
+        mode: "read",
+        authorization: options.authorization,
+        resource: { kind: "evidence", id: options.evidenceId },
+      });
+    } else if (options.atomId) {
+      await this.#assertEngineAuthorized({
+        method: "resolveEvidence",
+        mode: "read",
+        authorization: options.authorization,
+        resource: { kind: "atom", id: options.atomId },
+      });
+    } else {
+      await this.#assertEngineAuthorized({
+        method: "resolveEvidence",
+        mode: "read",
+        authorization: options.authorization,
+        declaredScope: requestedScope,
+      });
+    }
+    if (options.evidenceId) {
+      const item = await this.#metadataStore.getEvidence(options.evidenceId);
       if (!item) {
         throw new Error(`Unknown evidence: ${options.evidenceId}`);
       }
@@ -1995,14 +2260,14 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       return item;
     }
     if (options.atomId) {
-      const atom = await this.metadataStore.getAtom(options.atomId);
+      const atom = await this.#metadataStore.getAtom(options.atomId);
       if (!atom) {
         throw new Error(`Unknown atom: ${options.atomId}`);
       }
       assertScopeAccess(atom.scope, requestedScope, "resolveEvidence");
       const evidence = await Promise.all(
         atom.provenance.evidenceRefs.map((evidenceId) =>
-          this.metadataStore.getEvidence(evidenceId),
+          this.#metadataStore.getEvidence(evidenceId),
         ),
       );
       return evidence
@@ -2015,9 +2280,15 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return [];
   }
 
-  async getEvidenceRefs(atomId: string, scope?: ScopeInput): Promise<string[]> {
+  async getEvidenceRefs(atomId: string, scope?: ScopeInput, options?: EngineCallOptions): Promise<string[]> {
+    await this.#assertEngineAuthorized({
+      method: "getEvidenceRefs",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
     const requestedScope = resolveReadScopeOrThrow(scope, this.config, "getEvidenceRefs");
-    const atom = await this.metadataStore.getAtom(atomId);
+    const atom = await this.#metadataStore.getAtom(atomId);
     if (!atom) {
       return [];
     }
@@ -2029,23 +2300,29 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     query: string,
     options?: SearchEvidenceOptions,
   ): Promise<EvidenceSearchResult[]> {
-    await this.ensureSourceLifecycleHydrated();
     const requestedScope = resolveReadScopeOrThrow(options?.scope, this.config, "searchEvidence");
+    await this.#assertEngineAuthorized({
+      method: "searchEvidence",
+      mode: "read",
+      authorization: options?.authorization,
+      declaredScope: requestedScope,
+    });
+    await this.#ensureSourceLifecycleHydrated();
     if (options?.caller) {
-      const auth = await this.authorizeQueryAccess(requestedScope, options.caller);
+      const auth = await this.#authorizeQueryAccess(requestedScope, options.caller);
       if (!auth.allowed) {
         return [];
       }
     }
     const threshold = options?.minScore ?? 0;
     const maxResults = options?.maxResults ?? 5;
-    const scoped = this.metadataStore.queryEvidence
-      ? await this.metadataStore.queryEvidence({ scope: requestedScope })
-      : (await this.metadataStore.listEvidence()).filter((evidence) =>
+    const scoped = this.#metadataStore.queryEvidence
+      ? await this.#metadataStore.queryEvidence({ scope: requestedScope })
+      : (await this.#metadataStore.listEvidence()).filter((evidence) =>
           matchesScope(evidence.scope, requestedScope),
         );
     return scoped
-      .filter((evidence) => this.isEvidenceRetrievable(evidence))
+      .filter((evidence) => this.#isEvidenceRetrievable(evidence))
       .map((evidence) => scoreEvidenceSearchResult({ evidence, query }))
       .filter((result): result is EvidenceSearchResult => Boolean(result))
       .filter((result) => result.score >= threshold)
@@ -2064,16 +2341,30 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
    * Fail-closed on authorize deny (empty list — no enumeration).
    */
   async queryAtoms(options: QueryAtomsOptions): Promise<AtomQueryHit[]> {
-    await this.ensureSourceLifecycleHydrated();
     const requestedScope = resolveReadScopeOrThrow(options.scope, this.config, "queryAtoms");
-    const auth = await this.authorizeQueryAccess(requestedScope, options.caller);
+    const direct = await this.#assertEngineAuthorized({
+      method: "queryAtoms",
+      mode: "read",
+      authorization: options.authorization,
+      declaredScope: requestedScope,
+    });
+    await this.#ensureSourceLifecycleHydrated();
+    if (!direct.unauthenticatedLocal) {
+      if (!sameMemorySubject(options.caller, direct.principal.subject) && options.caller.ownerId !== direct.principal.userId) {
+        throw new ScopeViolationError("queryAtoms caller does not match trusted principal subject");
+      }
+    }
+    const auth = await this.#authorizeQueryAccess(
+      requestedScope,
+      direct.unauthenticatedLocal ? options.caller : direct.principal.subject,
+    );
     if (!auth.allowed) {
       return [];
     }
-    if (!this.metadataStore.queryAtoms) {
+    if (!this.#metadataStore.queryAtoms) {
       throw new Error("metadataStore.queryAtoms is required for CW2-P4-01 retrieval");
     }
-    const rows = await this.metadataStore.queryAtoms({
+    const rows = await this.#metadataStore.queryAtoms({
       scope: requestedScope,
       atomTypes: options.filter?.atomTypes,
       limit: options.filter?.limit,
@@ -2124,13 +2415,13 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       .map((row) => row.atomId);
 
     let vector: Array<{ atomId: string; score: number }> | undefined;
-    if (options.enableVector !== false && typeof this.vectorStore.search === "function") {
+    if (options.enableVector !== false && typeof this.#vectorStore.search === "function") {
       const requestedScope = resolveReadScopeOrThrow(
         options.scope,
         this.config,
         "queryAtomsHybrid",
       );
-      const vectorHits = await this.vectorStore.search({
+      const vectorHits = await this.#vectorStore.search({
         query: options.query,
         scope: requestedScope,
         limit: options.maxResults ?? 20,
@@ -2147,11 +2438,11 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         this.config,
         "queryAtomsHybrid",
       );
-      const relations = this.metadataStore.listRelationsByNode
+      const relations = this.#metadataStore.listRelationsByNode
         ? (
             await Promise.all(
               seedIds.map((nodeId) =>
-                this.metadataStore.listRelationsByNode!({
+                this.#metadataStore.listRelationsByNode!({
                   nodeId,
                   scope: requestedScope,
                   status: "active",
@@ -2159,7 +2450,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
               ),
             )
           ).flat()
-        : (await this.metadataStore.listRelations()).filter(
+        : (await this.#metadataStore.listRelations()).filter(
             (relation) =>
               matchesScope(relation.scope, requestedScope) && relation.status === "active",
           );
@@ -2202,18 +2493,25 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     scope: ScopeInput;
     caller: MemorySubject;
     scopeType?: "personal" | "agent" | "seat";
+    authorization?: { bearerToken?: string };
   }): Promise<{ bindingId: string; created: boolean }> {
+    const scope = resolveReadScopeOrThrow(input.scope, this.config, "ensureMemorySubjectBinding");
+    const direct = await this.#assertEngineAuthorized({
+      method: "ensureMemorySubjectBinding",
+      mode: "manage",
+      authorization: input.authorization,
+      declaredScope: scope,
+    });
     if (
-      !this.metadataStore.ensureDataPlaneId ||
-      !this.metadataStore.saveMemorySubjectBinding ||
-      !this.metadataStore.listMemorySubjectBindings
+      !this.#metadataStore.ensureDataPlaneId ||
+      !this.#metadataStore.saveMemorySubjectBinding ||
+      !this.#metadataStore.listMemorySubjectBindings
     ) {
       throw new Error("metadataStore MemorySubjectBinding APIs required");
     }
-    const scope = resolveReadScopeOrThrow(input.scope, this.config, "ensureMemorySubjectBinding");
-    const dataPlaneId = await this.metadataStore.ensureDataPlaneId();
+    const dataPlaneId = await this.#metadataStore.ensureDataPlaneId();
     const partition = createMemoryPartitionKeyV1(dataPlaneId, scope);
-    const existing = await this.metadataStore.listMemorySubjectBindings({
+    const existing = await this.#metadataStore.listMemorySubjectBindings({
       scope,
       liveOnly: true,
     });
@@ -2227,20 +2525,20 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       subject: input.caller,
       scopeType: input.scopeType ?? "personal",
     });
-    await this.metadataStore.saveMemorySubjectBinding(binding);
+    await this.#metadataStore.saveMemorySubjectBinding(binding);
     return { bindingId: binding.id, created: true };
   }
 
-  private async authorizeQueryAccess(
+  async #authorizeQueryAccess(
     scope: Scope,
     caller: MemorySubject,
   ): Promise<AuthorizeMemoryAccessResult> {
-    if (!this.metadataStore.ensureDataPlaneId || !this.metadataStore.listMemorySubjectBindings) {
+    if (!this.#metadataStore.ensureDataPlaneId || !this.#metadataStore.listMemorySubjectBindings) {
       return { allowed: false, reason: "UNBOUND" };
     }
-    const dataPlaneId = await this.metadataStore.ensureDataPlaneId();
+    const dataPlaneId = await this.#metadataStore.ensureDataPlaneId();
     const partition = createMemoryPartitionKeyV1(dataPlaneId, scope);
-    const bindings = await this.metadataStore.listMemorySubjectBindings({
+    const bindings = await this.#metadataStore.listMemorySubjectBindings({
       scope,
       liveOnly: true,
     });
@@ -2250,11 +2548,18 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   async detectConflicts(params: {
     atomIds?: string[];
     scope?: Scope;
+    authorization?: { bearerToken?: string };
   }): Promise<Record<string, unknown>> {
+    await this.#assertEngineAuthorized({
+      method: "detectConflicts",
+      mode: "read",
+      authorization: params.authorization,
+      declaredScope: params.scope,
+    });
     const targetIds =
-      params.atomIds ?? (await this.metadataStore.listAtoms()).map((atom) => atom.id);
+      params.atomIds ?? (await this.#metadataStore.listAtoms()).map((atom) => atom.id);
     const conflicts = (
-      await Promise.all(targetIds.map((atomId) => this.metadataStore.getAtom(atomId)))
+      await Promise.all(targetIds.map((atomId) => this.#metadataStore.getAtom(atomId)))
     )
       .filter((atom): atom is MemoryAtom => Boolean(atom))
       .filter((atom) => (params.scope ? matchesScope(atom.scope, params.scope) : true))
@@ -2265,40 +2570,74 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   async recomputeConfidence(
     atomId: string,
     signal?: Record<string, string | number | boolean>,
+    options?: EngineCallOptions,
   ): Promise<number> {
-    const atom = await this.metadataStore.getAtom(atomId);
+    await this.#assertEngineAuthorized({
+      method: "recomputeConfidence",
+      mode: "manage",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
+    const atom = await this.#metadataStore.getAtom(atomId);
     if (!atom) {
       return 0;
     }
     const boost = typeof signal?.positiveEvidence === "number" ? signal.positiveEvidence : 0;
     atom.metrics.confidence = Math.min(1, Math.max(0, atom.metrics.confidence + boost));
-    await this.metadataStore.saveAtom(atom);
+    await this.#metadataStore.saveAtom(atom);
     return atom.metrics.confidence;
   }
 
-  async deprecateAtom(atomId: string, _reason: string): Promise<void> {
-    const atom = await this.metadataStore.getAtom(atomId);
+  async deprecateAtom(atomId: string, _reason: string, options?: EngineCallOptions): Promise<void> {
+    await this.#assertEngineAuthorized({
+      method: "deprecateAtom",
+      mode: "manage",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
+    const atom = await this.#metadataStore.getAtom(atomId);
     if (!atom) {
       return;
     }
     atom.state.status = "deprecated";
-    await this.metadataStore.saveAtom(atom);
+    await this.#metadataStore.saveAtom(atom);
   }
 
-  async supersedeAtom(oldAtomId: string, newAtomId: string): Promise<void> {
-    const oldAtom = await this.metadataStore.getAtom(oldAtomId);
-    const newAtom = await this.metadataStore.getAtom(newAtomId);
+  async supersedeAtom(oldAtomId: string, newAtomId: string, options?: EngineCallOptions): Promise<void> {
+    await this.#assertEngineAuthorized({
+      method: "supersedeAtom",
+      mode: "manage",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: oldAtomId },
+    });
+    await this.#assertEngineAuthorized({
+      method: "supersedeAtom",
+      mode: "manage",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: newAtomId },
+    });
+    const oldAtom = await this.#metadataStore.getAtom(oldAtomId);
+    const newAtom = await this.#metadataStore.getAtom(newAtomId);
     if (!oldAtom || !newAtom) {
       return;
     }
     newAtom.versioning.parentVersion = oldAtomId;
     oldAtom.state.status = "deprecated";
-    await this.metadataStore.saveAtom(oldAtom);
-    await this.metadataStore.saveAtom(newAtom);
+    await this.#metadataStore.saveAtom(oldAtom);
+    await this.#metadataStore.saveAtom(newAtom);
   }
 
-  async mergeAtoms(atomIds: string[], targetAtomId?: string): Promise<string> {
-    const target = await this.metadataStore.getAtom(targetAtomId ?? atomIds[0]);
+  async mergeAtoms(atomIds: string[], targetAtomId?: string, options?: EngineCallOptions): Promise<string> {
+    const mergeIds = [targetAtomId ?? atomIds[0], ...atomIds].filter((id): id is string => Boolean(id));
+    for (const atomId of [...new Set(mergeIds)]) {
+      await this.#assertEngineAuthorized({
+        method: "mergeAtoms",
+        mode: "manage",
+        authorization: options?.authorization,
+        resource: { kind: "atom", id: atomId },
+      });
+    }
+    const target = await this.#metadataStore.getAtom(targetAtomId ?? atomIds[0]);
     if (!target) {
       throw new Error("merge target not found");
     }
@@ -2306,51 +2645,62 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       if (atomId === target.id) {
         continue;
       }
-      const atom = await this.metadataStore.getAtom(atomId);
+      const atom = await this.#metadataStore.getAtom(atomId);
       if (!atom) {
         continue;
       }
-      await this.metadataStore.saveAtom(
-        mergeAtoms((await this.metadataStore.getAtom(target.id))!, atom),
+      await this.#metadataStore.saveAtom(
+        mergeAtoms((await this.#metadataStore.getAtom(target.id))!, atom),
       );
-      await this.metadataStore.deleteAtom(atomId);
+      await this.#metadataStore.deleteAtom(atomId);
     }
     return target.id;
   }
 
-  private canonicalLookup(): CanonicalResourceLookup {
+  #canonicalLookup(): CanonicalResourceLookup {
     return {
-      getAtom: (id) => this.metadataStore.getAtom(id),
-      getEvent: (id) => this.metadataStore.getEvent(id),
-      getJournal: (id) => this.metadataStore.getJournal(id),
-      getEntity: (id) => this.metadataStore.getEntity(id),
-      getScenario: (id) => this.metadataStore.getScenario(id),
-      getProblem: (id) => this.metadataStore.getProblem(id),
-      getEvidence: (id) => this.metadataStore.getEvidence(id),
-      getRelation: (id) => this.metadataStore.getRelation(id),
-      getPackageTrace: async (id) => this.packageTraces.get(id),
-      getReasoningSession: async (id) => this.reasoningSessions.get(id),
+      getAtom: (id) => this.#metadataStore.getAtom(id),
+      getEvent: (id) => this.#metadataStore.getEvent(id),
+      getJournal: (id) => this.#metadataStore.getJournal(id),
+      getEntity: (id) => this.#metadataStore.getEntity(id),
+      getScenario: (id) => this.#metadataStore.getScenario(id),
+      getProblem: (id) => this.#metadataStore.getProblem(id),
+      getEvidence: (id) => this.#metadataStore.getEvidence(id),
+      getRelation: (id) => this.#metadataStore.getRelation(id),
+      getPackageTrace: async (id) => this.#packageTraces.get(id),
+      getReasoningSession: async (id) => this.#reasoningSessions.get(id),
     };
   }
 
   async resolveCanonicalResourceScope(
     kind: CanonicalResourceKind,
     id: string,
+    options?: EngineCallOptions,
   ): Promise<CanonicalResourceScope> {
-    return resolveCanonicalResourceScopeFromLookup(kind, id, this.canonicalLookup());
+    const direct = await this.#assertEngineAuthorized({
+      method: "resolveCanonicalResourceScope",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind, id },
+    });
+    if (direct.unauthenticatedLocal) {
+      return this.#resolveCanonicalResourceScopeForAuthorization(kind, id);
+    }
+    const resolved = await this.#resolveCanonicalResourceScopeForAuthorization(kind, id);
+    return resolved;
   }
 
-  private async resolveJournalCanonicalScope(journal: WriteJournal): Promise<Scope | undefined> {
-    return deriveJournalScope(journal, this.canonicalLookup());
+  async #resolveJournalCanonicalScope(journal: WriteJournal): Promise<Scope | undefined> {
+    return deriveJournalScope(journal, this.#canonicalLookup());
   }
 
-  private async journalsMatchingResolvedScope(
+  async #journalsMatchingResolvedScope(
     journals: WriteJournal[],
     requestedScope?: Scope,
   ): Promise<WriteJournal[]> {
     const matched: WriteJournal[] = [];
     for (const journal of journals) {
-      const scope = await this.resolveJournalCanonicalScope(journal);
+      const scope = await this.#resolveJournalCanonicalScope(journal);
       if (!isCompleteScope(scope)) {
         continue;
       }
@@ -2365,6 +2715,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   async repairIndexes(options?: {
     journalId?: string;
     scope?: Scope;
+    authorization?: { bearerToken?: string };
   }): Promise<Record<string, unknown>> {
     const requestedScope = options?.scope
       ? resolveScope(options.scope, this.config)
@@ -2372,24 +2723,39 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     if (!requestedScope && this.config.environment !== "local") {
       throw new ScopeViolationError("repairIndexes requires explicit scope");
     }
+    if (options?.journalId) {
+      await this.#assertEngineAuthorized({
+        method: "repairIndexes",
+        mode: "manage",
+        authorization: options?.authorization,
+        resource: { kind: "journal", id: options.journalId },
+      });
+    } else {
+      await this.#assertEngineAuthorized({
+        method: "repairIndexes",
+        mode: "manage",
+        authorization: options?.authorization,
+        declaredScope: requestedScope,
+      });
+    }
 
     let journals = options?.journalId
-      ? [await this.metadataStore.getJournal(options.journalId)].filter((v): v is WriteJournal =>
+      ? [await this.#metadataStore.getJournal(options.journalId)].filter((v): v is WriteJournal =>
           Boolean(v),
         )
-      : (await this.metadataStore.listJournals()).filter(
+      : (await this.#metadataStore.listJournals()).filter(
           (journal) => journal.status === "DERIVED_OUT_OF_SYNC",
         );
 
-    journals = await this.journalsMatchingResolvedScope(journals, requestedScope);
+    journals = await this.#journalsMatchingResolvedScope(journals, requestedScope);
 
     const repaired = [];
     for (const journal of journals) {
       repaired.push(
         await repairJournalDerivedIndexes({
-          metadataStore: this.metadataStore,
-          graphStore: this.graphStore,
-          vectorStore: this.vectorStore,
+          metadataStore: this.#metadataStore,
+          graphStore: this.#graphStore,
+          vectorStore: this.#vectorStore,
           journal,
         }),
       );
@@ -2401,13 +2767,20 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     objectType: string;
     objectId: string;
     scope?: ScopeInput;
+    authorization?: { bearerToken?: string };
   }): Promise<Record<string, unknown>> {
     const requestedScope = resolveReadScopeOrThrow(_options.scope, this.config, "rebuildFromTruth");
     const objectType = _options.objectType;
     if (!isRebuildObjectType(objectType)) {
       throw new ValidationError(`rebuildFromTruth received unsupported objectType: ${objectType}`);
     }
-    const resolved = await this.resolveCanonicalResourceScope(objectType, _options.objectId);
+    await this.#assertEngineAuthorized({
+      method: "rebuildFromTruth",
+      mode: "manage",
+      authorization: _options.authorization,
+      resource: { kind: objectType, id: _options.objectId },
+    });
+    const resolved = await this.#resolveCanonicalResourceScopeForAuthorization(objectType, _options.objectId);
     if (resolved.unresolvedReason === "store_unavailable") {
       throw new StoreUnavailableError("rebuildFromTruth canonical store unavailable");
     }
@@ -2416,21 +2789,21 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     }
     assertScopeAccess(resolved.scope, requestedScope, "rebuildFromTruth");
 
-    const journals = await this.metadataStore.listJournals();
+    const journals = await this.#metadataStore.listJournals();
     const journal = journals.find((candidate) =>
       journalObjectIdsForType(candidate, objectType).includes(_options.objectId),
     );
     if (!journal) {
       return { status: "NOT_FOUND" };
     }
-    const journalScope = await this.resolveJournalCanonicalScope(journal);
+    const journalScope = await this.#resolveJournalCanonicalScope(journal);
     if (!isCompleteScope(journalScope) || !matchesScope(journalScope, requestedScope)) {
       throw new ScopeViolationError("rebuildFromTruth scope violation");
     }
     const result = await rebuildDerivedFromTruth({
-      metadataStore: this.metadataStore,
-      graphStore: this.graphStore,
-      vectorStore: this.vectorStore,
+      metadataStore: this.#metadataStore,
+      graphStore: this.#graphStore,
+      vectorStore: this.#vectorStore,
       journal,
     });
     return { status: "REBUILT", ...result };
@@ -2443,40 +2816,62 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   async recoverFromCanonical(
     options?: RecoverFromCanonicalOptions,
   ): Promise<RecoverFromCanonicalResult> {
-    await this.ensureSourceLifecycleHydrated();
+    await this.#assertEngineAuthorized({
+      method: "recoverFromCanonical",
+      mode: "manage",
+      authorization: options?.authorization,
+      declaredScope: options?.scope,
+    });
+    await this.#ensureSourceLifecycleHydrated();
 
-    let journals = (await this.metadataStore.listJournals()).filter((journal) =>
+    let journals = (await this.#metadataStore.listJournals()).filter((journal) =>
       ["COMPLETED", "DERIVED_OUT_OF_SYNC", "METADATA_COMMITTED"].includes(journal.status),
     );
     if (options?.scope) {
-      journals = await this.journalsMatchingResolvedScope(
+      journals = await this.#journalsMatchingResolvedScope(
         journals,
         resolveScope(options.scope, this.config),
       );
     } else if (this.config.environment !== "local") {
       throw new ScopeViolationError("recoverFromCanonical requires explicit scope");
     } else {
-      journals = await this.journalsMatchingResolvedScope(journals);
+      journals = await this.#journalsMatchingResolvedScope(journals);
     }
 
     let journalsRebuilt = 0;
     for (const journal of journals) {
       await rebuildDerivedFromTruth({
-        metadataStore: this.metadataStore,
-        graphStore: this.graphStore,
-        vectorStore: this.vectorStore,
+        metadataStore: this.#metadataStore,
+        graphStore: this.#graphStore,
+        vectorStore: this.#vectorStore,
         journal,
       });
       journalsRebuilt += 1;
     }
 
+    const authorizedScope = options?.scope ? resolveScope(options.scope, this.config) : undefined;
+    const scopedJournals = await this.#journalsMatchingResolvedScope(
+      await this.#metadataStore.listJournals(),
+      authorizedScope,
+    );
+    const scopedJournalIds = new Set(scopedJournals.map((journal) => journal.id));
     const writeOperations =
-      typeof this.metadataStore.listWriteOperations === "function"
-        ? await this.metadataStore.listWriteOperations()
+      typeof this.#metadataStore.listWriteOperations === "function"
+        ? await this.#metadataStore.listWriteOperations()
         : [];
+    const writeOperationCount = writeOperations.filter((op) => {
+      const journalId = op.result?.journalId;
+      return Boolean(journalId && scopedJournalIds.has(journalId));
+    }).length;
     const orphanSourceBindingIds: string[] = [];
-    for (const binding of this.sourceBindings.values()) {
-      const live = this.liveSourceObjectLinks({ sourceBindingId: binding.id });
+    for (const binding of this.#sourceBindings.values()) {
+      if (!isCompleteScope(binding.scope)) {
+        continue;
+      }
+      if (authorizedScope && !matchesScope(binding.scope, authorizedScope)) {
+        continue;
+      }
+      const live = this.#liveSourceObjectLinks({ sourceBindingId: binding.id });
       if (live.length === 0) {
         orphanSourceBindingIds.push(binding.id);
       }
@@ -2485,19 +2880,34 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return {
       status: "RECOVERED",
       journalsRebuilt,
-      writeOperationCount: writeOperations.length,
-      journalCount: (await this.metadataStore.listJournals()).length,
+      writeOperationCount,
+      journalCount: scopedJournals.length,
       orphanSourceBindingIds,
     };
   }
 
   async compactJournals(options?: CompactJournalsOptions): Promise<CompactJournalsResult> {
+    const requestedScope = options?.scope
+      ? resolveScope(options.scope, this.config)
+      : undefined;
+    if (!requestedScope && this.config.environment !== "local") {
+      throw new ScopeViolationError("compactJournals requires explicit scope");
+    }
+    await this.#assertEngineAuthorized({
+      method: "compactJournals",
+      mode: "manage",
+      authorization: options?.authorization,
+      declaredScope: requestedScope,
+    });
     const keepCompleted = Math.max(0, options?.keepCompleted ?? 20);
     const dryRun = options?.dryRun === true;
-    const journals = await this.metadataStore.listJournals();
+    let journals = await this.#metadataStore.listJournals();
+    if (requestedScope) {
+      journals = await this.#journalsMatchingResolvedScope(journals, requestedScope);
+    }
     const pinnedJournalIds = new Set<string>();
-    if (typeof this.metadataStore.listWriteOperations === "function") {
-      for (const op of await this.metadataStore.listWriteOperations()) {
+    if (typeof this.#metadataStore.listWriteOperations === "function") {
+      for (const op of await this.#metadataStore.listWriteOperations()) {
         if (op.result?.journalId) {
           pinnedJournalIds.add(op.result.journalId);
         }
@@ -2531,9 +2941,9 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       .filter((journal) => !retained.has(journal.id))
       .map((journal) => journal.id);
 
-    if (!dryRun && typeof this.metadataStore.deleteJournal === "function") {
+    if (!dryRun && typeof this.#metadataStore.deleteJournal === "function") {
       for (const journalId of deletedJournalIds) {
-        await this.metadataStore.deleteJournal(journalId);
+        await this.#metadataStore.deleteJournal(journalId);
       }
     }
 
@@ -2544,13 +2954,19 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     };
   }
 
-  async getWriteJournal(journalId: string, scope?: ScopeInput): Promise<WriteJournal> {
+  async getWriteJournal(journalId: string, scope?: ScopeInput, options?: EngineCallOptions): Promise<WriteJournal> {
+    await this.#assertEngineAuthorized({
+      method: "getWriteJournal",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "journal", id: journalId },
+    });
     const requestedScope = resolveReadScopeOrThrow(scope, this.config, "getWriteJournal");
-    const journal = await this.metadataStore.getJournal(journalId);
+    const journal = await this.#metadataStore.getJournal(journalId);
     if (!journal) {
       throw new Error(`Unknown journal: ${journalId}`);
     }
-    const canonicalScope = await this.resolveJournalCanonicalScope(journal);
+    const canonicalScope = await this.#resolveJournalCanonicalScope(journal);
     if (!isCompleteScope(canonicalScope)) {
       throw new ScopeViolationError("getWriteJournal cannot resolve authoritative scope");
     }
@@ -2559,19 +2975,19 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   async archiveSource(input: SourceLifecycleInput): Promise<SourceLifecycleReceipt> {
-    return this.applySourceLifecycle(input, "archived");
+    return this.#applySourceLifecycle(input, "archived");
   }
 
   async restoreSource(input: SourceLifecycleInput): Promise<SourceLifecycleReceipt> {
-    return this.applySourceLifecycle(input, "active", { from: ["archived"] });
+    return this.#applySourceLifecycle(input, "active", { from: ["archived"] });
   }
 
   async forgetSource(input: SourceLifecycleInput): Promise<SourceLifecycleReceipt> {
-    return this.applySourceLifecycle(input, "forgotten", { from: ["active", "archived"] });
+    return this.#applySourceLifecycle(input, "forgotten", { from: ["active", "archived"] });
   }
 
   async purgeSource(input: SourceLifecycleInput): Promise<SourceLifecycleReceipt> {
-    return this.applySourceLifecycle(input, "purged");
+    return this.#applySourceLifecycle(input, "purged");
   }
 
   /**
@@ -2579,7 +2995,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
    * Includes bindings linked directly to the atom and bindings linked to its
    * current evidenceRefs. Does not invent locators or scan claim text.
    */
-  async listLiveSourcesForAtom(atomId: string): Promise<
+  async listLiveSourcesForAtom(atomId: string, options?: EngineCallOptions): Promise<
     Array<{
       sourceBindingId: string;
       sourceIdentityId: string;
@@ -2587,37 +3003,57 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       status: SourceLifecycleMode;
     }>
   > {
-    await this.ensureSourceLifecycleHydrated();
+    await this.#assertEngineAuthorized({
+      method: "listLiveSourcesForAtom",
+      mode: "read",
+      authorization: options?.authorization,
+      resource: { kind: "atom", id: atomId },
+    });
     const id = atomId.trim();
     if (!id) {
       return [];
     }
-    const bindingIds = new Set<string>();
-    for (const link of this.liveSourceObjectLinks({ objectType: "atom", objectId: id })) {
-      bindingIds.add(link.sourceBindingId);
+    const resolved = await this.#resolveCanonicalResourceScopeForAuthorization("atom", id);
+    if (!resolved.found || !isCompleteScope(resolved.scope)) {
+      throw new ScopeViolationError("listLiveSourcesForAtom cannot resolve authoritative scope");
     }
-    const atom = await this.metadataStore.getAtom(id);
+    const authorizedScope = resolved.scope;
+    await this.#ensureSourceLifecycleHydrated();
+    const bindingIds = new Set<string>();
+    const considerLinkedBinding = (bindingId: string): void => {
+      const binding = this.#sourceBindings.get(bindingId);
+      if (binding && this.#isAuthorizedLiveSourceBinding(binding, authorizedScope)) {
+        bindingIds.add(binding.id);
+      }
+    };
+    for (const link of this.#liveSourceObjectLinks({ objectType: "atom", objectId: id })) {
+      considerLinkedBinding(link.sourceBindingId);
+    }
+    const atom = await this.#metadataStore.getAtom(id);
     if (atom) {
+      if (!isCompleteScope(atom.scope) || !matchesScope(atom.scope, authorizedScope)) {
+        throw new ScopeViolationError("listLiveSourcesForAtom cannot resolve authoritative scope");
+      }
       for (const evidenceId of atom.provenance.evidenceRefs) {
-        for (const link of this.liveSourceObjectLinks({
+        for (const link of this.#liveSourceObjectLinks({
           objectType: "evidence",
           objectId: evidenceId,
         })) {
-          bindingIds.add(link.sourceBindingId);
+          considerLinkedBinding(link.sourceBindingId);
         }
       }
-      // Lazy backfill: evidence may match bindings that have not yet materialized
-      // atom links (same path as forgetSource pre-unlink ensure*).
-      for (const binding of this.sourceBindings.values()) {
+      // Lazy backfill: evidence may match same-scope bindings that have not yet
+      // materialized atom links. Foreign-scope URI matches are ignored.
+      for (const binding of this.#sourceBindings.values()) {
         if (bindingIds.has(binding.id)) {
           continue;
         }
-        if (binding.status !== "active" && binding.status !== "archived") {
+        if (!this.#isAuthorizedLiveSourceBinding(binding, authorizedScope)) {
           continue;
         }
         for (const evidenceId of atom.provenance.evidenceRefs) {
-          const evidence = await this.metadataStore.getEvidence(evidenceId);
-          if (evidence && this.evidenceMatchesBinding(evidence, binding)) {
+          const evidence = await this.#metadataStore.getEvidence(evidenceId);
+          if (evidence && this.#evidenceMatchesBinding(evidence, binding)) {
             bindingIds.add(binding.id);
             break;
           }
@@ -2631,11 +3067,8 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       status: SourceLifecycleMode;
     }> = [];
     for (const bindingId of bindingIds) {
-      const binding = this.sourceBindings.get(bindingId);
-      if (!binding) {
-        continue;
-      }
-      if (binding.status !== "active" && binding.status !== "archived") {
+      const binding = this.#sourceBindings.get(bindingId);
+      if (!binding || !this.#isAuthorizedLiveSourceBinding(binding, authorizedScope)) {
         continue;
       }
       out.push({
@@ -2648,53 +3081,41 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return out.toSorted((a, b) => a.sourceBindingId.localeCompare(b.sourceBindingId));
   }
 
+  #isAuthorizedLiveSourceBinding(binding: SourceBinding, authorizedScope: Scope): boolean {
+    if (binding.status !== "active" && binding.status !== "archived") {
+      return false;
+    }
+    if (!isCompleteScope(binding.scope)) {
+      return false;
+    }
+    return matchesScope(binding.scope, authorizedScope);
+  }
+
   /** True when evidence is still eligible for retrieval given lifecycle bindings/links. */
-  isEvidenceRetrievable(evidence: EvidenceRecord): boolean {
-    const liveLinks = this.liveSourceObjectLinks({
+  #isEvidenceRetrievable(evidence: EvidenceRecord): boolean {
+    const liveLinks = this.#liveSourceObjectLinks({
       objectType: "evidence",
       objectId: evidence.id,
     });
     if (liveLinks.length > 0) {
       return liveLinks.some((link) => {
-        const binding = this.sourceBindings.get(link.sourceBindingId);
+        const binding = this.#sourceBindings.get(link.sourceBindingId);
         return binding?.status === "active";
       });
     }
     // Legacy path: no normalized links yet — hide when any non-active binding matches.
-    for (const binding of this.sourceBindings.values()) {
+    for (const binding of this.#sourceBindings.values()) {
       if (binding.status === "active") {
         continue;
       }
-      if (this.evidenceMatchesBinding(evidence, binding)) {
+      if (this.#evidenceMatchesBinding(evidence, binding)) {
         return false;
       }
     }
     return true;
   }
 
-  getSourceBindingStatus(selector: SourceLifecycleSelector): SourceLifecycleMode | null {
-    const binding = this.findSourceBinding(selector);
-    return binding?.status ?? null;
-  }
-
-  /** Path / URI still eligible for OpenBot manager search after lifecycle ops. */
-  isSourcePathRetrievable(pathOrUri: string): boolean {
-    const p = pathOrUri.split("\\").join("/");
-    for (const binding of this.sourceBindings.values()) {
-      if (binding.status === "active") {
-        continue;
-      }
-      if (
-        (binding.sourceIdentityId && p.includes(binding.sourceIdentityId)) ||
-        (binding.sourceLocator && p.includes(binding.sourceLocator.split("\\").join("/")))
-      ) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  private evidenceMatchesBinding(evidence: EvidenceRecord, binding: SourceBinding): boolean {
+  #evidenceMatchesBinding(evidence: EvidenceRecord, binding: SourceBinding): boolean {
     const uri = (evidence.uri ?? "").split("\\").join("/");
     const identity = binding.sourceIdentityId;
     const locator = binding.sourceLocator.split("\\").join("/");
@@ -2707,21 +3128,24 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return false;
   }
 
-  private findSourceBinding(selector: SourceLifecycleSelector): SourceBinding | undefined {
+  #findSourceBinding(selector: SourceLifecycleSelector): SourceBinding | undefined {
     if (selector.mode === "binding") {
-      return this.sourceBindings.get(selector.sourceBindingId);
+      return this.#sourceBindings.get(selector.sourceBindingId);
     }
     if (selector.mode === "identity") {
-      const id = this.sourceBindingsByIdentity.get(selector.sourceIdentityId);
-      return id ? this.sourceBindings.get(id) : undefined;
+      const id = this.#sourceBindingsByIdentity.get(selector.sourceIdentityId);
+      return id ? this.#sourceBindings.get(id) : undefined;
     }
-    const id = this.sourceBindingsByLocator.get(selector.sourceLocator);
-    return id ? this.sourceBindings.get(id) : undefined;
+    const id = this.#sourceBindingsByLocator.get(selector.sourceLocator);
+    return id ? this.#sourceBindings.get(id) : undefined;
   }
 
-  private ensureSourceBinding(selector: SourceLifecycleSelector, scope: Scope): SourceBinding {
-    const existing = this.findSourceBinding(selector);
+  #ensureSourceBinding(selector: SourceLifecycleSelector, scope: Scope): SourceBinding {
+    const existing = this.#findSourceBinding(selector);
     if (existing) {
+      if (!matchesScope(existing.scope, scope)) {
+        throw new ScopeViolationError("source binding is not authorized");
+      }
       return existing;
     }
     const now = new Date().toISOString();
@@ -2746,20 +3170,30 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       createdAt: now,
       updatedAt: now,
     };
-    this.sourceBindings.set(binding.id, binding);
-    this.sourceBindingsByIdentity.set(binding.sourceIdentityId, binding.id);
-    this.sourceBindingsByLocator.set(binding.sourceLocator, binding.id);
+    this.#sourceBindings.set(binding.id, binding);
+    this.#sourceBindingsByIdentity.set(binding.sourceIdentityId, binding.id);
+    this.#sourceBindingsByLocator.set(binding.sourceLocator, binding.id);
     return binding;
   }
 
-  private async applySourceLifecycle(
+  async #applySourceLifecycle(
     input: SourceLifecycleInput,
     target: SourceLifecycleMode,
     opts?: { from?: SourceLifecycleMode[] },
   ): Promise<SourceLifecycleReceipt> {
-    await this.ensureSourceLifecycleHydrated();
-    const existingReceipt = await this.loadSourceLifecycleReceipt(input.operationId);
+    await this.#assertEngineAuthorized({
+      method: "applySourceLifecycle",
+      mode: "manage",
+      authorization: input.authorization,
+      declaredScope: input.subject.scope,
+    });
+    await this.#ensureSourceLifecycleHydrated();
+    const existingReceipt = await this.#loadSourceLifecycleReceipt(input.operationId);
     if (existingReceipt) {
+      const receiptBinding = this.#sourceBindings.get(existingReceipt.sourceBindingId);
+      if (!receiptBinding || !matchesScope(receiptBinding.scope, input.subject.scope)) {
+        throw new ScopeViolationError("source binding is not authorized");
+      }
       if (existingReceipt.currentStatus !== target) {
         throw new IdempotencyConflictError(
           `operationId ${input.operationId} already completed with status=${existingReceipt.currentStatus}`,
@@ -2768,8 +3202,8 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       return existingReceipt;
     }
 
-    const binding = this.ensureSourceBinding(input.selector, input.subject.scope);
-    await this.persistSourceBinding(binding);
+    const binding = this.#ensureSourceBinding(input.selector, input.subject.scope);
+    await this.#persistSourceBinding(binding);
     const previousStatus = binding.status;
     if (input.expectedStatus && previousStatus !== input.expectedStatus) {
       throw new Error(
@@ -2786,7 +3220,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         affectedObjectCount: 0,
         completedAt: new Date().toISOString(),
       };
-      await this.persistSourceLifecycleReceipt(receipt, input.reasonCode);
+      await this.#persistSourceLifecycleReceipt(receipt, input.reasonCode);
       return receipt;
     }
     if (opts?.from && !opts.from.includes(previousStatus)) {
@@ -2807,22 +3241,22 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
 
     binding.status = target;
     binding.updatedAt = new Date().toISOString();
-    this.sourceBindings.set(binding.id, binding);
-    await this.persistSourceBinding(binding);
+    this.#sourceBindings.set(binding.id, binding);
+    await this.#persistSourceBinding(binding);
 
     // Archive keeps links; forget/purge soft-unlink. Always ensure membership rows first.
-    await this.ensureEvidenceLinksForBinding(binding);
-    await this.ensureAtomLinksForBinding(binding);
-    await this.ensureEventLinksForBinding(binding);
-    await this.ensureRelationLinksForBinding(binding);
-    await this.ensureProvenanceObjectLinksForBinding(binding, "entity");
-    await this.ensureProvenanceObjectLinksForBinding(binding, "scenario");
-    await this.ensureProvenanceObjectLinksForBinding(binding, "problem");
+    await this.#ensureEvidenceLinksForBinding(binding);
+    await this.#ensureAtomLinksForBinding(binding);
+    await this.#ensureEventLinksForBinding(binding);
+    await this.#ensureRelationLinksForBinding(binding);
+    await this.#ensureProvenanceObjectLinksForBinding(binding, "entity");
+    await this.#ensureProvenanceObjectLinksForBinding(binding, "scenario");
+    await this.#ensureProvenanceObjectLinksForBinding(binding, "problem");
 
     let affectedObjectCount = 0;
     if (target === "forgotten" || target === "purged") {
       const now = new Date().toISOString();
-      const liveLinks = this.liveSourceObjectLinks({ sourceBindingId: binding.id });
+      const liveLinks = this.#liveSourceObjectLinks({ sourceBindingId: binding.id });
       const unlinkingEvidenceIds = new Set(
         liveLinks.filter((link) => link.objectType === "evidence").map((link) => link.objectId),
       );
@@ -2843,41 +3277,41 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       );
       // Objects that cite evidence being unlinked must recompute even without a link row.
       if (unlinkingEvidenceIds.size > 0) {
-        for (const atom of await this.metadataStore.listAtoms()) {
+        for (const atom of await this.#metadataStore.listAtoms()) {
           if (atom.provenance.evidenceRefs.some((id) => unlinkingEvidenceIds.has(id))) {
             affectedAtomIds.add(atom.id);
           }
         }
-        for (const relation of await this.metadataStore.listRelations()) {
+        for (const relation of await this.#metadataStore.listRelations()) {
           if (relation.provenance.evidenceRefs.some((id) => unlinkingEvidenceIds.has(id))) {
             affectedRelationIds.add(relation.id);
           }
         }
-        for (const entity of await this.metadataStore.listEntities()) {
+        for (const entity of await this.#metadataStore.listEntities()) {
           if (entity.provenance.evidenceRefs.some((id) => unlinkingEvidenceIds.has(id))) {
             affectedEntityIds.add(entity.id);
           }
         }
-        for (const scenario of await this.metadataStore.listScenarios()) {
+        for (const scenario of await this.#metadataStore.listScenarios()) {
           if (scenario.provenance.evidenceRefs.some((id) => unlinkingEvidenceIds.has(id))) {
             affectedScenarioIds.add(scenario.id);
           }
         }
-        for (const problem of await this.metadataStore.listProblems()) {
+        for (const problem of await this.#metadataStore.listProblems()) {
           if (problem.provenance.evidenceRefs.some((id) => unlinkingEvidenceIds.has(id))) {
             affectedProblemIds.add(problem.id);
           }
         }
       }
       for (const link of liveLinks) {
-        await this.persistSourceObjectLink({ ...link, unlinkedAt: now });
+        await this.#persistSourceObjectLink({ ...link, unlinkedAt: now });
       }
       affectedObjectCount = liveLinks.length;
 
       const mode = target === "purged" ? "purge" : "forget";
       // Include objects already unlinked on a prior forget when purging.
       if (target === "purged") {
-        for (const link of this.sourceObjectLinks.values()) {
+        for (const link of this.#sourceObjectLinks.values()) {
           if (link.sourceBindingId !== binding.id) {
             continue;
           }
@@ -2899,57 +3333,57 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         }
       }
       for (const atomId of affectedAtomIds) {
-        await this.recomputeAtomAfterSourceChange(atomId, mode);
+        await this.#recomputeAtomAfterSourceChange(atomId, mode);
       }
       for (const relationId of affectedRelationIds) {
-        await this.recomputeRelationAfterSourceChange(relationId, mode);
+        await this.#recomputeRelationAfterSourceChange(relationId, mode);
       }
       for (const entityId of affectedEntityIds) {
-        await this.recomputeProvenanceObjectAfterSourceChange("entity", entityId, mode);
+        await this.#recomputeProvenanceObjectAfterSourceChange("entity", entityId, mode);
       }
       for (const scenarioId of affectedScenarioIds) {
-        await this.recomputeProvenanceObjectAfterSourceChange("scenario", scenarioId, mode);
+        await this.#recomputeProvenanceObjectAfterSourceChange("scenario", scenarioId, mode);
       }
       for (const problemId of affectedProblemIds) {
-        await this.recomputeProvenanceObjectAfterSourceChange("problem", problemId, mode);
+        await this.#recomputeProvenanceObjectAfterSourceChange("problem", problemId, mode);
       }
 
       if (target === "purged") {
-        await this.purgeOrphanObjectsForBinding(binding.id, "evidence");
-        await this.purgeOrphanObjectsForBinding(binding.id, "event");
-        await this.purgeOrphanObjectsForBinding(binding.id, "relation");
-        await this.purgeOrphanObjectsForBinding(binding.id, "entity");
-        await this.purgeOrphanObjectsForBinding(binding.id, "scenario");
-        await this.purgeOrphanObjectsForBinding(binding.id, "problem");
+        await this.#purgeOrphanObjectsForBinding(binding.id, "evidence");
+        await this.#purgeOrphanObjectsForBinding(binding.id, "event");
+        await this.#purgeOrphanObjectsForBinding(binding.id, "relation");
+        await this.#purgeOrphanObjectsForBinding(binding.id, "entity");
+        await this.#purgeOrphanObjectsForBinding(binding.id, "scenario");
+        await this.#purgeOrphanObjectsForBinding(binding.id, "problem");
         const purgedIds: string[] = [];
         for (const atomId of affectedAtomIds) {
-          if (!(await this.metadataStore.getAtom(atomId))) {
+          if (!(await this.#metadataStore.getAtom(atomId))) {
             purgedIds.push(atomId);
           }
         }
         for (const relationId of affectedRelationIds) {
-          if (!(await this.metadataStore.getRelation(relationId))) {
+          if (!(await this.#metadataStore.getRelation(relationId))) {
             purgedIds.push(relationId);
           }
         }
         for (const entityId of affectedEntityIds) {
-          if (!(await this.metadataStore.getEntity(entityId))) {
+          if (!(await this.#metadataStore.getEntity(entityId))) {
             purgedIds.push(entityId);
           }
         }
         for (const scenarioId of affectedScenarioIds) {
-          if (!(await this.metadataStore.getScenario(scenarioId))) {
+          if (!(await this.#metadataStore.getScenario(scenarioId))) {
             purgedIds.push(scenarioId);
           }
         }
         for (const problemId of affectedProblemIds) {
-          if (!(await this.metadataStore.getProblem(problemId))) {
+          if (!(await this.#metadataStore.getProblem(problemId))) {
             purgedIds.push(problemId);
           }
         }
         if (purgedIds.length > 0) {
-          await this.graphStore.delete?.(purgedIds);
-          await this.vectorStore.delete?.(purgedIds);
+          await this.#graphStore.delete?.(purgedIds);
+          await this.#vectorStore.delete?.(purgedIds);
         }
       }
     }
@@ -2963,7 +3397,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       affectedObjectCount,
       completedAt: new Date().toISOString(),
     };
-    await this.persistSourceLifecycleReceipt(receipt, input.reasonCode);
+    await this.#persistSourceLifecycleReceipt(receipt, input.reasonCode);
     return receipt;
   }
 }

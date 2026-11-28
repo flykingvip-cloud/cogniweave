@@ -544,6 +544,7 @@ export type SourceLifecycleInput = {
   subject: CogniWeaveSubjectContext;
   reasonCode: string;
   expectedStatus?: SourceLifecycleMode;
+  authorization?: { bearerToken?: string };
 };
 
 export type SourceLifecycleReceipt = {

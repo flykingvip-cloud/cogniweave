@@ -7,8 +7,13 @@
   },
   "files": [
     "bin",
-    "dist",
-    "src",
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/models.js",
+    "dist/models.d.ts",
+    "dist/contracts.js",
+    "dist/contracts.d.ts",
+    "dist/cli.js",
     "datasets",
     "scripts",
     "docs",
@@ -24,10 +29,15 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
-    "./*": {
-      "types": "./dist/*.d.ts",
-      "import": "./dist/*.js",
-      "default": "./dist/*.js"
+    "./models": {
+      "types": "./dist/models.d.ts",
+      "import": "./dist/models.js",
+      "default": "./dist/models.js"
+    },
+    "./contracts": {
+      "types": "./dist/contracts.d.ts",
+      "import": "./dist/contracts.js",
+      "default": "./dist/contracts.js"
     },
     "./cli-entry": "./bin/cogniweave.mjs"
   },
@@ -44,7 +54,7 @@
     "benchmark:mvp": "tsx scripts/benchmark-mvp.ts --dataset datasets/mvp-core-eval.json",
     "benchmark:mvp:gate": "tsx scripts/benchmark-mvp.ts --dataset datasets/mvp-core-eval.json --enforce-thresholds",
     "bootstrap:schema": "tsx src/cli.ts bootstrap-schema",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node scripts/build-sdk.mjs",
     "cli": "tsx src/cli.ts",
     "eval:distill:replay": "tsx scripts/eval-distillation-replay.ts --dataset datasets/distillation-replay-multi-call.json --output .runtime/cogniweave-eval-distill-replay.json",
     "eval:distill:replay:gate": "tsx scripts/eval-distillation-replay.ts --dataset datasets/distillation-replay-multi-call.json --output .runtime/cogniweave-eval-distill-replay.json --enforce-thresholds",
@@ -64,6 +74,8 @@
   },
   "devDependencies": {
     "@types/node": "^25.3.5",
+    "dts-bundle-generator": "^10.0.0",
+    "esbuild": "^0.28.2",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"

@@ -10,6 +10,7 @@ import type {
 import { isAtomRetrievable } from "../retrieval/lifecycle-gate.js";
 import { authorizeMemoryAccess } from "../subject/binding.js";
 import { StoreUnavailableError } from "../errors.js";
+import type { MetadataStore } from "../storage/types.js";
 
 export type CanonicalResourceKind =
   | "atom"
@@ -88,7 +89,7 @@ export type ResourceCallerPrincipal = {
   subject?: MemorySubject;
 };
 
-export type CanonicalAuthorizationMode = "read" | "manage";
+export type CanonicalAuthorizationMode = "read" | "manage" | "revoke";
 
 export type CanonicalAuthorizationSuccess = {
   allowed: true;
@@ -471,38 +472,46 @@ export async function authorizeCanonicalResource(input: {
     return deny(404, "not_found");
   }
 
-  if (mode === "read") {
-    if (!input.bindingQuery) {
-      return deny(503, "binding_store_unavailable");
-    }
-    let dataPlaneId: string;
-    try {
-      dataPlaneId = (await input.ensureDataPlaneId?.())?.trim() ?? "";
-    } catch {
-      return deny(503, "binding_store_unavailable");
-    }
-    if (!dataPlaneId) {
-      return deny(503, "binding_store_unavailable");
-    }
-    let bindings: MemorySubjectBinding[];
-    try {
-      bindings = await input.bindingQuery.listLiveBindings({
-        tenantId: verifiedTenantId,
-        dataPlaneId,
-        scope: resolved.scope,
-      });
-    } catch {
-      return deny(503, "binding_store_unavailable");
-    }
-    const partition = createMemoryPartitionKeyV1(dataPlaneId, resolved.scope);
-    const acl = authorizeMemoryAccess(bindings, {
-      partition,
-      caller: callerSubject,
+  // read, manage, and revoke all query Subject Binding. Tenant/Workspace
+  // admin roles are never sufficient to skip Canonical Ownership.
+  if (!input.bindingQuery) {
+    return deny(503, "binding_store_unavailable");
+  }
+  let dataPlaneId: string;
+  try {
+    dataPlaneId = (await input.ensureDataPlaneId?.())?.trim() ?? "";
+  } catch {
+    return deny(503, "binding_store_unavailable");
+  }
+  if (!dataPlaneId) {
+    return deny(503, "binding_store_unavailable");
+  }
+  let bindings: MemorySubjectBinding[];
+  try {
+    bindings = await input.bindingQuery.listLiveBindings({
+      tenantId: verifiedTenantId,
+      dataPlaneId,
+      scope: resolved.scope,
     });
+  } catch {
+    return deny(503, "binding_store_unavailable");
+  }
+  const partition = createMemoryPartitionKeyV1(dataPlaneId, resolved.scope);
+  const acl = authorizeMemoryAccess(bindings, {
+    partition,
+    caller: callerSubject,
+  });
+
+  const ownerMatches = resolved.owner
+    ? (resolved.owner.ownerType === "user" && resolved.owner.ownerId === principal.userId) ||
+      (resolved.owner.ownerType === callerSubject.ownerType &&
+        resolved.owner.ownerId === callerSubject.ownerId)
+    : false;
+
+  if (mode === "read") {
     if (!acl.allowed) {
       return deny(404, "not_found");
     }
-
     if (resolved.retrievable === false) {
       return deny(404, "not_found");
     }
@@ -513,14 +522,8 @@ export async function authorizeCanonicalResource(input: {
     ) {
       return deny(404, "not_found");
     }
-    if (resolved.privacyLevel === "private" && resolved.owner) {
-      const ownerMatches =
-        (resolved.owner.ownerType === "user" && resolved.owner.ownerId === principal.userId) ||
-        (resolved.owner.ownerType === principal.subject.ownerType &&
-          resolved.owner.ownerId === principal.subject.ownerId);
-      if (!ownerMatches) {
-        return deny(404, "not_found");
-      }
+    if (resolved.privacyLevel === "private" && resolved.owner && !ownerMatches) {
+      return deny(404, "not_found");
     }
     if (input.knowledgePolicyAllows) {
       const policyOk = await input.knowledgePolicyAllows({ principal, resolved });
@@ -528,9 +531,69 @@ export async function authorizeCanonicalResource(input: {
         return deny(404, "not_found");
       }
     }
+    return { allowed: true, resolved, scope: resolved.scope };
+  }
+
+  // manage / revoke: Canonical Ownership first, then subject binding.
+  // An admin role cannot substitute for owner + binding proof.
+  const alreadyRevokedOrArchived =
+    resolved.lifecycleStatus === "revoked" || resolved.lifecycleStatus === "archived";
+
+  if (mode === "revoke" && alreadyRevokedOrArchived) {
+    // Idempotent revoke: the owner may succeed without a still-live binding.
+    // Anyone else gets a uniform 404 so existence is not leaked.
+    if (resolved.owner) {
+      if (!ownerMatches) {
+        return deny(404, "not_found");
+      }
+    } else if (!acl.allowed) {
+      return deny(404, "not_found");
+    }
+    return { allowed: true, resolved, scope: resolved.scope };
+  }
+
+  if (resolved.owner && !ownerMatches) {
+    return deny(404, "not_found");
+  }
+  if (!acl.allowed) {
+    return deny(404, "not_found");
+  }
+  if (
+    input.kind === "memory_resource" &&
+    resolved.lifecycleStatus &&
+    resolved.lifecycleStatus !== "active" &&
+    mode === "manage"
+  ) {
+    return deny(404, "not_found");
+  }
+  if (input.knowledgePolicyAllows) {
+    const policyOk = await input.knowledgePolicyAllows({ principal, resolved });
+    if (!policyOk) {
+      return deny(404, "not_found");
+    }
   }
 
   return { allowed: true, resolved, scope: resolved.scope };
+}
+
+
+export function createAuthoritativeBindingQueryFromMetadataStore(
+  store: Pick<MetadataStore, "listMemorySubjectBindings">,
+): AuthoritativeBindingQuery | undefined {
+  if (!store.listMemorySubjectBindings) {
+    return undefined;
+  }
+  return {
+    async listLiveBindings(filter) {
+      return store.listMemorySubjectBindings!({
+        tenantId: filter.tenantId,
+        dataPlaneId: filter.dataPlaneId,
+        scope: filter.scope,
+        scopeFingerprint: filter.scopeFingerprint,
+        liveOnly: true,
+      });
+    },
+  };
 }
 
 /** Deny-by-default test double. Only bindings explicitly provided can allow. */

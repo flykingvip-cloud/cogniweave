@@ -2,6 +2,21 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { createAuthoritativeBindingQueryFromMetadataStore } from "../auth/authorize.js";
+import { createMemoryDelegationAuthorizationStore } from "../auth/delegation.js";
+import { createDenyByDefaultPrincipalProvider, type TrustedPrincipal } from "../auth/principal.js";
+import { createTrustedRuntime } from "../auth/trusted-runtime.js";
+import type { AuthoritativeBindingQuery } from "../auth/canonical-scope.js";
+import type { DelegationAuthorizationStore } from "../auth/delegation.js";
+import type { MetadataStore } from "../storage/types.js";
+import {
+  BindingStoreUnavailableError,
+  DelegationDeniedError,
+  DelegationStoreUnavailableError,
+  PrincipalUnavailableError,
+  SecurityOverrideRejectedError,
+  UntrustedRuntimeError,
+} from "../errors.js";
 import { FileDurableJobStore } from "../jobs/durable-job-store.js";
 import { createMemoryPartitionKeyV1 } from "../keys.js";
 import type { CognitivePackage, MemoryAtom, MemorySubject, Scope, TaskFrame } from "../models.js";
@@ -37,6 +52,40 @@ const OTHER_AGENT_SCOPE: Scope = {
 
 const PARTITION = createMemoryPartitionKeyV1("dp_1", SCOPE);
 const CALLER: MemorySubject = { tenantId: "__local__", ownerType: "agent", ownerId: "agent_main" };
+const SELF_PRINCIPAL: TrustedPrincipal = {
+  tenantId: "__local__",
+  userId: "agent_main",
+  subject: CALLER,
+  tokenId: "tok_agent_main",
+};
+
+const TEST_TOKEN = "tok";
+
+function serviceJobAuth(
+  principal: TrustedPrincipal,
+  extras: {
+    bindingQuery?: AuthoritativeBindingQuery;
+    delegationStore?: DelegationAuthorizationStore;
+    metadataStore?: MetadataStore;
+  } = {},
+) {
+  const bindingQuery =
+    extras.bindingQuery ??
+    (extras.metadataStore
+      ? createAuthoritativeBindingQueryFromMetadataStore(extras.metadataStore)
+      : undefined);
+  return {
+    runtime: createTrustedRuntime({
+      environment: "service",
+      principalProvider: createDenyByDefaultPrincipalProvider([{ token: TEST_TOKEN, principal }]),
+      ...(bindingQuery ? { bindingQuery } : {}),
+      ...(extras.delegationStore ? { delegationStore: extras.delegationStore } : {}),
+    }),
+    authorization: { bearerToken: TEST_TOKEN },
+    ...(extras.metadataStore ? { metadataStore: extras.metadataStore } : {}),
+  };
+}
+
 
 function makeAtom(overrides: Partial<MemoryAtom> & { id: string }): MemoryAtom {
   return {
@@ -261,7 +310,7 @@ describe("Memory Optimization Engine (CW-04J)", () => {
       });
       await metadataStore.saveMemorySubjectBinding(binding);
 
-      // CW-08-02: Forged actorUserId without delegation rejected fail-closed
+      // CW-08-02 / CW-09-02: Forged actorUserId without a matching principal is rejected fail-closed
       await expect(
         runOptimizationJob({
           tenantId: "__local__",
@@ -276,10 +325,11 @@ describe("Memory Optimization Engine (CW-04J)", () => {
             caller: CALLER,
             dataPlaneId: "dp_1",
           },
+          ...serviceJobAuth(SELF_PRINCIPAL, { metadataStore }),
           jobStore,
           metadataStore,
         }),
-      ).rejects.toThrow("not authorized to act for subject");
+      ).rejects.toBeInstanceOf(DelegationDeniedError);
 
       const job = await runOptimizationJob({
         idempotencyKey: "explicit_key_1",
@@ -295,6 +345,7 @@ describe("Memory Optimization Engine (CW-04J)", () => {
           caller: CALLER,
           dataPlaneId: "dp_1",
         },
+        ...serviceJobAuth(SELF_PRINCIPAL, { metadataStore }),
         jobStore,
         metadataStore,
         graphStore: new InMemoryGraphStore(),
@@ -302,8 +353,12 @@ describe("Memory Optimization Engine (CW-04J)", () => {
       });
       expect(job.status).toBe("completed");
       expect(job.result?.estimatedCanonicalClaimTokenDelta).toBeGreaterThan(0);
+      expect(job.authorization?.decision).toBe("allow");
+      expect(job.authorization?.actor.userId).toBe("agent_main");
+      expect(job.authorization?.bindingId).toBe(binding.id);
 
       // Reusing same explicit idempotencyKey with a mutated atom version must fail with IdempotencyConflictError!
+      // Caller-submitted bindings are ignored; the metadata store remains the binding authority.
       await expect(
         runOptimizationJob({
           idempotencyKey: "explicit_key_1",
@@ -320,7 +375,9 @@ describe("Memory Optimization Engine (CW-04J)", () => {
             bindings: [binding],
             dataPlaneId: "dp_1",
           },
+          ...serviceJobAuth(SELF_PRINCIPAL, { metadataStore }),
           jobStore,
+          metadataStore,
         }),
       ).rejects.toThrow("different payload");
 
@@ -337,5 +394,250 @@ describe("Memory Optimization Engine (CW-04J)", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("CW-09-02 runOptimizationJob trusted identity (unit)", () => {
+  async function setup() {
+    const metadataStore = new InMemoryMetadataStore();
+    const a1 = makeAtom({ id: "atm_1", dedupKey: "k1" });
+    const a2 = makeAtom({ id: "atm_2", dedupKey: "k1" });
+    await metadataStore.saveAtom(a1);
+    await metadataStore.saveAtom(a2);
+    const binding = createMemorySubjectBinding({
+      partition: PARTITION,
+      scope: SCOPE,
+      subject: CALLER,
+    });
+    await metadataStore.saveMemorySubjectBinding(binding);
+    return { metadataStore, a1, a2, binding };
+  }
+
+  it("denies forged delegation claimed only through delegatedActorFor", async () => {
+    const { metadataStore, a1, a2 } = await setup();
+    const actorPrincipal: TrustedPrincipal = {
+      tenantId: "__local__",
+      userId: "user_assistant",
+      subject: { tenantId: "__local__", ownerType: "user", ownerId: "user_assistant" },
+    };
+    await expect(
+      runOptimizationJob({
+        tenantId: "__local__",
+        subjectId: "agent_main",
+        scope: SCOPE,
+        optimizationType: "consolidation",
+        atoms: [a1, a2],
+        executionContext: {
+          actorUserId: "user_assistant",
+          tenantId: "__local__",
+          scope: SCOPE,
+          caller: CALLER,
+          delegatedActorFor: ["agent_main"],
+          dataPlaneId: "dp_1",
+        },
+        ...serviceJobAuth(actorPrincipal, { metadataStore }),
+        metadataStore,
+      }),
+    ).rejects.toBeInstanceOf(DelegationStoreUnavailableError);
+  });
+
+  it("allows a lawful delegation record and records the audit decision on the job", async () => {
+    const { metadataStore, a1, a2, binding } = await setup();
+    const actorPrincipal: TrustedPrincipal = {
+      tenantId: "__local__",
+      userId: "user_assistant",
+      subject: { tenantId: "__local__", ownerType: "user", ownerId: "user_assistant" },
+      tokenId: "tok_assistant",
+    };
+    const delegationStore = createMemoryDelegationAuthorizationStore([
+      {
+        id: "del_job_1",
+        tenantId: "__local__",
+        delegator: CALLER,
+        delegateActorId: "user_assistant",
+        subject: CALLER,
+        scope: SCOPE,
+        grantedAt: "2026-11-01T00:00:00.000Z",
+        expiresAt: "2026-12-31T00:00:00.000Z",
+      },
+    ]);
+    const job = await runOptimizationJob({
+      tenantId: "__local__",
+      subjectId: "agent_main",
+      scope: SCOPE,
+      optimizationType: "consolidation",
+      atoms: [a1, a2],
+      executionContext: {
+        actorUserId: "user_assistant",
+        tenantId: "__local__",
+        scope: SCOPE,
+        caller: CALLER,
+        delegatedActorFor: ["not-evidence"],
+        bindings: [],
+        dataPlaneId: "dp_1",
+      },
+      ...serviceJobAuth(actorPrincipal, { metadataStore, delegationStore }),
+      metadataStore,
+      graphStore: new InMemoryGraphStore(),
+      vectorStore: new InMemoryVectorStore(),
+    });
+    expect(job.status).toBe("completed");
+    expect(job.authorization).toMatchObject({
+      actor: { userId: "user_assistant" },
+      delegator: CALLER,
+      caller: CALLER,
+      subject: { tenantId: "__local__", ownerType: "agent", ownerId: "agent_main" },
+      bindingId: binding.id,
+      tenantId: "__local__",
+      decision: "allow",
+      delegationId: "del_job_1",
+      principalTokenId: "tok_assistant",
+    });
+    expect(job.authorization?.traceId).toBeTruthy();
+  });
+
+  it("ignores forged ctx.bindings when the authoritative store has no live binding", async () => {
+    const metadataStore = new InMemoryMetadataStore();
+    const a1 = makeAtom({ id: "atm_1", dedupKey: "k1" });
+    await metadataStore.saveAtom(a1);
+    const forged = createMemorySubjectBinding({
+      partition: PARTITION,
+      scope: SCOPE,
+      subject: CALLER,
+    });
+    await expect(
+      runOptimizationJob({
+        tenantId: "__local__",
+        subjectId: "agent_main",
+        scope: SCOPE,
+        optimizationType: "consolidation",
+        atoms: [a1],
+        executionContext: {
+          actorUserId: "agent_main",
+          tenantId: "__local__",
+          scope: SCOPE,
+          caller: CALLER,
+          bindings: [forged],
+          dataPlaneId: "dp_1",
+        },
+        ...serviceJobAuth(SELF_PRINCIPAL, { metadataStore }),
+        metadataStore,
+      }),
+    ).rejects.toBeInstanceOf(DelegationDeniedError);
+  });
+
+  it("denies production execution when the principal or binding store is unavailable", async () => {
+    const a1 = makeAtom({ id: "atm_1", dedupKey: "k1" });
+    await expect(
+      runOptimizationJob({
+        tenantId: "__local__",
+        subjectId: "agent_main",
+        scope: SCOPE,
+        optimizationType: "consolidation",
+        atoms: [a1],
+        executionContext: {
+          actorUserId: "agent_main",
+          tenantId: "__local__",
+          scope: SCOPE,
+          caller: CALLER,
+          dataPlaneId: "dp_1",
+        },
+        runtime: createTrustedRuntime({ environment: "cloud" }),
+        authorization: { bearerToken: TEST_TOKEN },
+      }),
+    ).rejects.toBeInstanceOf(PrincipalUnavailableError);
+
+    const storeWithoutBindings = {} as InMemoryMetadataStore;
+    await expect(
+      runOptimizationJob({
+        tenantId: "__local__",
+        subjectId: "agent_main",
+        scope: SCOPE,
+        optimizationType: "consolidation",
+        atoms: [a1],
+        executionContext: {
+          actorUserId: "agent_main",
+          tenantId: "__local__",
+          scope: SCOPE,
+          caller: CALLER,
+          bindings: [
+            createMemorySubjectBinding({
+              partition: PARTITION,
+              scope: SCOPE,
+              subject: CALLER,
+            }),
+          ],
+          dataPlaneId: "dp_1",
+        },
+        ...serviceJobAuth(SELF_PRINCIPAL, { metadataStore: storeWithoutBindings }),
+        metadataStore: storeWithoutBindings,
+      }),
+    ).rejects.toBeInstanceOf(BindingStoreUnavailableError);
+  });
+});
+
+describe("CW-09-02-R1 runOptimizationJob production injection (unit)", () => {
+  it("denies a self-declared principal and a forged Binding Query in service/cloud", async () => {
+    const a1 = makeAtom({ id: "atm_1", dedupKey: "k1" });
+    await expect(
+      runOptimizationJob({
+        tenantId: "__local__",
+        subjectId: "agent_main",
+        scope: SCOPE,
+        optimizationType: "consolidation",
+        atoms: [a1],
+        executionContext: {
+          actorUserId: "agent_main",
+          tenantId: "__local__",
+          scope: SCOPE,
+          caller: CALLER,
+          dataPlaneId: "dp_1",
+        },
+        runtime: createTrustedRuntime({ environment: "service" }),
+        authorization: {
+          principal: SELF_PRINCIPAL,
+        } as never,
+      }),
+    ).rejects.toBeInstanceOf(SecurityOverrideRejectedError);
+
+    const forgedStore = new InMemoryMetadataStore();
+    await forgedStore.saveMemorySubjectBinding(
+      createMemorySubjectBinding({
+        partition: PARTITION,
+        scope: SCOPE,
+        subject: CALLER,
+      }),
+    );
+    await expect(
+      runOptimizationJob({
+        tenantId: "__local__",
+        subjectId: "agent_main",
+        scope: SCOPE,
+        optimizationType: "consolidation",
+        atoms: [a1],
+        executionContext: {
+          actorUserId: "agent_main",
+          tenantId: "__local__",
+          scope: SCOPE,
+          caller: CALLER,
+          dataPlaneId: "dp_1",
+        },
+        runtime: createTrustedRuntime({
+          environment: "cloud",
+          principalProvider: createDenyByDefaultPrincipalProvider([
+            { token: TEST_TOKEN, principal: SELF_PRINCIPAL },
+          ]),
+        }),
+        authorization: {
+          bearerToken: TEST_TOKEN,
+          bindingQuery: {
+            async listLiveBindings() {
+              return forgedStore.listMemorySubjectBindings!({ liveOnly: true });
+            },
+          },
+        } as never,
+        metadataStore: forgedStore,
+      }),
+    ).rejects.toBeInstanceOf(SecurityOverrideRejectedError);
   });
 });

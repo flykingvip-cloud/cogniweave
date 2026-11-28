@@ -84,6 +84,8 @@ export type {
   CogniWeaveEngine,
   CompactJournalsOptions,
   CompactJournalsResult,
+  EngineCallAuthorization,
+  EngineCallOptions,
   FrameTaskOptions,
   IngestInput,
   IngestResult,
@@ -102,16 +104,25 @@ export type {
 } from "./contracts.js";
 
 export {
+  BindingStoreUnavailableError,
   CogniWeaveError,
+  DelegationDeniedError,
+  DelegationStoreUnavailableError,
   DistillationError,
   EvidenceAccessError,
+  ExecutionAuthorizationError,
   IdempotencyConflictError,
+  PrincipalUnavailableError,
   ReasoningError,
+  SecurityOverrideRejectedError,
   ScopeViolationError,
   StorageConsistencyError,
   StoreUnavailableError,
+  ProductionBootstrapError,
+  UntrustedRuntimeError,
   ValidationError,
 } from "./errors.js";
+export type { ExecutionAuthorizationErrorCode, ProductionBootstrapFailureReason } from "./errors.js";
 
 export {
   OPERATION_KEY_VERSION,
@@ -336,8 +347,6 @@ export {
 
 export type { GraphStore, MetadataBundle, MetadataStore, VectorStore } from "./storage/types.js";
 
-export { rebuildFromTruth, repairDerivedIndexes } from "./journal/repair.js";
-
 export type {
   AdapterDescriptor,
   AdapterKind,
@@ -423,6 +432,63 @@ export {
   resolveCanonicalResourceScope,
   REBUILD_OBJECT_TYPES,
 } from "./auth/canonical-scope.js";
+
+export type { TrustedPrincipal, TrustedPrincipalProvider, ResolveTrustedPrincipalInput } from "./auth/principal.js";
+export { createDenyByDefaultPrincipalProvider, isUsableTrustedPrincipal } from "./auth/principal.js";
+
+export type {
+  ActiveDelegationQuery,
+  DelegationAuthorization,
+  DelegationAuthorizationStore,
+  DelegationRevalidationFailure,
+} from "./auth/delegation.js";
+export {
+  createMemoryDelegationAuthorizationStore,
+  isActiveDelegation,
+  revalidateDelegationRecord,
+  sameMemorySubject,
+} from "./auth/delegation.js";
+
+export type {
+  ExecutionAuthorizationDecision,
+  TrustedAuthorizationAssembly,
+  TrustedExecutionAuthorizationOptions,
+  TrustedExecutionAuthorizationSuccess,
+  TrustedExecutionRequest,
+  TrustedExecutionRequestAuthorization,
+  TrustedRuntime,
+} from "./auth/authorize.js";
+export {
+  authorizeAtomBindings,
+  authorizeTrustedExecution,
+  createAuthoritativeBindingQueryFromMetadataStore,
+  isProductionLikeEnvironment,
+  resolveRequireAuth,
+  resolveRequireAuthFromRuntime,
+} from "./auth/authorize.js";
+
+export type { CreateTrustedRuntimeInput } from "./auth/trusted-runtime.js";
+export {
+  REQUEST_SECURITY_OVERRIDE_KEYS,
+  createImplicitLocalRuntime,
+  createTrustedRuntime,
+  findCallerSecurityOverrides,
+  isVerifiableTrustedRuntime,
+} from "./auth/trusted-runtime.js";
+
+export type { ProductionAssemblyAuditRecord, ProductionBootstrapResult } from "./auth/production-bootstrap.js";
+export {
+  bootstrapProductionTrustedRuntime,
+  getEngineProductionAssemblyAudit,
+  getProductionAssemblyAudit,
+  getSealedProcessTrustMode,
+  isProductionProcess,
+  listFailedProductionBootstrapAudits,
+  submitProductionAssemblyAudit,
+} from "./auth/production-bootstrap.js";
+
+export { ENGINE_DIRECT_AUTH_ENTRYPOINTS } from "./auth/engine-invocation.js";
+export type { EngineDirectAuthMethod } from "./auth/engine-invocation.js";
 
 export type {
   DistillRequest,

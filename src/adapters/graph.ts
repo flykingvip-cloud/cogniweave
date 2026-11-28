@@ -1,3 +1,4 @@
+import { assertNotMixedOrInvalidProcessConfiguration } from "../auth/process-trust.js";
 import { StorageConsistencyError } from "../errors.js";
 import type { DistillationResult } from "../models.js";
 import type { GraphStore, MetadataBundle } from "../storage/types.js";
@@ -11,6 +12,7 @@ export class PlaceholderGraphStore implements GraphStore {
   descriptor: AdapterDescriptor;
 
   constructor(config: BackendAdapterConfig) {
+    assertNotMixedOrInvalidProcessConfiguration("PlaceholderGraphStore");
     this.descriptor = {
       kind: "graph",
       backend: config.backend,

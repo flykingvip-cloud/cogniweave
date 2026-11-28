@@ -2,6 +2,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { assertNotMixedOrInvalidProcessConfiguration } from "../auth/process-trust.js";
 import { StorageConsistencyError } from "../errors.js";
 import { createDataPlaneId } from "../keys.js";
 import type {
@@ -320,6 +321,10 @@ export function buildLocalMetadataSchema(): string[] {
   ];
 }
 
+/**
+ * File/SQLite canonical metadata. Suitable for local/dev single-instance use.
+ * Not multi-instance safe and is not production Binding-store evidence (CW-09-02 / CW-09-09).
+ */
 export class LocalMetadataStore implements MetadataStore {
   readonly descriptor: AdapterDescriptor;
   readonly path: string;
@@ -329,6 +334,7 @@ export class LocalMetadataStore implements MetadataStore {
   private transactionDepth = 0;
 
   constructor(config: LocalMetadataStoreConfig) {
+    assertNotMixedOrInvalidProcessConfiguration("LocalMetadataStore");
     this.path = config.path;
     const openMode = config.openMode ?? "readwrite";
     const { DatabaseSync } = requireNodeSqlite();
@@ -1408,6 +1414,7 @@ export class LocalMetadataStore implements MetadataStore {
 export function openLocalMetadataStoreReadonly(
   config: LocalMetadataStoreConfig,
 ): LocalMetadataReadonlyOpenResult {
+  assertNotMixedOrInvalidProcessConfiguration("openLocalMetadataStoreReadonly()");
   if (!existsSync(config.path)) {
     return {
       ok: false,
@@ -1419,6 +1426,9 @@ export function openLocalMetadataStoreReadonly(
     const store = new LocalMetadataStore({ ...config, openMode: "readonly" });
     return { ok: true, store };
   } catch (error) {
+    if (error && typeof error === "object" && "reason" in error && (error as { reason?: string }).reason === "mixed_test_and_production_configuration") {
+      throw error;
+    }
     const message = error instanceof Error ? error.message : String(error);
     if (/missing table|not initialized|schema_version missing/i.test(message)) {
       return { ok: false, code: "MEMORY_STORE_NOT_INITIALIZED", message };

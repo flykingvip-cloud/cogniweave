@@ -21,6 +21,11 @@ import {
   Neo4jGraphStore,
   PgVectorStore,
   createCogniWeaveRuntime,
+  createDenyByDefaultPrincipalProvider,
+  createTrustedRuntime,
+  createAuthoritativeBindingQueryFromMetadataStore,
+  createMemorySubjectBinding,
+  createMemoryPartitionKeyV1,
 } from "../index.js";
 
 class FailingOnceGraphStore extends InMemoryGraphStore {
@@ -347,28 +352,57 @@ describe("InMemoryCogniWeaveEngine", () => {
           environment: "service",
           client: pgvectorClient,
         }),
+        runtime: await (async () => {
+          const dataPlaneId = await metadataStore.ensureDataPlaneId();
+          const subject = { tenantId: "t_1", ownerType: "user" as const, ownerId: "u_1" };
+          await metadataStore.saveMemorySubjectBinding(
+            createMemorySubjectBinding({
+              partition: createMemoryPartitionKeyV1(dataPlaneId, scope),
+              scope,
+              subject,
+            }),
+          );
+          return createTrustedRuntime({
+            environment: "service",
+            principalProvider: createDenyByDefaultPrincipalProvider([
+              {
+                token: "svc_tok",
+                principal: {
+                  tenantId: "t_1",
+                  userId: "u_1",
+                  subject,
+                  allowedWorkspaceIds: ["ws_1"],
+                },
+              },
+            ]),
+            bindingQuery: createAuthoritativeBindingQueryFromMetadataStore(metadataStore),
+            ensureDataPlaneId: () => metadataStore.ensureDataPlaneId(),
+          });
+        })(),
       },
     );
 
+    const authorization = { bearerToken: "svc_tok" };
     const writeResult = await engine.writeBack({
       rawInput:
         "Throughput dropped and external API latency is high. Should we add synchronous retries?",
       scope,
       sourceType: "chat",
       sourceSessionId: "sess_sql_first_partial",
+      authorization,
     });
 
     expect(writeResult.status).toBe("PARTIAL_SUCCESS");
     expect(writeResult.derivedStatus).toBe("DERIVED_OUT_OF_SYNC");
 
-    const journalBefore = await engine.getWriteJournal(writeResult.journalId, scope);
+    const journalBefore = await engine.getWriteJournal(writeResult.journalId, scope, { authorization });
     expect(journalBefore.status).toBe("DERIVED_OUT_OF_SYNC");
 
-    const repair = await engine.repairIndexes({ journalId: writeResult.journalId, scope });
+    const repair = await engine.repairIndexes({ journalId: writeResult.journalId, scope, authorization });
     expect(repair.status).toBe("SYNCED");
     expect(repair.repairedCount).toBe(1);
 
-    const journalAfter = await engine.getWriteJournal(writeResult.journalId, scope);
+    const journalAfter = await engine.getWriteJournal(writeResult.journalId, scope, { authorization });
     expect(journalAfter.status).toBe("COMPLETED");
     expect(neo4jTransactionCalls).toBeGreaterThanOrEqual(2);
     expect(pgvectorTransactionCalls).toBeGreaterThanOrEqual(2);

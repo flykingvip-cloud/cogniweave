@@ -1,3 +1,4 @@
+import { assertNotMixedOrInvalidProcessConfiguration } from "../auth/process-trust.js";
 import type { PostgresQueryResult, PostgresSqlClient } from "./postgres-metadata.js";
 
 export type CreatePgSqlClientOptions = {
@@ -34,6 +35,7 @@ type PgPoolLike = {
 export async function createPgSqlClient(
   options: CreatePgSqlClientOptions,
 ): Promise<PgSqlClientHandle> {
+  assertNotMixedOrInvalidProcessConfiguration("createPgSqlClient()");
   const connectionString = options.connectionString.trim();
   if (!connectionString) {
     throw new Error("createPgSqlClient requires a non-empty connectionString");

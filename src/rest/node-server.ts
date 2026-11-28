@@ -9,8 +9,22 @@ import {
   type CanonicalResourceScope,
   type CanonicalResourceScopeResolver,
 } from "../auth/canonical-scope.js";
-import { ScopeViolationError, StoreUnavailableError } from "../errors.js";
-import type { Scope } from "../models.js";
+import { isUsableTrustedPrincipal } from "../auth/principal.js";
+import {
+  isVerifiableTrustedRuntime,
+  resolveEngineTrustedRuntime,
+  resolveTrustedRuntimeAssembly,
+  type SealedTrustedRuntimeAssembly,
+  type TrustedRuntime,
+} from "../auth/trusted-runtime.js";
+import {
+  BindingStoreUnavailableError,
+  ExecutionAuthorizationError,
+  PrincipalUnavailableError,
+  ScopeViolationError,
+  StoreUnavailableError,
+} from "../errors.js";
+import type { EngineEnvironment, Scope } from "../models.js";
 import type { CogniWeaveMemoryResourceAdapter, MemoryResourceDescriptor } from "../resource/index.js";
 import type {
   DistillRequest,
@@ -25,21 +39,22 @@ import type {
   RestResponse,
   WriteBackRequest,
 } from "./contracts.js";
+import { getEngineCanonicalAuthorizationResolver } from "../runtime/canonical-resolver-registry.js";
 import type { CogniWeaveRestService } from "./service.js";
 
 export type CogniWeaveHttpAuthPrincipal = RestPrincipal;
 
 export interface CogniWeaveHttpServerOptions {
   basePath?: string;
-  /** Defaults to true for service/cloud environments (fail-closed); false only if explicitly disabled for local dev. */
-  requireAuth?: boolean;
-  validateToken?: (token: string) => Promise<CogniWeaveHttpAuthPrincipal | null>;
-  /** Optional tenant-to-workspace authorization hook for body.scope validation. */
+  /**
+   * Optional sealed runtime used when the engine does not already hold one.
+   * Cannot replace an engine-held TrustedRuntime. Ordinary objects are rejected.
+   */
+  runtime?: TrustedRuntime;
+  /** Optional tenant-to-workspace authorization hook (additional restriction only). */
   authorizeTenantScope?: (principal: RestPrincipal, workspaceId: string) => Promise<boolean> | boolean;
   /** Optional Memory Resource Adapter to expose /v1/memory-resources/* HTTP routes. */
   resourceAdapter?: CogniWeaveMemoryResourceAdapter;
-  /** CW-09-01: required in service/cloud for Subject Binding intersection. Missing => 503. */
-  authoritativeBindingQuery?: AuthoritativeBindingQuery;
   ensureDataPlaneId?: () => Promise<string>;
   knowledgePolicyAllows?: (params: {
     principal: RestPrincipal;
@@ -143,10 +158,72 @@ function mapAuthorizationThrownError(error: unknown): RestResponse<unknown> | nu
   if (error instanceof ScopeViolationError) {
     return responseBody(404, { error: "not_found" });
   }
-  if (error instanceof StoreUnavailableError) {
+  if (error instanceof StoreUnavailableError || error instanceof BindingStoreUnavailableError) {
     return responseBody(503, { error: "store_unavailable" });
   }
+  if (error instanceof PrincipalUnavailableError) {
+    return responseBody(401, { error: "unauthorized" });
+  }
+  if (error instanceof ExecutionAuthorizationError) {
+    if (error.code === "binding_store_unavailable" || error.code === "delegation_store_unavailable") {
+      return responseBody(503, { error: error.code });
+    }
+    if (error.code === "untrusted_runtime" || error.code === "security_override_rejected") {
+      return responseBody(401, { error: error.code });
+    }
+    return responseBody(404, { error: "not_found" });
+  }
   return null;
+}
+
+type EngineLike = {
+  config?: { environment?: string };
+};
+
+function readEngine(service: CogniWeaveRestService): EngineLike | undefined {
+  return (service as unknown as { engine?: EngineLike }).engine;
+}
+
+function resolveHttpSecurity(
+  service: CogniWeaveRestService,
+  options?: CogniWeaveHttpServerOptions,
+): {
+  assembly: SealedTrustedRuntimeAssembly | undefined;
+  requireAuth: boolean;
+  environment: EngineEnvironment;
+} {
+  const engine = readEngine(service);
+  const engineRuntime = resolveEngineTrustedRuntime(engine);
+  if (isVerifiableTrustedRuntime(engineRuntime)) {
+    const assembly = resolveTrustedRuntimeAssembly(engineRuntime);
+    if (options?.runtime && options.runtime !== engineRuntime) {
+      // A request/server option cannot replace the engine-held runtime.
+      return { assembly, requireAuth: true, environment: assembly.environment };
+    }
+    return {
+      assembly,
+      requireAuth: assembly.requireAuth,
+      environment: assembly.environment,
+    };
+  }
+  if (options?.runtime) {
+    try {
+      const assembly = resolveTrustedRuntimeAssembly(options.runtime);
+      return {
+        assembly,
+        requireAuth: assembly.requireAuth,
+        environment: assembly.environment,
+      };
+    } catch {
+      return { assembly: undefined, requireAuth: true, environment: "service" };
+    }
+  }
+  const env = engine?.config?.environment;
+  if (env === "local") {
+    return { assembly: undefined, requireAuth: false, environment: "local" };
+  }
+  const environment: EngineEnvironment = env === "cloud" ? "cloud" : "service";
+  return { assembly: undefined, requireAuth: true, environment };
 }
 
 function toMemoryResourceScope(
@@ -190,24 +267,45 @@ async function routeEnvelopeInner(
     return responseBody(200, { ok: true, service: "cogniweave" });
   }
 
-  const env = (service as unknown as { engine?: { config?: { environment?: string } } }).engine?.config
-    ?.environment;
-  const requireAuth = options?.requireAuth ?? env !== "local";
+  const security = resolveHttpSecurity(service, options);
+  const requireAuth = security.requireAuth;
+  const environment = security.environment;
+  const assembly = security.assembly;
+  const bindingQuery = assembly?.bindingQuery;
+  const ensureDataPlaneId = assembly?.ensureDataPlaneId ?? options?.ensureDataPlaneId;
 
   let principal: RestPrincipal | undefined;
   if (requireAuth) {
     const authHeader = envelope.headers.authorization;
     const token = authHeader?.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : "";
-    if (!token || !options?.validateToken) {
+    if (!assembly?.principalProvider) {
+      metrics.unauthorizedTotal += 1;
+      return responseBody(503, { error: "principal_unavailable" });
+    }
+    if (!token) {
       metrics.unauthorizedTotal += 1;
       return responseBody(401, { error: "unauthorized" });
     }
-    const validated = await options.validateToken(token);
-    if (!validated) {
+    try {
+      const resolved = await assembly.principalProvider.resolvePrincipal({
+        bearerToken: token,
+        environment,
+      });
+      if (!isUsableTrustedPrincipal(resolved)) {
+        metrics.unauthorizedTotal += 1;
+        return responseBody(401, { error: "invalid_token" });
+      }
+      principal = {
+        tenantId: resolved.tenantId,
+        userId: resolved.userId,
+        roles: resolved.roles,
+        allowedWorkspaceIds: resolved.allowedWorkspaceIds,
+        subject: resolved.subject,
+      };
+    } catch {
       metrics.unauthorizedTotal += 1;
-      return responseBody(401, { error: "invalid_token" });
+      return responseBody(503, { error: "principal_unavailable" });
     }
-    principal = validated;
     if (principal.subject && principal.tenantId !== principal.subject.tenantId) {
       metrics.unauthorizedTotal += 1;
       return responseBody(403, { error: "tenant_mismatch" });
@@ -255,8 +353,8 @@ async function routeEnvelopeInner(
       principal,
       scope,
       authorizeWorkspace: workspaceAllowed,
-      bindingQuery: options?.authoritativeBindingQuery,
-      ensureDataPlaneId: options?.ensureDataPlaneId,
+      bindingQuery,
+      ensureDataPlaneId,
     });
     if (!decision.allowed) {
       metrics.unauthorizedTotal += 1;
@@ -267,7 +365,14 @@ async function routeEnvelopeInner(
   };
 
   const engineResolver: CanonicalResourceScopeResolver = {
-    resolve: (kind, id) => service.resolveCanonicalResourceScope(kind, id),
+    resolve: (kind, id) => {
+      const engine = readEngine(service);
+      const resolver = engine ? getEngineCanonicalAuthorizationResolver(engine) : undefined;
+      if (resolver) {
+        return resolver.resolve(kind, id);
+      }
+      return service.resolveCanonicalResourceScope(kind, id);
+    },
   };
 
   const memoryResourceResolver = (id: string): CanonicalResourceScopeResolver => ({
@@ -287,7 +392,7 @@ async function routeEnvelopeInner(
   const authorizeCanonical = async (
     kind: CanonicalResourceKind,
     id: string,
-    mode: "read" | "manage" = "read",
+    mode: "read" | "manage" | "revoke" = "read",
   ): Promise<RestResponse<unknown> | null> => {
     if (!requireAuth) return null;
     const decision = await authorizeCanonicalResource({
@@ -297,8 +402,8 @@ async function routeEnvelopeInner(
       mode,
       resolver: kind === "memory_resource" ? memoryResourceResolver(id) : engineResolver,
       authorizeWorkspace: workspaceAllowed,
-      bindingQuery: options?.authoritativeBindingQuery,
-      ensureDataPlaneId: options?.ensureDataPlaneId,
+      bindingQuery,
+      ensureDataPlaneId,
       knowledgePolicyAllows: options?.knowledgePolicyAllows,
     });
     if (!decision.allowed) {
@@ -371,7 +476,7 @@ async function routeEnvelopeInner(
           metrics.unauthorizedTotal += 1;
           return responseBody(403, { error: "scope_tenant_forbidden" });
         }
-        if (!options?.authoritativeBindingQuery) {
+        if (!bindingQuery) {
           metrics.unauthorizedTotal += 1;
           return responseBody(503, { error: "binding_store_unavailable" });
         }
@@ -397,8 +502,8 @@ async function routeEnvelopeInner(
           principal: listPrincipal,
           scope: desc.scope,
           authorizeWorkspace: workspaceAllowed,
-          bindingQuery: options?.authoritativeBindingQuery,
-          ensureDataPlaneId: options?.ensureDataPlaneId,
+          bindingQuery,
+          ensureDataPlaneId,
         });
         if (!decision.allowed) {
           if (decision.httpStatus === 503) {
@@ -430,7 +535,7 @@ async function routeEnvelopeInner(
     }
     const revokeMatch = pathname.match(/^\/v1\/memory-resources\/([^/]+)\/revoke$/);
     if (method === "POST" && revokeMatch) {
-      const denied = await authorizeCanonical("memory_resource", revokeMatch[1], "manage");
+      const denied = await authorizeCanonical("memory_resource", revokeMatch[1], "revoke");
       if (denied) return denied;
       const desc = await options.resourceAdapter.describeResource(revokeMatch[1]);
       if (!desc) return responseBody(404, { error: "not_found" });
@@ -439,9 +544,7 @@ async function routeEnvelopeInner(
       }
       if (!options.resourceAdapter.authorizeResourceManagement(desc, principal)) {
         metrics.unauthorizedTotal += 1;
-        // After authoritative lookup, management ACL denial still uses 403 (not enumeration of existence).
-        // Cross-tenant already mapped to 404 by the canonical gate.
-        return responseBody(403, { error: "resource_management_forbidden" });
+        return responseBody(404, { error: "not_found" });
       }
       return responseBody(200, await options.resourceAdapter.revokeAccess(revokeMatch[1], principal));
     }
