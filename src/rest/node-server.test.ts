@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { createAuthoritativeBindingQueryFromMetadataStore, createDenyByDefaultBindingQuery } from "../auth/canonical-scope.js";
 import { createDenyByDefaultPrincipalProvider } from "../auth/principal.js";
-import { createTrustedRuntime } from "../auth/trusted-runtime.js";
+import { bindEngineTrustedRuntime, createTrustedRuntime } from "../auth/trusted-runtime.js";
 import type { TrustedPrincipal } from "../auth/principal.js";
 import { createMemoryPartitionKeyV1 } from "../keys.js";
 import type { MemorySubject, Scope } from "../models.js";
@@ -591,9 +591,9 @@ describe("CW-09-01 REST canonical scope authorization", () => {
     expect(missingBinding.body).toEqual({ error: "binding_store_unavailable" });
 
     const throwingEngine = {
-      trustedRuntime: seeded.runtime,
       config: { environment: "service" },
     };
+    bindEngineTrustedRuntime(throwingEngine, seeded.runtime);
     registerEngineCanonicalAuthorizationResolver(throwingEngine, {
       async resolve() {
         throw new Error("canonical store down");

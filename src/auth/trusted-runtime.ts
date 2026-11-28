@@ -14,6 +14,7 @@ import { isUsableTrustedPrincipal, type TrustedPrincipal, type TrustedPrincipalP
  * TypeScript interfaces, type assertions, and field names are not trust.
  */
 const sealedAssemblies = new WeakMap<object, SealedTrustedRuntimeAssembly>();
+const engineRuntimeHandles = new WeakMap<object, TrustedRuntime>();
 
 export type TrustedRuntime = {
   readonly environment: EngineEnvironment;
@@ -126,6 +127,39 @@ export function createImplicitLocalRuntime(): TrustedRuntime {
 
 export function isVerifiableTrustedRuntime(value: unknown): value is TrustedRuntime {
   return typeof value === "object" && value !== null && sealedAssemblies.has(value);
+}
+
+/**
+ * Same-bundle internal helper. Associates an Engine instance with its sealed
+ * runtime handle. Not a public SDK export and not replaceable later.
+ */
+export function bindEngineTrustedRuntime(engine: object, runtime: TrustedRuntime): void {
+  if (!isVerifiableTrustedRuntime(runtime)) {
+    throw new UntrustedRuntimeError(
+      "Engine runtime binding requires a verifiable TrustedRuntime from createTrustedRuntime()",
+      { decision: "deny", reason: "untrusted_runtime" },
+    );
+  }
+  const existing = engineRuntimeHandles.get(engine);
+  if (existing && existing !== runtime) {
+    throw new UntrustedRuntimeError(
+      "Engine trusted runtime is already sealed and cannot be replaced",
+      { decision: "deny", reason: "untrusted_runtime" },
+    );
+  }
+  engineRuntimeHandles.set(engine, runtime);
+}
+
+/**
+ * Same-bundle internal helper. Returns the Engine-held handle, or undefined.
+ * Not a public SDK export. Ordinary instance property access cannot substitute
+ * for this lookup.
+ */
+export function resolveEngineTrustedRuntime(engine: unknown): TrustedRuntime | undefined {
+  if (!engine || typeof engine !== "object") {
+    return undefined;
+  }
+  return engineRuntimeHandles.get(engine);
 }
 
 export function resolveTrustedRuntimeAssembly(runtime: unknown): SealedTrustedRuntimeAssembly {

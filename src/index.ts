@@ -466,17 +466,13 @@ export {
   resolveRequireAuthFromRuntime,
 } from "./auth/authorize.js";
 
-export type {
-  CreateTrustedRuntimeInput,
-  SealedTrustedRuntimeAssembly,
-} from "./auth/trusted-runtime.js";
+export type { CreateTrustedRuntimeInput } from "./auth/trusted-runtime.js";
 export {
   REQUEST_SECURITY_OVERRIDE_KEYS,
   createImplicitLocalRuntime,
   createTrustedRuntime,
   findCallerSecurityOverrides,
   isVerifiableTrustedRuntime,
-  resolveTrustedRuntimeAssembly,
 } from "./auth/trusted-runtime.js";
 
 export { ENGINE_DIRECT_AUTH_ENTRYPOINTS } from "./auth/engine-invocation.js";

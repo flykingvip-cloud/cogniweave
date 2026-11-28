@@ -1,5 +1,5 @@
 import { createAdapterBundle } from "../adapters/factory.js";
-import type { TrustedRuntime } from "../auth/trusted-runtime.js";
+import { resolveEngineTrustedRuntime, type TrustedRuntime } from "../auth/trusted-runtime.js";
 import type { EngineConfig } from "../models.js";
 import {
   createCogniWeaveHttpServer,
@@ -35,7 +35,7 @@ export function createCogniWeaveRuntime(
   const service = new CogniWeaveRestService(engine);
   const server = createCogniWeaveHttpServer(service, {
     ...options?.http,
-    runtime: options?.runtime ?? options?.http?.runtime ?? engine.trustedRuntime,
+    runtime: options?.runtime ?? options?.http?.runtime ?? resolveEngineTrustedRuntime(engine),
   });
 
   return {

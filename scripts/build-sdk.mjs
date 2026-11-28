@@ -146,6 +146,17 @@ function bundleTypings() {
     ) {
       throw new Error(`${item.outfile} re-exposes a closed resolver hook or typings path`);
     }
+    if (
+      typings.includes("resolveTrustedRuntimeAssembly") ||
+      typings.includes("SealedTrustedRuntimeAssembly") ||
+      typings.includes("bindEngineTrustedRuntime") ||
+      typings.includes("resolveEngineTrustedRuntime")
+    ) {
+      throw new Error(`${item.outfile} re-exposes a Trusted Runtime unpack helper or assembly typings`);
+    }
+    if (/(?:^|[^#\w])trustedRuntime\b/.test(typings) || typings.includes("getTrustedRuntime")) {
+      throw new Error(`${item.outfile} re-exposes a public Trusted Runtime handle property or getter`);
+    }
   }
 }
 

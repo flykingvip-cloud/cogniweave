@@ -12,13 +12,16 @@ bootstrap and public authorization entry points after R5.
    `requireAuth`) and stores the sealed assembly in a module-private WeakMap.
    A same-shaped ordinary object cannot resolve that assembly.
 3. `createCogniWeaveRuntime()` / `new InMemoryCogniWeaveEngine()` receive the
-   handle. service/cloud always force `requireAuth: true`. local may only be
-   selected at bootstrap; a job or HTTP request cannot downgrade it.
+   handle. The Engine stores it as an ECMAScript `#private` field and in a
+   module-private WeakMap; it is not a public instance property. service/cloud
+   always force `requireAuth: true`. local may only be selected at bootstrap;
+   a job or HTTP request cannot downgrade it.
 4. Authorization functions (`authorizeTrustedExecution`,
-   `authorizeEngineDirectInvocation`, REST routing) call
-   `resolveTrustedRuntimeAssembly(handle)` and snapshot environment,
-   requireAuth, and services once. Request objects may carry a bearer token
-   and business data only.
+   `authorizeEngineDirectInvocation`, REST routing) call the same-bundle
+   internal `resolveTrustedRuntimeAssembly(handle)` and snapshot environment,
+   requireAuth, and services once. That unpack helper is not a public SDK
+   root export. Request objects may carry a bearer token and business data
+   only.
 5. `metadataStore` remains a data-plane store. It is never auto-promoted to a
    Binding Query on a production request path. A local or production bootstrap
    may pass an already-built Binding Query into `createTrustedRuntime()`.
@@ -33,7 +36,9 @@ bootstrap and public authorization entry points after R5.
 ### REST
 
 - `createCogniWeaveHttpServer` / `routeCogniWeaveHttpRequest`
-- Identity and Binding Query come from the engine-held `TrustedRuntime`.
+- Identity and Binding Query come from the engine-held `TrustedRuntime`,
+  obtained through a same-bundle internal handle lookup, not a public
+  Engine property or SDK-root unpack helper.
 - Declared-scope routes use `authorizeDeclaredScope()`.
 - Resource-id routes use `authorizeCanonicalResource()` (`read` / `manage` / `revoke`).
 - `/v1/memory-resources/:id/revoke` uses `revoke` mode and returns a uniform 404

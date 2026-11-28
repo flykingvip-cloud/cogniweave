@@ -38,6 +38,7 @@ import {
 } from "../auth/engine-invocation.js";
 import { sameMemorySubject } from "../auth/delegation.js";
 import {
+  bindEngineTrustedRuntime,
   createImplicitLocalRuntime,
   createTrustedRuntime,
   resolveTrustedRuntimeAssembly,
@@ -707,7 +708,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   readonly #sourceObjectLinks = new Map<string, SourceObjectLink>();
   readonly #sourceLifecycleReceipts = new Map<string, SourceLifecycleReceipt>();
   #sourceLifecycleHydratePromise: Promise<void> | null = null;
-  readonly trustedRuntime: TrustedRuntime;
+  readonly #trustedRuntime: TrustedRuntime;
 
   constructor(
     config: EngineConfig,
@@ -722,7 +723,8 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     },
   ) {
     this.config = config;
-    this.trustedRuntime = this.#initializeTrustedRuntime(stores?.runtime);
+    this.#trustedRuntime = this.#initializeTrustedRuntime(stores?.runtime);
+    bindEngineTrustedRuntime(this, this.#trustedRuntime);
     const defaults = createAdapterBundle(config);
     const llmTaskFramingProvider = createHttpTaskFramingProvider(config);
     const llmDistillationProvider = createHttpDistillationProvider(config);
@@ -783,7 +785,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     resource?: { kind: CanonicalResourceKind; id: string };
   }): Promise<EngineDirectAuthorizationResult> {
     return authorizeEngineDirectInvocation({
-      runtime: this.trustedRuntime,
+      runtime: this.#trustedRuntime,
       method: input.method,
       mode: input.mode,
       authorization: input.authorization,

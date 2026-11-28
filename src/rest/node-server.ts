@@ -12,6 +12,7 @@ import {
 import { isUsableTrustedPrincipal } from "../auth/principal.js";
 import {
   isVerifiableTrustedRuntime,
+  resolveEngineTrustedRuntime,
   resolveTrustedRuntimeAssembly,
   type SealedTrustedRuntimeAssembly,
   type TrustedRuntime,
@@ -176,7 +177,6 @@ function mapAuthorizationThrownError(error: unknown): RestResponse<unknown> | nu
 }
 
 type EngineLike = {
-  trustedRuntime?: unknown;
   config?: { environment?: string };
 };
 
@@ -193,7 +193,7 @@ function resolveHttpSecurity(
   environment: EngineEnvironment;
 } {
   const engine = readEngine(service);
-  const engineRuntime = engine?.trustedRuntime;
+  const engineRuntime = resolveEngineTrustedRuntime(engine);
   if (isVerifiableTrustedRuntime(engineRuntime)) {
     const assembly = resolveTrustedRuntimeAssembly(engineRuntime);
     if (options?.runtime && options.runtime !== engineRuntime) {

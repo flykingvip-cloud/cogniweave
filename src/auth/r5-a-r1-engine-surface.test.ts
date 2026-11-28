@@ -287,7 +287,12 @@ describe("CW-09-02-R5-A-R1 Engine Direct remaining public-surface remediations",
     expect(Object.hasOwn(pkg, "repairDerivedIndexes")).toBe(false);
     expect(Object.hasOwn(pkg, "getEngineCanonicalAuthorizationResolver")).toBe(false);
     expect(Object.hasOwn(pkg, "registerEngineCanonicalAuthorizationResolver")).toBe(false);
+    expect(Object.hasOwn(pkg, "resolveTrustedRuntimeAssembly")).toBe(false);
+    expect(Object.hasOwn(pkg, "bindEngineTrustedRuntime")).toBe(false);
+    expect(Object.hasOwn(pkg, "resolveEngineTrustedRuntime")).toBe(false);
+    expect(Object.hasOwn(pkg, "SealedTrustedRuntimeAssembly")).toBe(false);
     expect(typeof pkg.InMemoryCogniWeaveEngine).toBe("function");
+    expect(typeof pkg.createTrustedRuntime).toBe("function");
   });
 
   it("does not expose the Canonical resolver or lookup on an Engine instance", () => {
@@ -300,8 +305,13 @@ describe("CW-09-02-R5-A-R1 Engine Direct remaining public-surface remediations",
     expect(names).not.toContain("canonicalResolver");
     expect(names).not.toContain("canonicalLookup");
     expect(names).not.toContain("getEngineCanonicalAuthorizationResolver");
+    expect(names).not.toContain("trustedRuntime");
+    expect(names).not.toContain("_trustedRuntime");
+    expect(names).not.toContain("getTrustedRuntime");
     expect(typeof (engine as { canonicalResolver?: unknown }).canonicalResolver).toBe("undefined");
     expect(typeof (engine as { canonicalLookup?: unknown }).canonicalLookup).toBe("undefined");
+    expect((engine as { trustedRuntime?: unknown }).trustedRuntime).toBeUndefined();
+    expect((engine as unknown as Record<string, unknown>)["trustedRuntime"]).toBeUndefined();
   });
 
   it("filters listLiveSourcesForAtom to the atom Canonical Scope and hides foreign bindings", async () => {
