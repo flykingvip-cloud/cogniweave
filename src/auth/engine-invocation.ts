@@ -30,7 +30,7 @@ import {
  * This list must match the remaining public I/O surface on
  * `CogniWeaveEngine` / `InMemoryCogniWeaveEngine`. Private or unexported
  * helpers (ungated Canonical lookup, source-binding status predicates,
- * `src/journal/repair.ts`) are intentionally omitted. Presence on this
+ * and derived-index mutation helpers) are intentionally omitted. Presence on this
  * list is not proof that a method's implementation is authorized.
  */
 export const ENGINE_DIRECT_AUTH_ENTRYPOINTS = [

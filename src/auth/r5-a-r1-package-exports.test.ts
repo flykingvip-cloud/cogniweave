@@ -1,8 +1,8 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -19,6 +19,44 @@ const FORBIDDEN_SPECIFIERS = [
 ];
 
 const ALLOWED_SPECIFIERS = ["@cogniweave/sdk", "@cogniweave/sdk/models", "@cogniweave/sdk/contracts"];
+
+const PUBLISHED_DIST_FILES = [
+  "dist/cli.js",
+  "dist/contracts.d.ts",
+  "dist/contracts.js",
+  "dist/index.d.ts",
+  "dist/index.js",
+  "dist/models.d.ts",
+  "dist/models.js",
+];
+
+const FORBIDDEN_FS_RELATIVE_PATHS = [
+  "dist/journal/repair.js",
+  "dist/journal/repair.ts",
+  "dist/journal/repair.mjs",
+  "dist/journal/repair.cjs",
+  "dist/journal/repair.d.ts",
+  "src/journal/repair.ts",
+  "src/journal/repair.js",
+  "journal/repair.js",
+  "journal/repair.ts",
+  "dist/runtime/canonical-resolver-registry.js",
+  "dist/runtime/canonical-resolver-registry.ts",
+  "dist/runtime/canonical-resolver-registry.mjs",
+  "dist/runtime/canonical-resolver-registry.cjs",
+  "dist/runtime/canonical-resolver-registry.d.ts",
+  "src/runtime/canonical-resolver-registry.ts",
+  "src/runtime/canonical-resolver-registry.js",
+  "runtime/canonical-resolver-registry.js",
+];
+
+const FORBIDDEN_PACKED_PATH_PATTERNS = [
+  /(^|\/)src\//,
+  /journal\/repair/,
+  /canonical-resolver-registry/,
+  /dist\/journal\//,
+  /dist\/runtime\//,
+];
 
 type CommandResult = {
   status: number | null;
@@ -51,15 +89,59 @@ function resolveExportError(result: CommandResult): boolean {
   );
 }
 
+function resolveMissingModuleError(result: CommandResult): boolean {
+  const text = `${result.stdout}\n${result.stderr}`;
+  return (
+    result.status !== 0 &&
+    (text.includes("ERR_MODULE_NOT_FOUND") ||
+      text.includes("Cannot find module") ||
+      text.includes("MODULE_NOT_FOUND") ||
+      text.includes("ENOENT"))
+  );
+}
+
+function publishedLayoutIsBundled(): boolean {
+  const index = join(packageRoot, "dist", "index.js");
+  if (!existsSync(index)) {
+    return false;
+  }
+  if (existsSync(join(packageRoot, "dist", "journal", "repair.js"))) {
+    return false;
+  }
+  if (existsSync(join(packageRoot, "dist", "runtime", "canonical-resolver-registry.js"))) {
+    return false;
+  }
+  const source = readFileSync(index, "utf8");
+  return !source.includes("./journal/repair") && !source.includes("./canonical-resolver-registry");
+}
+
+function listFilesRecursive(root: string): string[] {
+  const results: string[] = [];
+  const walk = (current: string): void => {
+    for (const entry of readdirSync(current)) {
+      const full = join(current, entry);
+      if (statSync(full).isDirectory()) {
+        walk(full);
+      } else {
+        results.push(full);
+      }
+    }
+  };
+  walk(root);
+  return results;
+}
+
 describe("CW-09-02-R5-A-R1 built package export surface", () => {
   let tempRoot = "";
   let installDir = "";
+  let installedPkgRoot = "";
   let exportMap: Record<string, unknown> = {};
   let tarballName = "";
+  let packedFiles: string[] = [];
 
   beforeAll(() => {
-    if (!existsSync(join(packageRoot, "dist", "index.js"))) {
-      execFileSync("pnpm", ["exec", "tsc", "-p", "tsconfig.build.json"], {
+    if (!publishedLayoutIsBundled()) {
+      execFileSync("pnpm", ["build"], {
         cwd: packageRoot,
         stdio: "pipe",
       });
@@ -87,6 +169,15 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
       throw new Error(`npm pack did not report a tarball:\n${pack.stdout}\n${pack.stderr}`);
     }
     const tarballPath = join(packDir, tarballName);
+    const listed = run("tar", ["-tzf", tarballPath], packDir);
+    if (listed.status !== 0) {
+      throw new Error(`tar -tzf failed:\n${listed.stdout}\n${listed.stderr}`);
+    }
+    packedFiles = listed.stdout
+      .split("\n")
+      .map((line) => line.trim().replace(/^package\//, ""))
+      .filter(Boolean)
+      .sort();
     const init = run("npm", ["init", "-y"], installDir, env);
     if (init.status !== 0) {
       throw new Error(`npm init failed:\n${init.stdout}\n${init.stderr}`);
@@ -95,9 +186,10 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
     if (install.status !== 0) {
       throw new Error(`npm install failed:\n${install.stdout}\n${install.stderr}`);
     }
-    const installedPkg = JSON.parse(
-      readFileSync(join(installDir, "node_modules", "@cogniweave", "sdk", "package.json"), "utf8"),
-    ) as { exports?: Record<string, unknown> };
+    installedPkgRoot = join(installDir, "node_modules", "@cogniweave", "sdk");
+    const installedPkg = JSON.parse(readFileSync(join(installedPkgRoot, "package.json"), "utf8")) as {
+      exports?: Record<string, unknown>;
+    };
     exportMap = installedPkg.exports ?? {};
   }, 180_000);
 
@@ -112,6 +204,27 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
     expect(Object.keys(exportMap).sort()).toEqual([".", "./cli-entry", "./contracts", "./models"]);
     expect(exportMap).not.toHaveProperty("./*");
     expect(JSON.stringify(exportMap)).not.toContain("*");
+  });
+
+  it("omits src and standalone internal mutation or resolver modules from the packed layout", () => {
+    const distFiles = packedFiles.filter((file) => file.startsWith("dist/")).sort();
+    expect(distFiles).toEqual(PUBLISHED_DIST_FILES);
+    for (const file of packedFiles) {
+      for (const pattern of FORBIDDEN_PACKED_PATH_PATTERNS) {
+        expect(file, `packed path ${file}`).not.toMatch(pattern);
+      }
+    }
+    const installedFiles = listFilesRecursive(installedPkgRoot).map((file) =>
+      relative(installedPkgRoot, file).replaceAll("\\", "/"),
+    );
+    for (const file of installedFiles) {
+      for (const pattern of FORBIDDEN_PACKED_PATH_PATTERNS) {
+        expect(file, `installed path ${file}`).not.toMatch(pattern);
+      }
+    }
+    for (const relativePath of FORBIDDEN_FS_RELATIVE_PATHS) {
+      expect(existsSync(join(installedPkgRoot, relativePath)), relativePath).toBe(false);
+    }
   });
 
   it("resolves root and documented subpath imports from the packed package", () => {
@@ -230,9 +343,48 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
     expect(allowed.status).toBe(0);
   });
 
-  it("cannot replace the Canonical resolver or invoke repair helpers from the public package", () => {
+  it("cannot load repair helpers or the resolver registry by filesystem path from the packed install", () => {
+    const failures: Record<string, string> = {};
+    for (const relativePath of FORBIDDEN_FS_RELATIVE_PATHS) {
+      const absolute = join(installedPkgRoot, relativePath);
+      expect(existsSync(absolute), relativePath).toBe(false);
+      const href = pathToFileURL(absolute).href;
+      const esm = runNode(`await import(${JSON.stringify(href)});`, installDir);
+      expect(
+        resolveMissingModuleError(esm),
+        `esm ${relativePath} stdout=${esm.stdout} stderr=${esm.stderr}`,
+      ).toBe(true);
+      const cjs = run(
+        "node",
+        [
+          "--input-type=module",
+          "-e",
+          `
+            import { createRequire } from "node:module";
+            const require = createRequire(import.meta.url);
+            require(${JSON.stringify(absolute)});
+          `,
+        ],
+        installDir,
+      );
+      expect(
+        resolveMissingModuleError(cjs),
+        `cjs ${relativePath} stdout=${cjs.stdout} stderr=${cjs.stderr}`,
+      ).toBe(true);
+      failures[relativePath] = `${esm.stderr}\n${cjs.stderr}`;
+    }
+    expect(Object.keys(failures)).toEqual(FORBIDDEN_FS_RELATIVE_PATHS);
+  });
+
+  it("cannot retrieve or invoke the Canonical resolver from the packed public surface or filesystem", () => {
     const result = runNode(
       `
+        import { existsSync } from "node:fs";
+        import { createRequire } from "node:module";
+        import { join } from "node:path";
+        import { pathToFileURL } from "node:url";
+
+        const pkgRoot = ${JSON.stringify(installedPkgRoot)};
         const sdk = await import("@cogniweave/sdk");
         const engine = new sdk.InMemoryCogniWeaveEngine({
           environment: "local",
@@ -247,9 +399,41 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
         if (typeof engine.getEngineCanonicalAuthorizationResolver === "function") {
           throw new Error("resolver lookup leaked on the Engine instance");
         }
-        const hooks = Object.getOwnPropertyNames(engine).concat(Object.getOwnPropertyNames(Object.getPrototypeOf(engine)));
-        if (hooks.includes("registerEngineCanonicalAuthorizationResolver") || hooks.includes("getEngineCanonicalAuthorizationResolver")) {
+        if (typeof engine.canonicalResolver === "function" || typeof engine.canonicalLookup === "function") {
+          throw new Error("resolver or lookup method leaked on the Engine instance");
+        }
+        const proto = Object.getPrototypeOf(engine);
+        const names = Object.getOwnPropertyNames(engine).concat(Object.getOwnPropertyNames(proto));
+        if (names.includes("registerEngineCanonicalAuthorizationResolver") || names.includes("getEngineCanonicalAuthorizationResolver")) {
           throw new Error("resolver hook names visible on the Engine instance");
+        }
+        if (names.includes("canonicalResolver") || names.includes("canonicalLookup")) {
+          throw new Error("resolver or lookup names visible on the Engine instance");
+        }
+        if ("getEngineCanonicalAuthorizationResolver" in sdk || "registerEngineCanonicalAuthorizationResolver" in sdk) {
+          throw new Error("resolver hooks leaked on the package root");
+        }
+
+        const registryPath = join(pkgRoot, "dist/runtime/canonical-resolver-registry.js");
+        if (existsSync(registryPath)) {
+          throw new Error("resolver registry file is present in the installed package");
+        }
+        let registryLoaded = false;
+        try {
+          await import(pathToFileURL(registryPath).href);
+          registryLoaded = true;
+        } catch {}
+        if (registryLoaded) {
+          throw new Error("resolver registry was imported from a filesystem path");
+        }
+        const require = createRequire(import.meta.url);
+        let required = false;
+        try {
+          require(registryPath);
+          required = true;
+        } catch {}
+        if (required) {
+          throw new Error("resolver registry was required from a filesystem path");
         }
         console.log(JSON.stringify({ ok: true }));
       `,
@@ -257,6 +441,13 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
     );
     expect(result.status, result.stdout + result.stderr).toBe(0);
     expect(JSON.parse(result.stdout.trim())).toEqual({ ok: true });
+  });
+
+  it("keeps the published CLI entry working from the packed package", () => {
+    const bin = join(installDir, "node_modules", ".bin", "cogniweave");
+    const result = run(bin, ["--version", "--json"], installDir);
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    expect(result.stdout).toMatch(/0\.1\.0/);
   });
 
   it("filters packed listLiveSourcesForAtom results and preserves authorized repair plus fail-closed production behavior", () => {

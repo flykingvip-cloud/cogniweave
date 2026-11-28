@@ -1,9 +1,13 @@
 /**
  * Package-internal Canonical resolver registration.
  *
- * Not part of the public SDK surface. The public package export allowlist must
- * not expose this module. Registration is write-once so a caller who holds an
- * Engine instance cannot replace the resolver used by REST authorization.
+ * This module is not part of the public SDK surface and must not be published
+ * as a standalone JavaScript file. The SDK build inlines it into the public
+ * entry bundles so packaged consumers cannot load a named getter or register
+ * hook by package specifier or filesystem path.
+ *
+ * Registration is write-once so a caller who holds an Engine instance cannot
+ * replace the resolver used by REST authorization.
  */
 import { UntrustedRuntimeError } from "../errors.js";
 import type { CanonicalResourceScopeResolver } from "../auth/canonical-scope.js";

@@ -740,7 +740,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         llmProvider: llmDistillationProvider,
       });
     this.templateRegistry = stores?.templateRegistry ?? DEFAULT_TEMPLATE_REGISTRY;
-    registerEngineCanonicalAuthorizationResolver(this, this.canonicalResolver());
+    registerEngineCanonicalAuthorizationResolver(this, this.#canonicalResolver());
     // Kick hydrate early so first search/lifecycle sees durable bindings.
     void this.ensureSourceLifecycleHydrated();
   }
@@ -766,10 +766,10 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     kind: CanonicalResourceKind,
     id: string,
   ): Promise<CanonicalResourceScope> {
-    return resolveCanonicalResourceScopeFromLookup(kind, id, this.canonicalLookup());
+    return resolveCanonicalResourceScopeFromLookup(kind, id, this.#canonicalLookup());
   }
 
-  private canonicalResolver(): CanonicalResourceScopeResolver {
+  #canonicalResolver(): CanonicalResourceScopeResolver {
     return {
       resolve: (kind, id) => this.#resolveCanonicalResourceScopeForAuthorization(kind, id),
     };
@@ -789,7 +789,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       authorization: input.authorization,
       declaredScope: input.declaredScope,
       resource: input.resource,
-      resolver: input.resource ? this.canonicalResolver() : undefined,
+      resolver: input.resource ? this.#canonicalResolver() : undefined,
     });
   }
 
@@ -2569,7 +2569,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return target.id;
   }
 
-  private canonicalLookup(): CanonicalResourceLookup {
+  #canonicalLookup(): CanonicalResourceLookup {
     return {
       getAtom: (id) => this.metadataStore.getAtom(id),
       getEvent: (id) => this.metadataStore.getEvent(id),
@@ -2603,7 +2603,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   private async resolveJournalCanonicalScope(journal: WriteJournal): Promise<Scope | undefined> {
-    return deriveJournalScope(journal, this.canonicalLookup());
+    return deriveJournalScope(journal, this.#canonicalLookup());
   }
 
   private async journalsMatchingResolvedScope(

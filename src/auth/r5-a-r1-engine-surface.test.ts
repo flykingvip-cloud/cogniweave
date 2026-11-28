@@ -290,6 +290,20 @@ describe("CW-09-02-R5-A-R1 Engine Direct remaining public-surface remediations",
     expect(typeof pkg.InMemoryCogniWeaveEngine).toBe("function");
   });
 
+  it("does not expose the Canonical resolver or lookup on an Engine instance", () => {
+    const engine = new InMemoryCogniWeaveEngine(localConfig);
+    const proto = Object.getPrototypeOf(engine) as object;
+    const names = [
+      ...Object.getOwnPropertyNames(engine),
+      ...Object.getOwnPropertyNames(proto),
+    ];
+    expect(names).not.toContain("canonicalResolver");
+    expect(names).not.toContain("canonicalLookup");
+    expect(names).not.toContain("getEngineCanonicalAuthorizationResolver");
+    expect(typeof (engine as { canonicalResolver?: unknown }).canonicalResolver).toBe("undefined");
+    expect(typeof (engine as { canonicalLookup?: unknown }).canonicalLookup).toBe("undefined");
+  });
+
   it("filters listLiveSourcesForAtom to the atom Canonical Scope and hides foreign bindings", async () => {
     const store = new InMemoryMetadataStore();
     const fixture = await seedLiveSourceFixture(store);
