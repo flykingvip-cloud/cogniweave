@@ -53,8 +53,21 @@ What the SDK does guarantee:
 A process that mixes a production request with a test harness marker
 (`VITEST=true` or `COGNIWEAVE_TEST_HARNESS=1`) at module evaluation is
 `mixedConfiguration` / `configurationState: "mixed_or_invalid"`. That is a
-distinct rejection state, not ordinary non-production, and fail-closes
-runtime creation paths.
+distinct rejection state, not ordinary non-production. It fail-closes every
+public store factory and CLI store path before any store is created,
+connected, or initialized, including:
+
+- `createAdapterBundle()` and the official production adapter factory
+- `PostgresMetadataStore` and `createPgSqlClient()`
+- `LocalMetadataStore` and `openLocalMetadataStoreReadonly()`
+- `PgVectorStore`, `Neo4jGraphStore`, placeholder stores, and in-memory stores
+- `migrateLocalCanonicalToPostgres()`
+- CLI `bootstrap-schema`, `recover`, `compact`, `doctor`, `journal-stats`,
+  `serve`, and any other command that would connect a store, run schema,
+  recover, mutate a journal, or maintain indexes
+
+The error states that this is a runtime configuration conflict. After the
+error, execution does not fall back to ordinary non-production and continue.
 
 ## Official production path
 

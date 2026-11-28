@@ -1,5 +1,5 @@
 import { createAdapterBundle } from "../adapters/factory.js";
-import { getProcessTrustSnapshot, isProductionTrustBoundaryActive } from "../auth/process-trust.js";
+import { assertNotMixedOrInvalidProcessConfiguration, getProcessTrustSnapshot, isProductionTrustBoundaryActive } from "../auth/process-trust.js";
 import { resolveEngineTrustedRuntime, type TrustedRuntime } from "../auth/trusted-runtime.js";
 import { ProductionBootstrapError } from "../errors.js";
 import type { EngineConfig } from "../models.js";
@@ -27,6 +27,7 @@ export function createCogniWeaveRuntime(
   config: EngineConfig,
   options?: CreateCogniWeaveRuntimeOptions,
 ): CogniWeaveRuntime {
+  assertNotMixedOrInvalidProcessConfiguration("createCogniWeaveRuntime()");
   if (isProductionTrustBoundaryActive()) {
     const trust = getProcessTrustSnapshot();
     throw new ProductionBootstrapError(

@@ -942,6 +942,7 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
           "markOfficialProductionTrustFailedClosed",
           "isProductionTrustBoundaryActive",
           "isMixedOrInvalidProcessConfiguration",
+          "assertNotMixedOrInvalidProcessConfiguration",
           "clearSimulatedProductionRuntimeSlot",
         ].filter((name) => typings.includes(name));
         if (leakedTypings.length > 0) {
@@ -967,6 +968,7 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
           "markOfficialProductionTrustFailedClosed",
           "isProductionTrustBoundaryActive",
           "isMixedOrInvalidProcessConfiguration",
+          "assertNotMixedOrInvalidProcessConfiguration",
           "clearSimulatedProductionRuntimeSlot",
         ].filter((name) => name in sdk);
         if (leakedExports.length > 0) {
@@ -1429,6 +1431,7 @@ describe("CW-09-02-R5-A-R1 built package export surface", () => {
           "markOfficialProductionTrustFailedClosed",
           "isProductionTrustBoundaryActive",
           "isMixedOrInvalidProcessConfiguration",
+          "assertNotMixedOrInvalidProcessConfiguration",
           "createSealedProductionRuntime",
           "issueProductionRuntimePermit",
           "createProductionEngine",

@@ -1,3 +1,4 @@
+import { assertNotMixedOrInvalidProcessConfiguration } from "../auth/process-trust.js";
 import { StorageConsistencyError } from "../errors.js";
 import type { DistillationResult } from "../models.js";
 import type { Scope } from "../models.js";
@@ -78,6 +79,7 @@ export class PgVectorStore implements VectorStore {
   private readonly embeddingProvider?: EmbeddingProvider;
 
   constructor(config: PgVectorStoreConfig) {
+    assertNotMixedOrInvalidProcessConfiguration("PgVectorStore");
     this.schema = config.schema ?? "public";
     this.client = config.client;
     this.embeddingDimension = config.embeddingDimension ?? 1536;

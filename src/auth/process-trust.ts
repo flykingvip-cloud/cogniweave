@@ -1,3 +1,4 @@
+import { ProductionBootstrapError } from "../errors.js";
 import type { MemorySubject, ScopeVisibility } from "../models.js";
 /**
  * CW-09-02-R5-B-R1: process-start trust claim and official production identity.
@@ -282,6 +283,35 @@ export function isProductionTrustBoundaryActive(): boolean {
  */
 export function isMixedOrInvalidProcessConfiguration(): boolean {
   return snapshot.mixedConfiguration || snapshot.configurationState === "mixed_or_invalid";
+}
+
+/**
+ * Same-bundle guard for every public store factory, store constructor, SQL
+ * client factory, and CLI store entry. Refuses mixed/invalid configuration
+ * before any store create, connect, schema, recovery, or journal mutation.
+ * Not a public SDK export.
+ */
+export function assertNotMixedOrInvalidProcessConfiguration(action: string): void {
+  if (!isMixedOrInvalidProcessConfiguration()) {
+    return;
+  }
+  const trust = getProcessTrustSnapshot();
+  throw new ProductionBootstrapError(
+    `${action} refused: runtime configuration conflict. Production markers and test harness markers are both present. Mixed/invalid configuration is a distinct rejection state and does not fall back to ordinary non-production.`,
+    "mixed_test_and_production_configuration",
+    Object.freeze({
+      assemblyId: "unissued",
+      trustClass: "none",
+      runtimeEnvironment: trust.engineEnvironment,
+      processTrustMode: trust.mode,
+      bootstrapAuthorityId: trust.authorityId,
+      createdAt: new Date().toISOString(),
+      verificationResult: "failed",
+      failureReason: "mixed_test_and_production_configuration",
+      services: {},
+      canonicalStoreBindingQueryAssociation: "missing",
+    }),
+  );
 }
 
 export function isSimulatedProductionProcess(): boolean {

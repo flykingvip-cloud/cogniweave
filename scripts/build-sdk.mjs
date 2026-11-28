@@ -161,7 +161,8 @@ function bundleTypings() {
       typings.includes("applyOfficialProductionTrustEstablishment") ||
       typings.includes("markOfficialProductionTrustFailedClosed") ||
       typings.includes("isProductionTrustBoundaryActive") ||
-      typings.includes("isMixedOrInvalidProcessConfiguration")
+      typings.includes("isMixedOrInvalidProcessConfiguration") ||
+      typings.includes("assertNotMixedOrInvalidProcessConfiguration")
     ) {
       throw new Error(`${item.outfile} re-exposes a Trusted Runtime unpack helper, production issuance permit, or test-only process trust hook`);
     }

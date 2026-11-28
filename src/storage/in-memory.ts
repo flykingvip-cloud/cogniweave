@@ -1,3 +1,4 @@
+import { assertNotMixedOrInvalidProcessConfiguration } from "../auth/process-trust.js";
 import { createDataPlaneId } from "../keys.js";
 import type {
   AtomStatus,
@@ -36,6 +37,10 @@ function mergeDistinct(values: string[]): string[] {
 }
 
 export class InMemoryMetadataStore implements MetadataStore {
+  constructor() {
+    assertNotMixedOrInvalidProcessConfiguration("InMemoryMetadataStore");
+  }
+
   private readonly ingestions = new Map<
     string,
     { ingestionId: string; ingestionChecksum: string; status: "RECEIVED" }
@@ -509,6 +514,10 @@ export class InMemoryMetadataStore implements MetadataStore {
 }
 
 export class InMemoryGraphStore implements GraphStore {
+  constructor() {
+    assertNotMixedOrInvalidProcessConfiguration("InMemoryGraphStore");
+  }
+
   private readonly nodes = new Map<string, { nodeType: string }>();
   private readonly edges = new Map<
     string,
@@ -592,6 +601,10 @@ export class InMemoryGraphStore implements GraphStore {
 }
 
 export class InMemoryVectorStore implements VectorStore {
+  constructor() {
+    assertNotMixedOrInvalidProcessConfiguration("InMemoryVectorStore");
+  }
+
   private readonly documents = new Map<string, string>();
 
   async syncFromDistillation(result: DistillationResult): Promise<{ documentCount: number }> {

@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { assertNotMixedOrInvalidProcessConfiguration } from "../auth/process-trust.js";
 import { StorageConsistencyError } from "../errors.js";
 import { createDataPlaneId } from "../keys.js";
 import type {
@@ -305,6 +306,7 @@ export class PostgresMetadataStore implements MetadataStore {
   private readonly transactionContext = new AsyncLocalStorage<PostgresSqlTransaction>();
 
   constructor(config: PostgresMetadataStoreConfig) {
+    assertNotMixedOrInvalidProcessConfiguration("PostgresMetadataStore");
     this.schema = config.schema ?? "public";
     this.client = config.client;
     this.tables = POSTGRES_METADATA_TABLES;

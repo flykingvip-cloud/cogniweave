@@ -1,6 +1,6 @@
 import { ProductionBootstrapError } from "../errors.js";
 import type { EngineConfig } from "../models.js";
-import { getProcessTrustSnapshot, isProductionProcess, isProductionTrustBoundaryActive } from "../auth/process-trust.js";
+import { assertNotMixedOrInvalidProcessConfiguration, getProcessTrustSnapshot, isProductionProcess, isProductionTrustBoundaryActive } from "../auth/process-trust.js";
 import {
   InMemoryGraphStore,
   InMemoryMetadataStore,
@@ -50,6 +50,7 @@ function denyPublicProductionAdapterBundle(): never {
  * Ordinary createAdapterBundle() is refused in a production process.
  */
 export function createOfficialProductionAdapterBundle(config: EngineConfig): AdapterBundle {
+  assertNotMixedOrInvalidProcessConfiguration("createOfficialProductionAdapterBundle()");
   if (!isProductionProcess()) {
     denyPublicProductionAdapterBundle();
   }
@@ -92,6 +93,7 @@ function createMetadataStore(config: EngineConfig): MetadataStore {
 }
 
 export function createAdapterBundle(config: EngineConfig): AdapterBundle {
+  assertNotMixedOrInvalidProcessConfiguration("createAdapterBundle()");
   if (isProductionTrustBoundaryActive() && !officialProductionBundleGate.open) {
     denyPublicProductionAdapterBundle();
   }

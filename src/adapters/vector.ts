@@ -1,3 +1,4 @@
+import { assertNotMixedOrInvalidProcessConfiguration } from "../auth/process-trust.js";
 import { StorageConsistencyError } from "../errors.js";
 import type { DistillationResult } from "../models.js";
 import type { MetadataBundle, VectorStore } from "../storage/types.js";
@@ -11,6 +12,7 @@ export class PlaceholderVectorStore implements VectorStore {
   descriptor: AdapterDescriptor;
 
   constructor(config: BackendAdapterConfig) {
+    assertNotMixedOrInvalidProcessConfiguration("PlaceholderVectorStore");
     this.descriptor = {
       kind: "vector",
       backend: config.backend,

@@ -37,7 +37,7 @@ import {
   type EngineDirectAuthorizationResult,
 } from "../auth/engine-invocation.js";
 import { sameMemorySubject } from "../auth/delegation.js";
-import { getProcessTrustSnapshot, isProductionProcess, isProductionTrustBoundaryActive } from "../auth/process-trust.js";
+import { assertNotMixedOrInvalidProcessConfiguration, getProcessTrustSnapshot, isProductionProcess, isProductionTrustBoundaryActive } from "../auth/process-trust.js";
 import {
   bindEngineTrustedRuntime,
   createImplicitLocalRuntime,
@@ -768,6 +768,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     config: EngineConfig,
     stores?: InMemoryEngineConstructionStores,
   ) {
+    assertNotMixedOrInvalidProcessConfiguration("InMemoryCogniWeaveEngine");
     if (isProductionTrustBoundaryActive() && !productionConstructionGate.open) {
       throw new ProductionBootstrapError(
         "Ordinary callers cannot construct a production Engine; use the official production bootstrap",

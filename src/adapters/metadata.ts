@@ -1,3 +1,4 @@
+import { assertNotMixedOrInvalidProcessConfiguration } from "../auth/process-trust.js";
 import { StorageConsistencyError } from "../errors.js";
 import type {
   EntityRecord,
@@ -20,6 +21,7 @@ export class PlaceholderMetadataStore implements MetadataStore {
   descriptor: AdapterDescriptor;
 
   constructor(config: BackendAdapterConfig) {
+    assertNotMixedOrInvalidProcessConfiguration("PlaceholderMetadataStore");
     this.descriptor = {
       kind: "metadata",
       backend: config.backend,

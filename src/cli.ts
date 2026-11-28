@@ -3,7 +3,7 @@ import { pathToFileURL } from "node:url";
 import type { AdapterBundle } from "./adapters/factory.js";
 import { createAdapterBundle } from "./adapters/factory.js";
 import { bootstrapProductionTrustedRuntime } from "./auth/production-bootstrap.js";
-import { getProcessTrustSnapshot, isProductionTrustBoundaryActive } from "./auth/process-trust.js";
+import { assertNotMixedOrInvalidProcessConfiguration, getProcessTrustSnapshot, isMixedOrInvalidProcessConfiguration, isProductionTrustBoundaryActive } from "./auth/process-trust.js";
 import type { EngineConfig, EngineEnvironment, ScopeInput, ScopeVisibility } from "./models.js";
 import {
   createCogniWeaveHttpServer,
@@ -548,6 +548,7 @@ export interface CogniWeaveServePlan {
 export async function bootstrapAdapterBundle(
   bundle: AdapterBundle,
 ): Promise<CogniWeaveCliBootstrapTargetResult[]> {
+  assertNotMixedOrInvalidProcessConfiguration("bootstrapAdapterBundle()");
   const targets = [
     {
       kind: "metadata" as const,
@@ -732,6 +733,7 @@ async function readPackageVersion(): Promise<string> {
 export async function buildCogniWeaveCliConfigSnapshot(
   options: CogniWeaveCliOptions,
 ): Promise<CogniWeaveCliConfigSnapshot> {
+  assertNotMixedOrInvalidProcessConfiguration("buildCogniWeaveCliConfigSnapshot()");
   const runtime = buildCogniWeaveEngineConfig(options);
   const bundle = createAdapterBundle(runtime);
   const version = await readPackageVersion();
@@ -751,6 +753,7 @@ export async function buildCogniWeaveCliConfigSnapshot(
 export async function buildCogniWeaveServePlan(
   options: CogniWeaveCliOptions,
 ): Promise<CogniWeaveServePlan> {
+  assertNotMixedOrInvalidProcessConfiguration("buildCogniWeaveServePlan()");
   const config = buildCogniWeaveEngineConfig(options);
   const bundle = createAdapterBundle(config);
   const snapshot = await buildCogniWeaveCliConfigSnapshot(options);
@@ -857,6 +860,15 @@ export async function runCogniWeaveCli(
     if (options.helpRequested || options.command === "help") {
       io.log(printHelp());
       return 0;
+    }
+
+    if (isMixedOrInvalidProcessConfiguration()) {
+      await emitFailure(
+        currentAction,
+        "INVALID_ARGUMENT",
+        "Runtime configuration conflict: production markers and test harness markers are both present. Mixed/invalid configuration is a distinct rejection state and does not fall back to ordinary non-production. Store, schema, recovery, and journal operations are not executed.",
+      );
+      return 1;
     }
 
     if (isProductionTrustBoundaryActive()) {
