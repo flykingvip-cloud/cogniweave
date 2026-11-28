@@ -38,6 +38,7 @@ import type {
   RestResponse,
   WriteBackRequest,
 } from "./contracts.js";
+import { getEngineCanonicalAuthorizationResolver } from "../runtime/in-memory-engine.js";
 import type { CogniWeaveRestService } from "./service.js";
 
 export type CogniWeaveHttpAuthPrincipal = RestPrincipal;
@@ -177,10 +178,6 @@ function mapAuthorizationThrownError(error: unknown): RestResponse<unknown> | nu
 type EngineLike = {
   trustedRuntime?: unknown;
   config?: { environment?: string };
-  resolveCanonicalResourceScopeForAuthorization?: (
-    kind: CanonicalResourceKind,
-    id: string,
-  ) => Promise<CanonicalResourceScope>;
 };
 
 function readEngine(service: CogniWeaveRestService): EngineLike | undefined {
@@ -370,8 +367,9 @@ async function routeEnvelopeInner(
   const engineResolver: CanonicalResourceScopeResolver = {
     resolve: (kind, id) => {
       const engine = readEngine(service);
-      if (engine?.resolveCanonicalResourceScopeForAuthorization) {
-        return engine.resolveCanonicalResourceScopeForAuthorization(kind, id);
+      const resolver = engine ? getEngineCanonicalAuthorizationResolver(engine) : undefined;
+      if (resolver) {
+        return resolver.resolve(kind, id);
       }
       return service.resolveCanonicalResourceScope(kind, id);
     },

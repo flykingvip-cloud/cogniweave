@@ -686,6 +686,24 @@ function assertCanonicalScopeHierarchy(distillation: DistillationResult): void {
   }
 }
 
+
+const engineCanonicalAuthorizationResolvers = new WeakMap<object, CanonicalResourceScopeResolver>();
+
+/** Package-internal hook for REST authorization gates and tests. Not a public SDK API. */
+export function getEngineCanonicalAuthorizationResolver(
+  engine: object,
+): CanonicalResourceScopeResolver | undefined {
+  return engineCanonicalAuthorizationResolvers.get(engine);
+}
+
+/** Package-internal registration used by the engine constructor and tests. */
+export function registerEngineCanonicalAuthorizationResolver(
+  engine: object,
+  resolver: CanonicalResourceScopeResolver,
+): void {
+  engineCanonicalAuthorizationResolvers.set(engine, resolver);
+}
+
 export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   readonly config: EngineConfig;
 
@@ -739,6 +757,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         llmProvider: llmDistillationProvider,
       });
     this.templateRegistry = stores?.templateRegistry ?? DEFAULT_TEMPLATE_REGISTRY;
+    registerEngineCanonicalAuthorizationResolver(this, this.canonicalResolver());
     // Kick hydrate early so first search/lifecycle sees durable bindings.
     void this.ensureSourceLifecycleHydrated();
   }
@@ -760,7 +779,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return createTrustedRuntime({ environment: this.config.environment });
   }
 
-  resolveCanonicalResourceScopeForAuthorization(
+  #resolveCanonicalResourceScopeForAuthorization(
     kind: CanonicalResourceKind,
     id: string,
   ): Promise<CanonicalResourceScope> {
@@ -769,7 +788,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
 
   private canonicalResolver(): CanonicalResourceScopeResolver {
     return {
-      resolve: (kind, id) => this.resolveCanonicalResourceScopeForAuthorization(kind, id),
+      resolve: (kind, id) => this.#resolveCanonicalResourceScopeForAuthorization(kind, id),
     };
   }
 
@@ -1973,6 +1992,9 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   async upsertAtoms(atoms: MemoryAtom[], options?: UpsertAtomsOptions): Promise<AtomUpsertDecision[]> {
+    if (atoms.length === 0) {
+      return [];
+    }
     const firstScope = atoms[0]?.scope;
     await this.assertEngineAuthorized({
       method: "upsertAtoms",
@@ -1980,6 +2002,11 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       authorization: options?.authorization,
       declaredScope: firstScope,
     });
+    for (const atom of atoms) {
+      if (!isCompleteScope(atom.scope) || !firstScope || !matchesScope(atom.scope, firstScope)) {
+        throw new ScopeViolationError("upsertAtoms mixed-scope batch is not authorized");
+      }
+    }
     const decisions: AtomUpsertDecision[] = [];
 
     for (const incomingAtom of atoms.map((atom) => attachDedupKey(withAtomV2Defaults(atom)))) {
@@ -2202,7 +2229,6 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     query: string,
     options?: SearchEvidenceOptions,
   ): Promise<EvidenceSearchResult[]> {
-    await this.ensureSourceLifecycleHydrated();
     const requestedScope = resolveReadScopeOrThrow(options?.scope, this.config, "searchEvidence");
     await this.assertEngineAuthorized({
       method: "searchEvidence",
@@ -2210,6 +2236,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       authorization: options?.authorization,
       declaredScope: requestedScope,
     });
+    await this.ensureSourceLifecycleHydrated();
     if (options?.caller) {
       const auth = await this.authorizeQueryAccess(requestedScope, options.caller);
       if (!auth.allowed) {
@@ -2224,7 +2251,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
           matchesScope(evidence.scope, requestedScope),
         );
     return scoped
-      .filter((evidence) => this.isEvidenceRetrievable(evidence))
+      .filter((evidence) => this.#isEvidenceRetrievable(evidence))
       .map((evidence) => scoreEvidenceSearchResult({ evidence, query }))
       .filter((result): result is EvidenceSearchResult => Boolean(result))
       .filter((result) => result.score >= threshold)
@@ -2243,7 +2270,6 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
    * Fail-closed on authorize deny (empty list — no enumeration).
    */
   async queryAtoms(options: QueryAtomsOptions): Promise<AtomQueryHit[]> {
-    await this.ensureSourceLifecycleHydrated();
     const requestedScope = resolveReadScopeOrThrow(options.scope, this.config, "queryAtoms");
     const direct = await this.assertEngineAuthorized({
       method: "queryAtoms",
@@ -2251,6 +2277,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       authorization: options.authorization,
       declaredScope: requestedScope,
     });
+    await this.ensureSourceLifecycleHydrated();
     if (!direct.unauthenticatedLocal) {
       if (!sameMemorySubject(options.caller, direct.principal.subject) && options.caller.ownerId !== direct.principal.userId) {
         throw new ScopeViolationError("queryAtoms caller does not match trusted principal subject");
@@ -2586,9 +2613,9 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       resource: { kind, id },
     });
     if (direct.unauthenticatedLocal) {
-      return this.resolveCanonicalResourceScopeForAuthorization(kind, id);
+      return this.#resolveCanonicalResourceScopeForAuthorization(kind, id);
     }
-    const resolved = await this.resolveCanonicalResourceScopeForAuthorization(kind, id);
+    const resolved = await this.#resolveCanonicalResourceScopeForAuthorization(kind, id);
     return resolved;
   }
 
@@ -2682,7 +2709,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       authorization: _options.authorization,
       resource: { kind: objectType, id: _options.objectId },
     });
-    const resolved = await this.resolveCanonicalResourceScopeForAuthorization(objectType, _options.objectId);
+    const resolved = await this.#resolveCanonicalResourceScopeForAuthorization(objectType, _options.objectId);
     if (resolved.unresolvedReason === "store_unavailable") {
       throw new StoreUnavailableError("rebuildFromTruth canonical store unavailable");
     }
@@ -2751,12 +2778,28 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       journalsRebuilt += 1;
     }
 
+    const authorizedScope = options?.scope ? resolveScope(options.scope, this.config) : undefined;
+    const scopedJournals = await this.journalsMatchingResolvedScope(
+      await this.metadataStore.listJournals(),
+      authorizedScope,
+    );
+    const scopedJournalIds = new Set(scopedJournals.map((journal) => journal.id));
     const writeOperations =
       typeof this.metadataStore.listWriteOperations === "function"
         ? await this.metadataStore.listWriteOperations()
         : [];
+    const writeOperationCount = writeOperations.filter((op) => {
+      const journalId = op.result?.journalId;
+      return Boolean(journalId && scopedJournalIds.has(journalId));
+    }).length;
     const orphanSourceBindingIds: string[] = [];
     for (const binding of this.sourceBindings.values()) {
+      if (!isCompleteScope(binding.scope)) {
+        continue;
+      }
+      if (authorizedScope && !matchesScope(binding.scope, authorizedScope)) {
+        continue;
+      }
       const live = this.liveSourceObjectLinks({ sourceBindingId: binding.id });
       if (live.length === 0) {
         orphanSourceBindingIds.push(binding.id);
@@ -2766,22 +2809,31 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     return {
       status: "RECOVERED",
       journalsRebuilt,
-      writeOperationCount: writeOperations.length,
-      journalCount: (await this.metadataStore.listJournals()).length,
+      writeOperationCount,
+      journalCount: scopedJournals.length,
       orphanSourceBindingIds,
     };
   }
 
   async compactJournals(options?: CompactJournalsOptions): Promise<CompactJournalsResult> {
+    const requestedScope = options?.scope
+      ? resolveScope(options.scope, this.config)
+      : undefined;
+    if (!requestedScope && this.config.environment !== "local") {
+      throw new ScopeViolationError("compactJournals requires explicit scope");
+    }
     await this.assertEngineAuthorized({
       method: "compactJournals",
       mode: "manage",
       authorization: options?.authorization,
-      declaredScope: options?.scope,
+      declaredScope: requestedScope,
     });
     const keepCompleted = Math.max(0, options?.keepCompleted ?? 20);
     const dryRun = options?.dryRun === true;
-    const journals = await this.metadataStore.listJournals();
+    let journals = await this.metadataStore.listJournals();
+    if (requestedScope) {
+      journals = await this.journalsMatchingResolvedScope(journals, requestedScope);
+    }
     const pinnedJournalIds = new Set<string>();
     if (typeof this.metadataStore.listWriteOperations === "function") {
       for (const op of await this.metadataStore.listWriteOperations()) {
@@ -2948,7 +3000,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   }
 
   /** True when evidence is still eligible for retrieval given lifecycle bindings/links. */
-  isEvidenceRetrievable(evidence: EvidenceRecord): boolean {
+  #isEvidenceRetrievable(evidence: EvidenceRecord): boolean {
     const liveLinks = this.liveSourceObjectLinks({
       objectType: "evidence",
       objectId: evidence.id,
@@ -2965,28 +3017,6 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
         continue;
       }
       if (this.evidenceMatchesBinding(evidence, binding)) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  getSourceBindingStatus(selector: SourceLifecycleSelector): SourceLifecycleMode | null {
-    const binding = this.findSourceBinding(selector);
-    return binding?.status ?? null;
-  }
-
-  /** Path / URI still eligible for OpenBot manager search after lifecycle ops. */
-  isSourcePathRetrievable(pathOrUri: string): boolean {
-    const p = pathOrUri.split("\\").join("/");
-    for (const binding of this.sourceBindings.values()) {
-      if (binding.status === "active") {
-        continue;
-      }
-      if (
-        (binding.sourceIdentityId && p.includes(binding.sourceIdentityId)) ||
-        (binding.sourceLocator && p.includes(binding.sourceLocator.split("\\").join("/")))
-      ) {
         return false;
       }
     }
@@ -3021,6 +3051,9 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
   private ensureSourceBinding(selector: SourceLifecycleSelector, scope: Scope): SourceBinding {
     const existing = this.findSourceBinding(selector);
     if (existing) {
+      if (!matchesScope(existing.scope, scope)) {
+        throw new ScopeViolationError("source binding is not authorized");
+      }
       return existing;
     }
     const now = new Date().toISOString();
@@ -3065,6 +3098,10 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     await this.ensureSourceLifecycleHydrated();
     const existingReceipt = await this.loadSourceLifecycleReceipt(input.operationId);
     if (existingReceipt) {
+      const receiptBinding = this.sourceBindings.get(existingReceipt.sourceBindingId);
+      if (!receiptBinding || !matchesScope(receiptBinding.scope, input.subject.scope)) {
+        throw new ScopeViolationError("source binding is not authorized");
+      }
       if (existingReceipt.currentStatus !== target) {
         throw new IdempotencyConflictError(
           `operationId ${input.operationId} already completed with status=${existingReceipt.currentStatus}`,

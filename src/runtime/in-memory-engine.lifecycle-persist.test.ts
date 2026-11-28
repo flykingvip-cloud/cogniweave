@@ -78,10 +78,6 @@ describe("InMemoryCogniWeaveEngine source lifecycle persistence", () => {
     expect(afterRestart.map((r) => r.evidence.uri)).not.toContain(`msrc://${identity}`);
     const keep = await engine2.searchEvidence("unrelated keep me", { scope });
     expect(keep.some((r) => r.evidence.uri.includes("other.jsonl"))).toBe(true);
-    expect(engine2.getSourceBindingStatus({ mode: "identity", sourceIdentityId: identity })).toBe(
-      "archived",
-    );
-    expect(engine2.isSourcePathRetrievable(`msrc://${identity}/chunk`)).toBe(false);
 
     const evidenceBefore = (await store2.listEvidence()).length;
     await engine2.restoreSource({

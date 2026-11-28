@@ -41,19 +41,30 @@ bootstrap and public authorization entry points after R5.
 
 ### Engine / SDK direct
 
-See `ENGINE_DIRECT_AUTH_ENTRYPOINTS` in `src/auth/engine-invocation.ts`.
-Notable methods: `rebuildFromTruth`, `repairIndexes`, `recoverFromCanonical`,
-`compactJournals`, `writeBack`, `ingest`, `queryAtoms`, resource traces, and
-source lifecycle operations. Missing security context or authoritative stores
-fail closed in service/cloud.
+See `ENGINE_DIRECT_AUTH_ENTRYPOINTS` in `src/auth/engine-invocation.ts` for the
+remaining public Engine I/O surface. Notable methods: `rebuildFromTruth`,
+`repairIndexes`, `recoverFromCanonical`, `compactJournals`, `writeBack`,
+`ingest`, `queryAtoms` / `queryAtomsHybrid` / `searchEvidence`, resource
+traces, and source lifecycle operations. Missing security context or
+authoritative stores fail closed in service/cloud.
+
+The inventory is not itself proof of coverage; each public method must call
+the unified gate before Canonical or Derived I/O. Scoped batch methods
+(`upsertAtoms`, `compactJournals`, `recoverFromCanonical`, source lifecycle)
+must not apply one Scope grant to another Scope's data or receipt IDs.
 
 `ensureMemorySubjectBinding()` is not a production binding-provision API. It
 fails closed in service/cloud so a caller cannot self-create a live binding.
 Local unauthenticated engines may still use it as a test helper.
 
-`resolveCanonicalResourceScopeForAuthorization()` is an internal lookup used
-by authorization gates. The public `resolveCanonicalResourceScope()` is
-itself authorized in service/cloud.
+Ungated Canonical ownership lookup is engine-internal (not on
+`CogniWeaveEngine` or the instance public surface). The public
+`resolveCanonicalResourceScope()` is itself authorized in service/cloud.
+`getSourceBindingStatus` and `isSourcePathRetrievable` are no longer public
+Engine methods. `isEvidenceRetrievable` is a private helper used after
+authorization inside `searchEvidence`.
+`rebuildFromTruth` / `repairDerivedIndexes` in `src/journal/repair.ts` are
+engine-internal and are not exported from the package root.
 
 ## Non-goals still unverified
 

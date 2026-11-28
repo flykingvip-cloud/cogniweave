@@ -250,21 +250,13 @@ export interface CogniWeaveEngine {
   getWriteJournal(journalId: string, scope?: ScopeInput, options?: EngineCallOptions): Promise<WriteJournal>;
   /**
    * CW-09-01 / CW-09-02-R5: resolve Canonical ownership, then authorize the caller
-   * in service/cloud. Use `resolveCanonicalResourceScopeForAuthorization` only from
-   * an authorization gate that will apply its own policy.
+   * in service/cloud. Ungated ownership lookup is an engine-internal authorization
+   * helper and is not part of this public interface.
    */
   resolveCanonicalResourceScope(
     kind: CanonicalResourceKind,
     id: string,
     options?: EngineCallOptions,
-  ): Promise<CanonicalResourceScope>;
-  /**
-   * Internal authorization lookup. Does not enforce caller authorization and must
-   * not be treated as a public data-access API.
-   */
-  resolveCanonicalResourceScopeForAuthorization?(
-    kind: CanonicalResourceKind,
-    id: string,
   ): Promise<CanonicalResourceScope>;
 
   /**

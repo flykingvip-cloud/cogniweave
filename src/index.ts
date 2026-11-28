@@ -346,8 +346,6 @@ export {
 
 export type { GraphStore, MetadataBundle, MetadataStore, VectorStore } from "./storage/types.js";
 
-export { rebuildFromTruth, repairDerivedIndexes } from "./journal/repair.js";
-
 export type {
   AdapterDescriptor,
   AdapterKind,

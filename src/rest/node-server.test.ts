@@ -11,7 +11,10 @@ import { createMemoryPartitionKeyV1 } from "../keys.js";
 import type { MemorySubject, Scope } from "../models.js";
 import { createMemorySubjectBinding } from "../subject/binding.js";
 import { CogniWeaveMemoryResourceAdapter } from "../resource/index.js";
-import { InMemoryCogniWeaveEngine } from "../runtime/in-memory-engine.js";
+import {
+  InMemoryCogniWeaveEngine,
+  registerEngineCanonicalAuthorizationResolver,
+} from "../runtime/in-memory-engine.js";
 import { InMemoryMetadataStore } from "../storage/in-memory.js";
 import { handleCogniWeaveHttpRequest, RESOURCE_ID_ROUTE_REGISTRY, routeCogniWeaveHttpRequest } from "./node-server.js";
 import { CogniWeaveRestService } from "./service.js";
@@ -592,10 +595,12 @@ describe("CW-09-01 REST canonical scope authorization", () => {
     const throwingEngine = {
       trustedRuntime: seeded.runtime,
       config: { environment: "service" },
-      async resolveCanonicalResourceScopeForAuthorization() {
+    };
+    registerEngineCanonicalAuthorizationResolver(throwingEngine, {
+      async resolve() {
         throw new Error("canonical store down");
       },
-    };
+    });
     const throwingStore = new CogniWeaveRestService(throwingEngine as never);
     const storeDown = await routeCogniWeaveHttpRequest(
       throwingStore,

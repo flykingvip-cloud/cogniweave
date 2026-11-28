@@ -151,11 +151,10 @@ describe("InMemoryCogniWeaveEngine source lifecycle", () => {
       reasonCode: "TEST_PURGE",
     });
     expect(purged.currentStatus).toBe("purged");
-    expect(engine.getSourceBindingStatus({ mode: "identity", sourceIdentityId: identity })).toBe(
-      "purged",
-    );
-    expect(engine.isSourcePathRetrievable(`msrc://${identity}/chunk`)).toBe(false);
-    expect(engine.isSourcePathRetrievable("agents/main/sessions/other.jsonl")).toBe(true);
+    const afterPurge = await engine.searchEvidence("lifecycle alpha secret", { scope });
+    expect(afterPurge.map((r) => r.evidence.uri)).not.toContain(`msrc://${identity}`);
+    const keepAfterPurge = await engine.searchEvidence("unrelated keep me", { scope });
+    expect(keepAfterPurge.some((r) => r.evidence.uri.includes("other.jsonl"))).toBe(true);
   });
 
   it("supports legacy locator selectors", async () => {
@@ -182,7 +181,6 @@ describe("InMemoryCogniWeaveEngine source lifecycle", () => {
 
     const hits = await engine.searchEvidence("locator only secret", { scope });
     expect(hits).toHaveLength(0);
-    expect(engine.isSourcePathRetrievable(locator)).toBe(false);
   });
 
   it("keeps multi-source evidence after forget; purge only deletes orphans", async () => {

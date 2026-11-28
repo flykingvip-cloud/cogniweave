@@ -1,3 +1,8 @@
+/**
+ * Engine-internal derived-index helpers. Not part of the public SDK API.
+ * Mutation must go through authorized Engine methods (`rebuildFromTruth`,
+ * `repairIndexes`, `recoverFromCanonical`).
+ */
 import type { WriteJournal } from "../models.js";
 import type { GraphStore, MetadataStore, VectorStore } from "../storage/types.js";
 
