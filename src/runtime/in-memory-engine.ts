@@ -48,6 +48,7 @@ import {
   repairDerivedIndexes as repairJournalDerivedIndexes,
   rebuildFromTruth as rebuildDerivedFromTruth,
 } from "../journal/repair.js";
+import { registerEngineCanonicalAuthorizationResolver } from "./canonical-resolver-registry.js";
 import {
   computeDedupKey,
   computeEventKey,
@@ -684,24 +685,6 @@ function assertCanonicalScopeHierarchy(distillation: DistillationResult): void {
   for (const relation of distillation.relations) {
     assertScopeAccess(relation.scope, eventScope, "writeBack.relation");
   }
-}
-
-
-const engineCanonicalAuthorizationResolvers = new WeakMap<object, CanonicalResourceScopeResolver>();
-
-/** Package-internal hook for REST authorization gates and tests. Not a public SDK API. */
-export function getEngineCanonicalAuthorizationResolver(
-  engine: object,
-): CanonicalResourceScopeResolver | undefined {
-  return engineCanonicalAuthorizationResolvers.get(engine);
-}
-
-/** Package-internal registration used by the engine constructor and tests. */
-export function registerEngineCanonicalAuthorizationResolver(
-  engine: object,
-  resolver: CanonicalResourceScopeResolver,
-): void {
-  engineCanonicalAuthorizationResolvers.set(engine, resolver);
 }
 
 export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
@@ -2938,32 +2921,46 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       authorization: options?.authorization,
       resource: { kind: "atom", id: atomId },
     });
-    await this.ensureSourceLifecycleHydrated();
     const id = atomId.trim();
     if (!id) {
       return [];
     }
+    const resolved = await this.#resolveCanonicalResourceScopeForAuthorization("atom", id);
+    if (!resolved.found || !isCompleteScope(resolved.scope)) {
+      throw new ScopeViolationError("listLiveSourcesForAtom cannot resolve authoritative scope");
+    }
+    const authorizedScope = resolved.scope;
+    await this.ensureSourceLifecycleHydrated();
     const bindingIds = new Set<string>();
+    const considerLinkedBinding = (bindingId: string): void => {
+      const binding = this.sourceBindings.get(bindingId);
+      if (binding && this.isAuthorizedLiveSourceBinding(binding, authorizedScope)) {
+        bindingIds.add(binding.id);
+      }
+    };
     for (const link of this.liveSourceObjectLinks({ objectType: "atom", objectId: id })) {
-      bindingIds.add(link.sourceBindingId);
+      considerLinkedBinding(link.sourceBindingId);
     }
     const atom = await this.metadataStore.getAtom(id);
     if (atom) {
+      if (!isCompleteScope(atom.scope) || !matchesScope(atom.scope, authorizedScope)) {
+        throw new ScopeViolationError("listLiveSourcesForAtom cannot resolve authoritative scope");
+      }
       for (const evidenceId of atom.provenance.evidenceRefs) {
         for (const link of this.liveSourceObjectLinks({
           objectType: "evidence",
           objectId: evidenceId,
         })) {
-          bindingIds.add(link.sourceBindingId);
+          considerLinkedBinding(link.sourceBindingId);
         }
       }
-      // Lazy backfill: evidence may match bindings that have not yet materialized
-      // atom links (same path as forgetSource pre-unlink ensure*).
+      // Lazy backfill: evidence may match same-scope bindings that have not yet
+      // materialized atom links. Foreign-scope URI matches are ignored.
       for (const binding of this.sourceBindings.values()) {
         if (bindingIds.has(binding.id)) {
           continue;
         }
-        if (binding.status !== "active" && binding.status !== "archived") {
+        if (!this.isAuthorizedLiveSourceBinding(binding, authorizedScope)) {
           continue;
         }
         for (const evidenceId of atom.provenance.evidenceRefs) {
@@ -2983,10 +2980,7 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
     }> = [];
     for (const bindingId of bindingIds) {
       const binding = this.sourceBindings.get(bindingId);
-      if (!binding) {
-        continue;
-      }
-      if (binding.status !== "active" && binding.status !== "archived") {
+      if (!binding || !this.isAuthorizedLiveSourceBinding(binding, authorizedScope)) {
         continue;
       }
       out.push({
@@ -2997,6 +2991,16 @@ export class InMemoryCogniWeaveEngine implements CogniWeaveEngine {
       });
     }
     return out.toSorted((a, b) => a.sourceBindingId.localeCompare(b.sourceBindingId));
+  }
+
+  private isAuthorizedLiveSourceBinding(binding: SourceBinding, authorizedScope: Scope): boolean {
+    if (binding.status !== "active" && binding.status !== "archived") {
+      return false;
+    }
+    if (!isCompleteScope(binding.scope)) {
+      return false;
+    }
+    return matchesScope(binding.scope, authorizedScope);
   }
 
   /** True when evidence is still eligible for retrieval given lifecycle bindings/links. */

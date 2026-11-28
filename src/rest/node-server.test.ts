@@ -11,10 +11,8 @@ import { createMemoryPartitionKeyV1 } from "../keys.js";
 import type { MemorySubject, Scope } from "../models.js";
 import { createMemorySubjectBinding } from "../subject/binding.js";
 import { CogniWeaveMemoryResourceAdapter } from "../resource/index.js";
-import {
-  InMemoryCogniWeaveEngine,
-  registerEngineCanonicalAuthorizationResolver,
-} from "../runtime/in-memory-engine.js";
+import { registerEngineCanonicalAuthorizationResolver } from "../runtime/canonical-resolver-registry.js";
+import { InMemoryCogniWeaveEngine } from "../runtime/in-memory-engine.js";
 import { InMemoryMetadataStore } from "../storage/in-memory.js";
 import { handleCogniWeaveHttpRequest, RESOURCE_ID_ROUTE_REGISTRY, routeCogniWeaveHttpRequest } from "./node-server.js";
 import { CogniWeaveRestService } from "./service.js";

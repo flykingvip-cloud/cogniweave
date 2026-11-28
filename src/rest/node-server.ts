@@ -38,7 +38,7 @@ import type {
   RestResponse,
   WriteBackRequest,
 } from "./contracts.js";
-import { getEngineCanonicalAuthorizationResolver } from "../runtime/in-memory-engine.js";
+import { getEngineCanonicalAuthorizationResolver } from "../runtime/canonical-resolver-registry.js";
 import type { CogniWeaveRestService } from "./service.js";
 
 export type CogniWeaveHttpAuthPrincipal = RestPrincipal;
